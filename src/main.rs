@@ -19,12 +19,25 @@ enum Tier {
     Private,
 }
 
+#[derive(Clone, ValueEnum)]
+enum WorkerRole {
+    Scan,
+    Extract,
+    Watch,
+    Validate,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Long-running indexing service
     Index,
     /// Sandboxed worker child of `index`
-    Worker,
+    Worker {
+        #[arg(long, value_enum)]
+        role: WorkerRole,
+        #[arg(long)]
+        root: Option<String>,
+    },
     /// MCP server on stdio (read-only)
     Mcp {
         #[arg(long, value_enum)]
@@ -43,6 +56,32 @@ fn main() -> ExitCode {
         println!("pdfium={}", llm_index::pdfium_lib());
         println!("model={}", llm_index::model_dir());
         return ExitCode::SUCCESS;
+    }
+    if let Command::Worker { role, root } = cli.command {
+        let role = match role {
+            WorkerRole::Scan => "scan",
+            WorkerRole::Extract => "extract",
+            WorkerRole::Watch => "watch",
+            WorkerRole::Validate => "validate",
+        };
+        let config = match cli
+            .config
+            .map(Ok)
+            .unwrap_or_else(llm_index::config::default_path)
+        {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match llm_index::worker::run(&config, role, root.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        };
     }
     eprintln!("not implemented");
     ExitCode::from(2)
