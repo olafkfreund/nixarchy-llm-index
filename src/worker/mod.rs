@@ -291,12 +291,16 @@ mod tests {
 
     #[test]
     fn watcher_closes_fds_and_watches_recreated_directory() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
         let base = std::env::temp_dir().join(format!("llm-index-watch-{}", std::process::id()));
         fs::create_dir_all(base.join("root/recreated")).unwrap();
         for n in 0..1100 {
             fs::create_dir(base.join(format!("root/dir-{n}"))).unwrap();
         }
+        // an unreadable directory must not degrade the watcher
+        fs::create_dir(base.join("root/locked")).unwrap();
+        fs::set_permissions(base.join("root/locked"), fs::Permissions::from_mode(0o000)).unwrap();
         fs::write(
             base.join("config.toml"),
             format!(
@@ -343,6 +347,9 @@ mod tests {
         fs::create_dir(base.join("root/recreated")).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         fs::write(base.join("root/recreated/new.txt"), "new").unwrap();
+        // a file written into a brand-new directory before its watch exists is still reported
+        fs::create_dir(base.join("root/fresh")).unwrap();
+        fs::write(base.join("root/fresh/early.txt"), "early").unwrap();
         std::thread::sleep(Duration::from_secs(3));
         child
             .stdin
@@ -356,7 +363,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(String::from_utf8_lossy(&result.stdout).contains("recreated/new.txt"));
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("recreated/new.txt"));
+        assert!(stdout.contains("fresh/early.txt"), "{stdout}");
+        assert!(!stdout.contains("WatchDegraded"), "{stdout}");
+        fs::set_permissions(base.join("root/locked"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 

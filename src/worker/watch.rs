@@ -46,7 +46,9 @@ fn add_watches(
     watched: &mut Watches,
     by_wd: &mut HashMap<WatchDescriptor, PathBuf>,
     subtree: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    // Files already inside a new directory before its watch existed (`mkdir d && echo x > d/f`).
+    let mut found = Vec::new();
     let mut walker = Walker::new(ready)?;
     let loader = Walker::new(ready)?;
     if let Some(rel) = subtree {
@@ -70,6 +72,9 @@ fn add_watches(
             return Ok(());
         }
         let Some(fd) = fd else {
+            if subtree.is_some() {
+                found.push(rel.to_path_buf());
+            }
             return Ok(());
         };
         let root = &ready.config.roots[ready.root.ok_or("missing root")?].path;
@@ -89,10 +94,16 @@ fn add_watches(
         walker.walk(|rel, _, fd, reason| add(rel, fd, reason))
     };
     result?;
-    if let Some((rel, reason)) = walker.skipped.first() {
+    // Unreadable or vanished directories are tolerated like in the scanner; only I/O errors
+    // that mean the filesystem itself is failing degrade the watcher.
+    if let Some((rel, reason)) = walker
+        .skipped
+        .iter()
+        .find(|(_, reason)| reason == "EIO" || reason == "ESTALE")
+    {
         return Err(format!("watch walk {}: {reason}", rel.display()).into());
     }
-    Ok(())
+    Ok(found)
 }
 
 fn remove_watch(
@@ -119,6 +130,7 @@ fn watch_inner(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>>
     let mut watched = Watches::new();
     let mut by_wd = HashMap::new();
     add_watches(ready, output, &mut inotify, &mut watched, &mut by_wd, None)?;
+    const IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".llmindexignore"];
     let mut buffer = [0; 8192];
     let mut pending = HashMap::<PathBuf, (Instant, String)>::new();
     let stdin = io::stdin();
@@ -169,6 +181,12 @@ fn watch_inner(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>>
                 };
                 let path = dir.join(name);
                 let is_dir = event.mask.contains(EventMask::ISDIR);
+                // A changed ignore file invalidates the cached rules of its directory subtree.
+                if !is_dir && IGNORE_FILES.iter().any(|f| name == *f) && watched.contains_key(&dir)
+                {
+                    remove_watch(&dir, &mut watched, &mut by_wd, &mut removed);
+                    additions.push(dir.clone());
+                }
                 if is_dir
                     && event
                         .mask
@@ -199,14 +217,16 @@ fn watch_inner(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>>
                 let _ = inotify.watches().remove(wd);
             }
             for path in additions {
-                add_watches(
+                for file in add_watches(
                     ready,
                     output,
                     &mut inotify,
                     &mut watched,
                     &mut by_wd,
                     Some(&path),
-                )?;
+                )? {
+                    pending.insert(file, (Instant::now(), "CREATE".into()));
+                }
             }
         }
         let now = Instant::now();
