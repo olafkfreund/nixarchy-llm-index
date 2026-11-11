@@ -21,6 +21,8 @@
           pkg-config
           pdfium
         ];
+        LLM_INDEX_PDFIUM_LIB = "${pkgs.pdfium}/lib/libpdfium.so";
+        LLM_INDEX_MODEL_DIR = "${self.packages.${system}.default.passthru.modelDir}";
       };
 
       checks.${system}.closure = pkgs.callPackage ./nix/checks/closure.nix {

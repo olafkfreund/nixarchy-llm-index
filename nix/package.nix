@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   fetchurl,
+  linkFarm,
   pdfium,
 }:
 let
@@ -20,6 +21,8 @@ let
       hash = "sha256-Y8ANkIJMgywE7B0CtqmD+5BIm/BJ8p+/8VukgbikMu4=";
     };
   };
+  # A store path that exists at build, test and run time (unlike $out during checkPhase).
+  modelDir = linkFarm "potion-retrieval-32M" model;
 in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "llm-index";
@@ -37,13 +40,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   # Read with option_env! so both paths land in the binary and hence the closure.
   LLM_INDEX_PDFIUM_LIB = "${pdfium}/lib/libpdfium.so";
-  LLM_INDEX_MODEL_DIR = "${placeholder "out"}/share/llm-index/models/potion-retrieval-32M";
+  LLM_INDEX_MODEL_DIR = "${modelDir}";
 
   postInstall = ''
-    d=$out/share/llm-index/models/potion-retrieval-32M
-    mkdir -p $d
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (n: f: "cp ${f} $d/${n}") model)}
+    mkdir -p $out/share/llm-index/models
+    ln -s ${modelDir} $out/share/llm-index/models/potion-retrieval-32M
   '';
+
+  passthru = { inherit modelDir pdfium; };
 
   meta = {
     license = lib.licenses.mit;
