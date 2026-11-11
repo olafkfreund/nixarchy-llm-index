@@ -26,7 +26,26 @@ pub fn extract(
     output: &Output,
 ) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + EXTRACT_TIMEOUT;
+    extract_with_deadlines(
+        ready,
+        relpath,
+        expected_size,
+        expected_mtime_ns,
+        deadline,
+        deadline,
+        output,
+    )
+}
 
+fn extract_with_deadlines(
+    ready: &Ready,
+    relpath: String,
+    expected_size: u64,
+    expected_mtime_ns: i64,
+    extract_deadline: Instant,
+    chunk_deadline: Instant,
+    output: &Output,
+) -> Result<(), Box<dyn Error>> {
     if !normal_relative(&relpath) {
         return output.send(&Message::Failed {
             relpath,
@@ -120,7 +139,7 @@ pub fn extract(
     let mut buf = [0u8; 64 * 1024];
 
     loop {
-        if Instant::now() >= deadline {
+        if Instant::now() >= extract_deadline {
             return output.send(&Message::Failed {
                 relpath,
                 reason: "timeout".into(),
@@ -153,7 +172,7 @@ pub fn extract(
             reason: "changed".into(),
         });
     }
-    if Instant::now() >= deadline {
+    if Instant::now() >= extract_deadline {
         return output.send(&Message::Failed {
             relpath,
             reason: "timeout".into(),
@@ -176,7 +195,7 @@ pub fn extract(
         file_type,
         &bytes,
         &ready.config.limits,
-        deadline,
+        extract_deadline,
     ) {
         Ok(ext) => ext,
         Err(err) => {
@@ -191,26 +210,39 @@ pub fn extract(
         }
     };
 
-    if Instant::now() >= deadline {
+    if Instant::now() >= chunk_deadline {
         return output.send(&Message::Failed {
             relpath,
             reason: "timeout".into(),
         });
     }
 
-    // 7. Chunk, sanitize chunk text and title, compute BLAKE3 of bytes, reply Extracted.
-    let mut chunks = chunk::chunk(&extracted.segments, extracted.file_type);
-    for c in &mut chunks {
-        c.text = sanitize::sanitize(&c.text);
-        if let Some(sym) = &c.heading_or_symbol {
-            let cleaned = sanitize::sanitize(sym);
-            c.heading_or_symbol = if cleaned.trim().is_empty() {
-                None
-            } else {
-                Some(cleaned)
-            };
+    // 7. Chunk with deadline, sanitize chunk text and title (dropping empty chunks),
+    // compute BLAKE3 of bytes, re-check deadline, and reply Extracted.
+    let mut chunks = match chunk::chunk(&extracted.segments, extracted.file_type, chunk_deadline) {
+        Ok(chunks) => chunks,
+        Err(ExtractError::Timeout) => {
+            return output.send(&Message::Failed {
+                relpath,
+                reason: "timeout".into(),
+            });
         }
+        Err(err) => {
+            return output.send(&Message::Failed {
+                relpath,
+                reason: err.to_string(),
+            });
+        }
+    };
+
+    if Instant::now() >= chunk_deadline {
+        return output.send(&Message::Failed {
+            relpath,
+            reason: "timeout".into(),
+        });
     }
+
+    sanitize::sanitize_chunks(&mut chunks);
 
     let mut title = sanitize::sanitize(&extracted.title);
     if title.trim().is_empty() {
@@ -218,6 +250,13 @@ pub fn extract(
     }
 
     let blake3 = blake3::hash(&bytes).to_hex().to_string();
+
+    if Instant::now() >= chunk_deadline {
+        return output.send(&Message::Failed {
+            relpath,
+            reason: "timeout".into(),
+        });
+    }
 
     output.send(&Message::Extracted {
         relpath,
@@ -297,10 +336,12 @@ fn pre_open_check(
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::{Cursor, Write};
+    use std::io::{BufRead, BufReader, Cursor, Write};
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
 
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
@@ -363,21 +404,30 @@ mod tests {
         let base_path = Path::new(&base);
 
         let (orig_size, orig_mtime) = stat_size_mtime(&base_path.join("root/changed.txt"));
+        let (same_size, same_mtime) = stat_size_mtime(&base_path.join("root/same_size_mtime.txt"));
         let (swap_size, swap_mtime) = stat_size_mtime(&base_path.join("root/sub/target.txt"));
         let (ok_size, ok_mtime) = stat_size_mtime(&base_path.join("root/hello.md"));
+        let (slow_size, slow_mtime) = stat_size_mtime(&base_path.join("root/slow.rs"));
 
-        // Acquire root_fd and apply Landlock before swapping `root/sub` and modifying `changed.txt`.
+        // Acquire root_fd and apply Landlock before swapping `root/sub` and modifying files.
         let ready =
             worker::sandbox::start(&base_path.join("config.toml"), "extract", Some("parent"))
                 .unwrap();
 
-        // Wait until parent process swaps `root/sub` for a symlink and updates `changed.txt`.
-        let signal = std::env::var("LLM_INDEX_READY_SIGNAL").unwrap();
-        while !Path::new(&signal).exists() {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
         let output = Output::new();
+
+        // Readiness handshake: emit Entry so parent knows root_fd and Landlock are active,
+        // then wait for parent to finish swapping `root/sub` and updating test files.
+        output
+            .send(&Message::Entry {
+                relpath: "sub/target.txt".into(),
+                size: swap_size,
+                mtime_ns: swap_mtime,
+                is_dir: false,
+            })
+            .unwrap();
+        let mut go = String::new();
+        io::stdin().read_line(&mut go).unwrap();
 
         // 1. Excluded file (FIFO with no writer): must NEVER be opened, returning quickly with "excluded".
         extract(&ready, "excluded/fifo.txt".into(), 10, 12345, &output).unwrap();
@@ -398,10 +448,34 @@ mod tests {
         )
         .unwrap();
 
-        // 5. File whose size/mtime changed since scan: Failed "changed".
+        // 5. File whose size changed since scan: Failed "changed".
         extract(&ready, "changed.txt".into(), orig_size, orig_mtime, &output).unwrap();
 
-        // 6. Normal file with invisible characters in title and body: Extracted and sanitized.
+        // 6. File whose size is identical but mtime_ns changed since scan: Failed "changed".
+        extract(
+            &ready,
+            "same_size_mtime.txt".into(),
+            same_size,
+            same_mtime,
+            &output,
+        )
+        .unwrap();
+
+        // 7. Deadline firing during chunking (tiny chunk deadline): Failed "timeout".
+        let now = Instant::now();
+        extract_with_deadlines(
+            &ready,
+            "slow.rs".into(),
+            slow_size,
+            slow_mtime,
+            now + Duration::from_secs(30),
+            now,
+            &output,
+        )
+        .unwrap();
+
+        // 8. Normal file with invisible characters in title, an invisible-only section (dropped),
+        // and a body section: Extracted and sanitized.
         extract(&ready, "hello.md".into(), ok_size, ok_mtime, &output).unwrap();
     }
 
@@ -430,9 +504,15 @@ mod tests {
         fs::write(base.join("root/sub/target.txt"), "inside content").unwrap();
         fs::write(base.join("outside/target.txt"), "outside secret").unwrap();
         fs::write(base.join("root/changed.txt"), "before change").unwrap();
+        fs::write(base.join("root/same_size_mtime.txt"), "1234567890123").unwrap();
+        fs::write(base.join("root/slow.rs"), "pub fn slow() -> i32 { 42 }\n").unwrap();
         fs::write(
             base.join("root/hello.md"),
-            "# Clean\u{200B}Title\u{202E}\n\nParagraph with \u{FEFF}hidden\u{E0041} tags.\n",
+            concat!(
+                "\u{200E}\u{200F}\u{061C}\u{2061}\u{2062}\u{2063}\u{2064}\u{180E}\u{FE00}\u{FE0F}\u{E0100}\u{E01EF}\n\n",
+                "# Clean\u{200B}Title\u{202E}\u{2061}\u{FE0F}\n\n",
+                "Paragraph with \u{FEFF}hidden\u{E0041}\u{2063}\u{FE0E}\u{E0101} tags.\n"
+            ),
         )
         .unwrap();
 
@@ -448,8 +528,7 @@ mod tests {
         )
         .unwrap();
 
-        let signal_path = base.join("root/ready.signal");
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "worker::extract::tests::extract_checks_child",
@@ -457,14 +536,26 @@ mod tests {
             ])
             .env("LLM_INDEX_EXTRACT_CHECKS_CHILD", "1")
             .env("LLM_INDEX_TEST_BASE", &base)
-            .env("LLM_INDEX_READY_SIGNAL", &signal_path)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
 
-        // Give child a moment to acquire root_fd, then swap `root/sub` for a symlink and modify `changed.txt`.
-        std::thread::sleep(Duration::from_millis(100));
+        let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ready_seen = false;
+        let mut line = String::new();
+        while child_stdout.read_line(&mut line).unwrap() > 0 {
+            if line.contains("\"message\":\"Entry\"") && line.contains("sub/target.txt") {
+                ready_seen = true;
+                break;
+            }
+            line.clear();
+        }
+        assert!(ready_seen, "did not receive readiness Entry from child");
+
+        // Swap `root/sub` for a symlink, modify `changed.txt`, and update `same_size_mtime.txt`
+        // with the exact same byte length and a new mtime.
         fs::rename(base.join("root/sub"), base.join("moved_sub")).unwrap();
         std::os::unix::fs::symlink(base.join("outside"), base.join("root/sub")).unwrap();
         fs::write(
@@ -472,15 +563,36 @@ mod tests {
             "after change with more bytes",
         )
         .unwrap();
-        fs::write(&signal_path, "go").unwrap();
+        let same_path = base.join("root/same_size_mtime.txt");
+        let (_, old_mtime_ns) = stat_size_mtime(&same_path);
+        fs::write(&same_path, "abcdefghijklm").unwrap();
+        let new_sec = (old_mtime_ns / 1_000_000_000) + 10;
+        let ts = Timestamps {
+            last_access: Timespec {
+                tv_sec: new_sec,
+                tv_nsec: 0,
+            },
+            last_modification: Timespec {
+                tv_sec: new_sec,
+                tv_nsec: 123_456_789,
+            },
+        };
+        utimensat(CWD, &same_path, &ts, AtFlags::empty()).unwrap();
+        let (new_size, new_mtime_ns) = stat_size_mtime(&same_path);
+        assert_eq!(new_size, 13);
+        assert_ne!(new_mtime_ns, old_mtime_ns);
 
-        let result = child.wait_with_output().unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&result.stdout);
+        // Signal child to proceed.
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "go").unwrap();
+        }
+
+        let mut rest_stdout = String::new();
+        child_stdout.read_to_string(&mut rest_stdout).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child failed with status {status}");
+        let stdout = rest_stdout;
         assert!(stdout.contains("1 passed"), "{stdout}");
         assert!(
             stdout.contains(
@@ -513,11 +625,37 @@ mod tests {
         );
         assert!(
             stdout.contains(
+                "\"message\":\"Failed\",\"relpath\":\"same_size_mtime.txt\",\"reason\":\"changed\""
+            ),
+            "{stdout}"
+        );
+        assert!(
+            stdout
+                .contains("\"message\":\"Failed\",\"relpath\":\"slow.rs\",\"reason\":\"timeout\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(
                 "\"message\":\"Extracted\",\"relpath\":\"hello.md\",\"title\":\"CleanTitle\""
             ),
             "{stdout}"
         );
         assert!(stdout.contains("Paragraph with hidden tags."), "{stdout}");
+        // The first section of hello.md contained only stripped invisible characters, so it must
+        // be dropped, leaving only the 1 real section chunk.
+        let extracted_line = stdout
+            .lines()
+            .find(|l| l.contains("\"message\":\"Extracted\"") && l.contains("hello.md"))
+            .expect("Extracted message for hello.md");
+        let parsed: serde_json::Value = serde_json::from_str(extracted_line).unwrap();
+        let chunks = parsed["chunks"].as_array().unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "expected empty sanitized chunk to be dropped: {chunks:?}"
+        );
+        assert_eq!(chunks[0]["ord"], 0);
+        assert_eq!(chunks[0]["heading_or_symbol"], "CleanTitle");
 
         fs::remove_dir_all(&base).unwrap();
     }
@@ -604,13 +742,21 @@ mod tests {
         }
         let bomb_out = bomb_worker.wait_with_output().unwrap();
         let bomb_stdout = String::from_utf8_lossy(&bomb_out.stdout);
-        // The worker must either die (OOM/abort on the 96M-cell allocation) or reply Failed.
+        let bomb_stderr = String::from_utf8_lossy(&bomb_out.stderr);
+        let died_by_signal = bomb_out.status.signal().is_some();
+        let alloc_failed_stderr = bomb_stderr.contains("memory allocation of")
+            || bomb_stderr.contains("allocation failed")
+            || bomb_stderr.contains("out of memory");
         assert!(
-            !bomb_out.status.success() || bomb_stdout.contains("\"message\":\"Failed\""),
-            "expected bomb worker to die or reply Failed, status={}, stdout={bomb_stdout}",
-            bomb_out.status
+            died_by_signal || alloc_failed_stderr,
+            "expected bomb worker to die by a signal or report allocation failure on stderr, status={}, signal={:?}, stderr={bomb_stderr}",
+            bomb_out.status,
+            bomb_out.status.signal()
         );
-        assert!(!bomb_stdout.contains("\"message\":\"Extracted\""));
+        assert!(
+            !bomb_stdout.contains("\"message\":\"Extracted\""),
+            "bomb worker must not send Extracted: {bomb_stdout}"
+        );
 
         // 2. Spawn a fresh extract worker and verify it cleanly extracts the next normal file.
         let mut fresh_worker = Command::new(std::env::current_exe().unwrap())

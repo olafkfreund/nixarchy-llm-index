@@ -84,6 +84,7 @@ pub enum SegmentKind {
         name: String,
         first_row: u32,
         last_row: u32,
+        row_numbers: Vec<u32>,
     },
     Whole,
 }

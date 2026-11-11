@@ -33,6 +33,13 @@ pub fn start(
     let global_ignore = scan::global_ignore();
     fs::write("/proc/self/oom_score_adj", "1000")?;
     let oom_score_adj = fs::read_to_string("/proc/self/oom_score_adj")?;
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )?;
     let old = getrlimit(Resource::As);
     let limit = 4 * 1024 * 1024 * 1024;
     setrlimit(
