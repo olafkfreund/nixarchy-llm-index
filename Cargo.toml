@@ -1,0 +1,16 @@
+[package]
+name = "llm-index"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "llm_index"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llm-index"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
