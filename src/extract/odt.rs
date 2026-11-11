@@ -1,22 +1,34 @@
+use std::io::BufRead;
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
 use super::{
-    ExtractError, Extracted, FileType, Segment, SegmentKind, Skip, append_general_ref, file_name,
-    local_name, read_zip_entries,
+    ExtractError, Extracted, FileType, ODF_ODT_MIME, Segment, SegmentKind, Skip, TextBudget,
+    append_general_ref_budget, file_name, local_name, parse_dc_title, verify_odf_mimetype,
+    verify_zip_guard, with_zip_xml_reader,
 };
 
-pub fn extract(relpath: &str, bytes: &[u8]) -> Result<Extracted, ExtractError> {
-    let entries = read_zip_entries(bytes, "mimetype", &["meta.xml", "content.xml"])?;
-    let Some(content_xml) = entries.get("content.xml") else {
+pub fn extract(
+    relpath: &str,
+    bytes: &[u8],
+    max_text_bytes: usize,
+) -> Result<Extracted, ExtractError> {
+    verify_zip_guard(bytes)?;
+    verify_odf_mimetype(bytes, ODF_ODT_MIME)?;
+
+    let mut read_so_far = 0;
+    let dc_title =
+        with_zip_xml_reader(bytes, "meta.xml", &mut read_so_far, parse_dc_title)?.flatten();
+
+    let Some((first_heading, segments)) =
+        with_zip_xml_reader(bytes, "content.xml", &mut read_so_far, |reader| {
+            parse_content_xml(reader, max_text_bytes)
+        })?
+    else {
         return Err(ExtractError::Skipped(Skip::Mismatch));
     };
 
-    let dc_title = entries
-        .get("meta.xml")
-        .and_then(|xml| parse_meta_title(xml));
-
-    let (first_heading, segments) = parse_content_xml(content_xml)?;
     let title = dc_title
         .or(first_heading)
         .filter(|s| !s.is_empty())
@@ -29,46 +41,14 @@ pub fn extract(relpath: &str, bytes: &[u8]) -> Result<Extracted, ExtractError> {
     })
 }
 
-fn parse_meta_title(xml: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut in_title = false;
-    let mut buf = String::new();
+fn parse_content_xml(
+    reader: &mut dyn BufRead,
+    max_text_bytes: usize,
+) -> Result<(Option<String>, Vec<Segment>), ExtractError> {
+    let mut xml_reader = Reader::from_reader(reader);
+    let mut event_buf = Vec::new();
+    let mut budget = TextBudget::new(max_text_bytes);
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                if local_name(e.name().as_ref()) == "title" {
-                    in_title = true;
-                    buf.clear();
-                }
-            }
-            Ok(Event::End(e)) => {
-                if local_name(e.name().as_ref()) == "title" && in_title {
-                    let trimmed = buf.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                    in_title = false;
-                }
-            }
-            Ok(Event::Text(e)) if in_title => {
-                buf.push_str(e.as_ref());
-            }
-            Ok(Event::GeneralRef(r)) if in_title => {
-                append_general_ref(&r, &mut buf);
-            }
-            Ok(Event::CData(e)) if in_title => {
-                buf.push_str(e.as_ref());
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_content_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), ExtractError> {
-    let mut reader = Reader::from_str(xml);
     let mut block_depth: usize = 0;
     let mut is_heading = false;
     let mut block_text = String::new();
@@ -81,7 +61,8 @@ fn parse_content_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extrac
     let mut total_lines: u32 = 0;
 
     loop {
-        match reader.read_event() {
+        event_buf.clear();
+        match xml_reader.read_event_into(&mut event_buf) {
             Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
                 "h" => {
                     if block_depth == 0 {
@@ -99,30 +80,26 @@ fn parse_content_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extrac
                 }
                 "s" if block_depth > 0 => {
                     let count = space_count(&e);
-                    for _ in 0..count {
-                        block_text.push(' ');
-                    }
+                    budget.push_spaces(&mut block_text, count)?;
                 }
                 "tab" if block_depth > 0 => {
-                    block_text.push('\t');
+                    budget.push_char(&mut block_text, '\t')?;
                 }
                 "line-break" if block_depth > 0 => {
-                    block_text.push('\n');
+                    budget.push_char(&mut block_text, '\n')?;
                 }
                 _ => {}
             },
             Ok(Event::Empty(e)) if block_depth > 0 => match local_name(e.name().as_ref()) {
                 "s" => {
                     let count = space_count(&e);
-                    for _ in 0..count {
-                        block_text.push(' ');
-                    }
+                    budget.push_spaces(&mut block_text, count)?;
                 }
                 "tab" => {
-                    block_text.push('\t');
+                    budget.push_char(&mut block_text, '\t')?;
                 }
                 "line-break" => {
-                    block_text.push('\n');
+                    budget.push_char(&mut block_text, '\n')?;
                 }
                 _ => {}
             },
@@ -157,13 +134,13 @@ fn parse_content_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extrac
                 _ => {}
             },
             Ok(Event::Text(e)) if block_depth > 0 => {
-                block_text.push_str(e.as_ref());
+                budget.push_str(&mut block_text, e.as_ref())?;
             }
             Ok(Event::GeneralRef(r)) if block_depth > 0 => {
-                append_general_ref(&r, &mut block_text);
+                append_general_ref_budget(&r, &mut block_text, &mut budget)?;
             }
             Ok(Event::CData(e)) if block_depth > 0 => {
-                block_text.push_str(e.as_ref());
+                budget.push_str(&mut block_text, e.as_ref())?;
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(ExtractError::Parse(format!("odt xml error: {e}"))),
@@ -187,7 +164,7 @@ fn space_count(e: &quick_xml::events::BytesStart<'_>) -> usize {
         if local_name(attr.key.as_ref()) == "c"
             && let Ok(n) = attr.value.as_ref().parse::<usize>()
         {
-            return n.min(256);
+            return n.min(1024);
         }
     }
     1

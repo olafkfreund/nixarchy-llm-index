@@ -62,6 +62,10 @@ pub struct Exclude {
 pub struct Limits {
     #[serde(default = "default_max_file_mb")]
     pub max_file_mb: u64,
+    #[serde(default = "default_max_text_bytes")]
+    pub max_text_bytes: usize,
+    #[serde(default = "default_max_cells")]
+    pub max_cells: u64,
     #[serde(default = "default_memory_max_mb")]
     pub memory_max_mb: u64,
     #[serde(default = "default_workers")]
@@ -74,6 +78,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_file_mb: default_max_file_mb(),
+            max_text_bytes: default_max_text_bytes(),
+            max_cells: default_max_cells(),
             memory_max_mb: default_memory_max_mb(),
             workers: default_workers(),
             backoff_max: default_backoff_max(),
@@ -86,6 +92,12 @@ fn default_interval() -> String {
 }
 fn default_max_file_mb() -> u64 {
     50
+}
+fn default_max_text_bytes() -> usize {
+    32 * 1024 * 1024
+}
+fn default_max_cells() -> u64 {
+    2_000_000
 }
 fn default_memory_max_mb() -> u64 {
     1024

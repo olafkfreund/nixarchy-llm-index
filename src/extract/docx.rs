@@ -1,26 +1,35 @@
+use std::io::BufRead;
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
 use super::{
-    ExtractError, Extracted, FileType, Segment, SegmentKind, Skip, append_general_ref, file_name,
-    local_name, read_zip_entries,
+    ExtractError, Extracted, FileType, OoxmlKind, Segment, SegmentKind, Skip, TextBudget,
+    append_general_ref_budget, file_name, local_name, parse_dc_title, verify_ooxml_content_type,
+    verify_zip_guard, with_zip_xml_reader,
 };
 
-pub fn extract(relpath: &str, bytes: &[u8]) -> Result<Extracted, ExtractError> {
-    let entries = read_zip_entries(
-        bytes,
-        "[Content_Types].xml",
-        &["docProps/core.xml", "word/document.xml"],
-    )?;
-    let Some(doc_xml) = entries.get("word/document.xml") else {
+pub fn extract(
+    relpath: &str,
+    bytes: &[u8],
+    max_text_bytes: usize,
+) -> Result<Extracted, ExtractError> {
+    verify_zip_guard(bytes)?;
+    verify_ooxml_content_type(bytes, OoxmlKind::Docx)?;
+
+    let mut read_so_far = 0;
+    let dc_title =
+        with_zip_xml_reader(bytes, "docProps/core.xml", &mut read_so_far, parse_dc_title)?
+            .flatten();
+
+    let Some((first_heading, segments)) =
+        with_zip_xml_reader(bytes, "word/document.xml", &mut read_so_far, |reader| {
+            parse_document_xml(reader, max_text_bytes)
+        })?
+    else {
         return Err(ExtractError::Skipped(Skip::Mismatch));
     };
 
-    let dc_title = entries
-        .get("docProps/core.xml")
-        .and_then(|xml| parse_core_title(xml));
-
-    let (first_heading, segments) = parse_document_xml(doc_xml)?;
     let title = dc_title
         .or(first_heading)
         .filter(|s| !s.is_empty())
@@ -33,46 +42,14 @@ pub fn extract(relpath: &str, bytes: &[u8]) -> Result<Extracted, ExtractError> {
     })
 }
 
-fn parse_core_title(xml: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut in_title = false;
-    let mut buf = String::new();
+fn parse_document_xml(
+    reader: &mut dyn BufRead,
+    max_text_bytes: usize,
+) -> Result<(Option<String>, Vec<Segment>), ExtractError> {
+    let mut xml_reader = Reader::from_reader(reader);
+    let mut event_buf = Vec::new();
+    let mut budget = TextBudget::new(max_text_bytes);
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                if local_name(e.name().as_ref()) == "title" {
-                    in_title = true;
-                    buf.clear();
-                }
-            }
-            Ok(Event::End(e)) => {
-                if local_name(e.name().as_ref()) == "title" && in_title {
-                    let trimmed = buf.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                    in_title = false;
-                }
-            }
-            Ok(Event::Text(e)) if in_title => {
-                buf.push_str(e.as_ref());
-            }
-            Ok(Event::GeneralRef(r)) if in_title => {
-                append_general_ref(&r, &mut buf);
-            }
-            Ok(Event::CData(e)) if in_title => {
-                buf.push_str(e.as_ref());
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_document_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), ExtractError> {
-    let mut reader = Reader::from_str(xml);
     let mut in_p = false;
     let mut in_ppr = false;
     let mut in_t = false;
@@ -87,7 +64,8 @@ fn parse_document_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extra
     let mut total_lines: u32 = 0;
 
     loop {
-        match reader.read_event() {
+        event_buf.clear();
+        match xml_reader.read_event_into(&mut event_buf) {
             Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
                 "p" => {
                     in_p = true;
@@ -103,16 +81,18 @@ fn parse_document_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extra
                     }
                 }
                 "outlineLvl" if in_ppr => {
-                    p_is_heading = true;
+                    if is_heading_outline_lvl(&e) {
+                        p_is_heading = true;
+                    }
                 }
                 "t" if in_p => {
                     in_t = true;
                 }
                 "tab" if in_p => {
-                    p_text.push('\t');
+                    budget.push_char(&mut p_text, '\t')?;
                 }
                 "br" | "cr" if in_p => {
-                    p_text.push('\n');
+                    budget.push_char(&mut p_text, '\n')?;
                 }
                 _ => {}
             },
@@ -123,13 +103,15 @@ fn parse_document_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extra
                     }
                 }
                 "outlineLvl" if in_ppr => {
-                    p_is_heading = true;
+                    if is_heading_outline_lvl(&e) {
+                        p_is_heading = true;
+                    }
                 }
                 "tab" if in_p => {
-                    p_text.push('\t');
+                    budget.push_char(&mut p_text, '\t')?;
                 }
                 "br" | "cr" if in_p => {
-                    p_text.push('\n');
+                    budget.push_char(&mut p_text, '\n')?;
                 }
                 _ => {}
             },
@@ -163,17 +145,18 @@ fn parse_document_xml(xml: &str) -> Result<(Option<String>, Vec<Segment>), Extra
                             cur_lines.push(line.to_string());
                         }
                     }
+                    p_text.clear();
                 }
                 _ => {}
             },
             Ok(Event::Text(e)) if in_t => {
-                p_text.push_str(e.as_ref());
+                budget.push_str(&mut p_text, e.as_ref())?;
             }
             Ok(Event::GeneralRef(r)) if in_t => {
-                append_general_ref(&r, &mut p_text);
+                append_general_ref_budget(&r, &mut p_text, &mut budget)?;
             }
             Ok(Event::CData(e)) if in_t => {
-                p_text.push_str(e.as_ref());
+                budget.push_str(&mut p_text, e.as_ref())?;
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(ExtractError::Parse(format!("docx xml error: {e}"))),
@@ -196,9 +179,26 @@ fn is_heading_style(e: &quick_xml::events::BytesStart<'_>) -> bool {
     for attr in e.attributes().flatten() {
         if local_name(attr.key.as_ref()) == "val" {
             let lower = attr.value.as_ref().to_ascii_lowercase();
-            if lower.starts_with("heading") || lower == "title" || lower == "subtitle" {
+            if lower == "title" {
                 return true;
             }
+            if let Some(rest) = lower.strip_prefix("heading") {
+                let rest = rest.trim_start_matches(' ');
+                if rest.len() == 1 && matches!(rest.as_bytes()[0], b'1'..=b'9') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_heading_outline_lvl(e: &quick_xml::events::BytesStart<'_>) -> bool {
+    for attr in e.attributes().flatten() {
+        if local_name(attr.key.as_ref()) == "val"
+            && let Ok(n) = attr.value.as_ref().trim().parse::<u8>()
+        {
+            return n <= 8;
         }
     }
     false

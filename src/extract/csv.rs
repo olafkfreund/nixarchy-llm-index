@@ -1,49 +1,86 @@
-use super::{ExtractError, Extracted, FileType, Segment, SegmentKind, file_name};
+use super::{ExtractError, Extracted, FileType, Segment, SegmentKind, TextBudget, file_name};
 
 const ROWS_PER_SEGMENT: usize = 50;
 
-pub fn extract(relpath: &str, bytes: &[u8]) -> Result<Extracted, ExtractError> {
+pub fn extract(
+    relpath: &str,
+    bytes: &[u8],
+    max_text_bytes: usize,
+) -> Result<Extracted, ExtractError> {
     let title = file_name(relpath);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .from_reader(bytes);
 
-    let mut rows: Vec<(u32, String)> = Vec::new();
+    let mut budget = TextBudget::new(max_text_bytes);
+    let mut segments = Vec::new();
+    let mut global_line: u32 = 0;
+    let mut chunk_first_row: u32 = 0;
+    let mut chunk_last_row: u32 = 0;
+    let mut chunk_rows: u32 = 0;
+    let mut chunk_text = String::new();
+    let mut row_buf = String::new();
+
     for (idx, record) in rdr.records().enumerate() {
         let rec = record.map_err(|e| ExtractError::Parse(format!("csv error: {e}")))?;
-        let line = rec
-            .iter()
-            .map(|field| field.replace(['\r', '\n', '\t'], " "))
-            .collect::<Vec<_>>()
-            .join("\t");
-        if !line.trim().is_empty() {
-            rows.push(((idx + 1) as u32, line));
+        row_buf.clear();
+        for (col_idx, field) in rec.iter().enumerate() {
+            if col_idx > 0 {
+                row_buf.push('\t');
+            }
+            if row_buf.len().saturating_add(field.len()) > budget.remaining() {
+                return Err(ExtractError::TooLarge);
+            }
+            for ch in field.chars() {
+                row_buf.push(match ch {
+                    '\r' | '\n' | '\t' => ' ',
+                    other => other,
+                });
+            }
+        }
+        if row_buf.trim().is_empty() {
+            continue;
+        }
+        let row_no = (idx + 1) as u32;
+        if chunk_rows == 0 {
+            chunk_first_row = row_no;
+        } else {
+            budget.push_char(&mut chunk_text, '\n')?;
+        }
+        budget.push_str(&mut chunk_text, &row_buf)?;
+        chunk_last_row = row_no;
+        chunk_rows += 1;
+
+        if chunk_rows as usize == ROWS_PER_SEGMENT {
+            let start_line = global_line + 1;
+            global_line += chunk_rows;
+            segments.push(Segment {
+                kind: SegmentKind::Sheet {
+                    name: title.clone(),
+                    first_row: chunk_first_row,
+                    last_row: chunk_last_row,
+                },
+                start_line,
+                end_line: global_line,
+                text: std::mem::take(&mut chunk_text),
+            });
+            chunk_rows = 0;
         }
     }
 
-    let mut segments = Vec::new();
-    let mut global_line: u32 = 0;
-    for chunk in rows.chunks(ROWS_PER_SEGMENT) {
-        let first_row = chunk.first().map(|(r, _)| *r).unwrap_or(1);
-        let last_row = chunk.last().map(|(r, _)| *r).unwrap_or(first_row);
+    if chunk_rows > 0 {
         let start_line = global_line + 1;
-        global_line += chunk.len() as u32;
-        let end_line = global_line;
-        let text = chunk
-            .iter()
-            .map(|(_, l)| l.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        global_line += chunk_rows;
         segments.push(Segment {
             kind: SegmentKind::Sheet {
                 name: title.clone(),
-                first_row,
-                last_row,
+                first_row: chunk_first_row,
+                last_row: chunk_last_row,
             },
             start_line,
-            end_line,
-            text,
+            end_line: global_line,
+            text: chunk_text,
         });
     }
 
