@@ -1,14 +1,20 @@
 use std::error::Error;
+use std::ffi::{CStr, CString, OsStr};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, StatxFlags, fstat, openat2, statx};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use rustix::fs::{
+    AtFlags, CWD, Dir, Mode, OFlags, ResolveFlags, Statx, StatxFlags, fstat, openat2, statx,
+};
 
 use super::{Output, sandbox::Ready};
 use crate::config::Tier;
 use crate::deny;
-use crate::proto::Message;
+use crate::proto::{Message, ValidationResult};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -34,236 +40,549 @@ const LOCKFILES: &[&str] = &[
     "go.sum",
     "uv.lock",
 ];
+const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_SYMLINKS)
+    .union(ResolveFlags::NO_MAGICLINKS)
+    .union(ResolveFlags::NO_XDEV);
+
+#[derive(Clone)]
+struct Mount {
+    id: u64,
+    point: PathBuf,
+    root: String,
+    fs: String,
+    source: String,
+}
+
+fn unescape(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn mounts(data: &str) -> Vec<Mount> {
+    data.lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let fields: Vec<_> = left.split(' ').collect();
+            let tail: Vec<_> = right.split(' ').collect();
+            if fields.len() < 5 || tail.len() < 2 {
+                return None;
+            }
+            Some(Mount {
+                id: fields[0].parse().ok()?,
+                point: unescape(fields[4]).into(),
+                root: unescape(fields[3]),
+                fs: unescape(tail[0]),
+                source: unescape(tail[1]),
+            })
+        })
+        .collect()
+}
+
+fn mount_state(
+    mountinfo: &mut impl ReadSeek,
+    root: &Path,
+) -> Result<(Option<String>, Option<u64>), Box<dyn Error>> {
+    mountinfo.seek(SeekFrom::Start(0))?;
+    let mut data = String::new();
+    mountinfo.read_to_string(&mut data)?;
+    let mounts = mounts(&data);
+    let best = mounts
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| root.starts_with(&m.point))
+        .max_by_key(|(n, m)| (m.point.components().count(), *n));
+    let Some((_, mount)) = best else {
+        return Ok((None, None));
+    };
+    let mut below: Vec<_> = mounts
+        .iter()
+        .filter(|m| m.point != root && m.point.starts_with(root))
+        .map(|m| m.point.to_string_lossy().into_owned())
+        .collect();
+    below.sort();
+    Ok((
+        Some(format!(
+            "{}|{}|{}|{}|{}|{:?}",
+            mount.fs,
+            mount.source,
+            mount.root,
+            mount.point.display(),
+            mount.id,
+            below
+        )),
+        Some(mount.id),
+    ))
+}
 
 pub fn mount_identity(
     mountinfo: &mut impl ReadSeek,
     root: &Path,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    mountinfo.seek(SeekFrom::Start(0))?;
-    let mut data = String::new();
-    mountinfo.read_to_string(&mut data)?;
-    let mut best: Option<(&str, String)> = None;
-    for line in data.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<_> = left.split_whitespace().collect();
-        let tail: Vec<_> = right.split_whitespace().collect();
-        if fields.len() < 5 || tail.len() < 2 {
-            continue;
-        }
-        let mount_point = fields[4];
-        if root.starts_with(mount_point)
-            && best
-                .as_ref()
-                .is_none_or(|(p, _)| p.len() < mount_point.len())
-        {
-            best = Some((
-                mount_point,
-                format!("{}|{}|{}|{}", tail[0], tail[1], fields[3], mount_point),
-            ));
-        }
-    }
-    Ok(best.map(|(_, identity)| identity))
+    Ok(mount_state(mountinfo, root)?.0)
 }
 
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
-pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
-    let i = ready.root.ok_or("missing root")?;
-    let root = &ready.config.roots[i];
-    let before = mount_identity(&mut ready.mountinfo, &root.path)?;
-    let device_before = fstat(ready.root_fd.as_ref().ok_or("missing root fd")?)?.st_dev;
-    let mut complete = before.is_some();
-    let mut walk = WalkBuilder::new(&root.path);
-    walk.follow_links(false)
-        .same_file_system(true)
-        .git_global(false)
-        .add_custom_ignore_filename(".llmindexignore");
-    let root_path = root.path.clone();
-    let nested: Vec<_> = ready
-        .config
-        .roots
-        .iter()
-        .enumerate()
-        .filter(|(n, _)| *n != i)
-        .map(|(_, r)| r.path.clone())
-        .collect();
-    let excluded = ready.config.exclude.paths.clone();
-    let state_dir = ready.config.state_dir.clone();
-    let lifts = if root.tier == Tier::Private {
-        ready.config.exclude.lift_builtin.clone()
-    } else {
-        vec![]
+pub fn root_mount_id(fd: &OwnedFd) -> Result<u64, Box<dyn Error>> {
+    Ok(statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?.stx_mnt_id)
+}
+
+pub fn open_dir(parent: &OwnedFd, name: &CStr) -> rustix::io::Result<OwnedFd> {
+    openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    )
+}
+
+fn read_ignore(parent: &OwnedFd, name: &str) -> Option<String> {
+    let fd = match openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
+            return None;
+        }
+        Err(error) => {
+            eprintln!("ignore {name}: {error}");
+            return None;
+        }
     };
-    let global = ready.global_ignore.clone();
-    let out = output.clone();
-    walk.filter_entry(move |entry| {
-        if !entry.file_type().is_some_and(|t| t.is_dir()) || entry.path() == root_path {
-            return true;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy();
-        let skip = nested.iter().any(|other| path.starts_with(other))
-            || excluded.iter().any(|p| path.starts_with(p))
-            || deny::denied(&path.to_string_lossy(), &state_dir, &lifts)
-            || global
-                .matched_path_or_any_parents(path.strip_prefix(&root_path).unwrap_or(path), true)
-                .is_ignore()
-            || SKIP_DIRS.contains(&name.as_ref())
-            || name.starts_with("result")
-            || path.join("CACHEDIR.TAG").exists();
-        if skip {
-            let relpath = path
-                .strip_prefix(&root_path)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
-            let _ = out.send(&Message::Skipped {
-                relpath,
-                reason: "directory".into(),
-            });
-        }
-        !skip
-    });
-    for entry in walk.build() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete = false;
-                continue;
+    let meta = fstat(&fd).ok()?;
+    if meta.st_mode & 0o170000 != 0o100000 || meta.st_size > 1024 * 1024 {
+        eprintln!("ignore {name}: not a regular file under 1 MiB");
+        return None;
+    }
+    let mut text = String::new();
+    if File::from(fd)
+        .take(1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .is_err()
+        || text.len() > 1024 * 1024
+    {
+        eprintln!("ignore {name}: unreadable or too large");
+        return None;
+    }
+    Some(text)
+}
+
+pub fn global_ignore() -> Gitignore {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")));
+    let mut builder = GitignoreBuilder::new("/");
+    if let Some(path) = base.map(|p| p.join("git/ignore")) {
+        match openat2(
+            CWD,
+            &path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => {
+                if let Ok(meta) = fstat(&fd) {
+                    if meta.st_mode & 0o170000 == 0o100000 && meta.st_size <= 1024 * 1024 {
+                        let mut text = String::new();
+                        if File::from(fd)
+                            .take(1024 * 1024 + 1)
+                            .read_to_string(&mut text)
+                            .is_ok()
+                            && text.len() <= 1024 * 1024
+                        {
+                            for line in text.lines() {
+                                if let Err(e) = builder.add_line(Some(path.clone()), line) {
+                                    eprintln!("global gitignore: {e}");
+                                }
+                            }
+                        } else {
+                            eprintln!("global gitignore: unreadable or too large");
+                        }
+                    } else {
+                        eprintln!("global gitignore: not a regular file under 1 MiB");
+                    }
+                }
             }
-        };
-        let path = entry.path();
-        if path == root.path {
-            continue;
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => eprintln!("global gitignore: {e}"),
         }
-        let relpath = path
-            .strip_prefix(&root.path)?
-            .to_string_lossy()
-            .into_owned();
-        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-        let reason = if entry.path_is_symlink() {
-            Some("symlink")
-        } else if ready
+    }
+    builder.build().unwrap_or_else(|e| {
+        eprintln!("global gitignore: {e}");
+        Gitignore::empty()
+    })
+}
+
+pub struct Walker<'a> {
+    ready: &'a Ready,
+    root: &'a Path,
+    local: Vec<Gitignore>,
+}
+impl<'a> Walker<'a> {
+    pub fn new(ready: &'a Ready) -> Result<Self, Box<dyn Error>> {
+        let root = &ready.config.roots[ready.root.ok_or("missing root")?].path;
+        Ok(Self {
+            ready,
+            root,
+            local: Vec::new(),
+        })
+    }
+    fn reason(&self, path: &Path, is_dir: bool) -> Option<&'static str> {
+        let i = self.ready.root?;
+        let root = &self.ready.config.roots[i];
+        let name = path.file_name().unwrap_or(OsStr::new(""));
+        if self
+            .ready
             .config
             .roots
             .iter()
             .enumerate()
-            .filter(|(n, _)| *n != i)
-            .map(|(_, r)| &r.path)
-            .any(|other| path.starts_with(other))
+            .any(|(n, r)| n != i && path.starts_with(&r.path))
         {
-            Some("nested_root")
-        } else if ready
+            return Some("nested_root");
+        }
+        if self
+            .ready
             .config
             .exclude
             .paths
             .iter()
             .any(|p| path.starts_with(p))
         {
-            Some("excluded")
-        } else if deny::denied(
-            &path.to_string_lossy(),
-            &ready.config.state_dir,
-            if root.tier == Tier::Private {
-                &ready.config.exclude.lift_builtin
-            } else {
-                &[]
-            },
-        ) {
-            Some("denied")
-        } else if ready
-            .global_ignore
-            .matched_path_or_any_parents(path.strip_prefix(&root.path).unwrap_or(path), is_dir)
-            .is_ignore()
-        {
-            Some("ignored")
-        } else if SKIP_DIRS.contains(&entry.file_name().to_string_lossy().as_ref())
-            || (is_dir && entry.file_name().to_string_lossy().starts_with("result"))
-        {
-            Some("directory")
-        } else if is_dir && path.join("CACHEDIR.TAG").exists() {
-            Some("cache")
-        } else if !is_dir && LOCKFILES.contains(&entry.file_name().to_string_lossy().as_ref()) {
-            Some("lockfile")
+            return Some("excluded");
+        }
+        let lifts = if root.tier == Tier::Private {
+            self.ready.config.exclude.lift_builtin.as_slice()
         } else {
-            None
+            &[]
         };
-        if let Some(reason) = reason {
+        if deny::denied(&path.to_string_lossy(), &self.ready.config.state_dir, lifts) {
+            return Some("denied");
+        }
+        for matcher in self
+            .local
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.ready.global_ignore))
+        {
+            let result = matcher.matched_path_or_any_parents(path, is_dir);
+            if result.is_ignore() {
+                return Some("ignored");
+            }
+            if result.is_whitelist() {
+                break;
+            }
+        }
+        if is_dir
+            && (SKIP_DIRS.iter().any(|n| OsStr::new(n) == name)
+                || name.to_string_lossy().starts_with("result"))
+        {
+            return Some("directory");
+        }
+        if !is_dir && LOCKFILES.iter().any(|n| OsStr::new(n) == name) {
+            return Some("lockfile");
+        }
+        None
+    }
+    fn load_rules(&self, fd: &OwnedFd, path: &Path) -> Gitignore {
+        let mut builder = GitignoreBuilder::new(path);
+        for name in [".gitignore", ".ignore", ".llmindexignore"] {
+            if let Some(text) = read_ignore(fd, name) {
+                for line in text.lines() {
+                    if let Err(e) = builder.add_line(Some(path.join(name)), line) {
+                        eprintln!("{}: {e}", path.join(name).display());
+                    }
+                }
+            }
+        }
+        if let Ok(git) = openat2(
+            fd,
+            ".git",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            RESOLVE,
+        ) && let Some(text) = read_ignore(&git, "info/exclude")
+        {
+            for line in text.lines() {
+                if let Err(e) = builder.add_line(Some(path.join(".git/info/exclude")), line) {
+                    eprintln!("git exclude: {e}");
+                }
+            }
+        }
+        builder.build().unwrap_or_else(|e| {
+            eprintln!("ignore rules: {e}");
+            Gitignore::empty()
+        })
+    }
+    pub fn walk<F>(&mut self, mut visit: F) -> Result<(), Box<dyn Error>>
+    where
+        F: FnMut(&Path, &Statx, Option<&OwnedFd>, Option<&str>) -> Result<(), Box<dyn Error>>,
+    {
+        let fd = self.ready.root_fd.as_ref().ok_or("missing root fd")?;
+        if let Some(reason) = self.reason(self.root, true) {
+            return Err(format!("root skipped: {reason}").into());
+        }
+        let st = statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?;
+        visit(Path::new(""), &st, Some(fd), None)?;
+        self.descend(fd, Path::new(""), &mut visit)
+    }
+    fn descend<F>(&mut self, fd: &OwnedFd, rel: &Path, visit: &mut F) -> Result<(), Box<dyn Error>>
+    where
+        F: FnMut(&Path, &Statx, Option<&OwnedFd>, Option<&str>) -> Result<(), Box<dyn Error>>,
+    {
+        let path = self.root.join(rel);
+        self.local.push(self.load_rules(fd, &path));
+        let dir = Dir::read_from(fd)?;
+        for entry in dir {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let part = OsStr::from_bytes(name.to_bytes());
+            let child_rel = rel.join(part);
+            let child_path = self.root.join(&child_rel);
+            let st = match statx(
+                fd,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW,
+                StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+            ) {
+                Ok(st) => st,
+                Err(error) => return Err(format!("stat {}: {error}", child_rel.display()).into()),
+            };
+            let is_dir = st.stx_mode & 0o170000 == 0o040000;
+            let reason = if st.stx_mode & 0o170000 == 0o120000 {
+                Some("symlink")
+            } else if !is_dir && st.stx_mode & 0o170000 != 0o100000 {
+                Some("special")
+            } else {
+                self.reason(&child_path, is_dir)
+            };
+            if reason.is_some() {
+                visit(&child_rel, &st, None, reason)?;
+                continue;
+            }
+            if is_dir {
+                match open_dir(fd, name) {
+                    Ok(child) => {
+                        if statx(&child, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?.stx_mnt_id
+                            != root_mount_id(self.ready.root_fd.as_ref().ok_or("missing root fd")?)?
+                        {
+                            visit(&child_rel, &st, None, Some("mount"))?;
+                        } else if statx(fd, part, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::MNT_ID)?
+                            .stx_ino
+                            == st.stx_ino
+                        {
+                            if statx(&child, "", AtFlags::EMPTY_PATH, StatxFlags::INO)?.stx_ino
+                                != st.stx_ino
+                            {
+                                visit(&child_rel, &st, None, Some("symlink"))?;
+                                continue;
+                            }
+                            if statx(
+                                &child,
+                                "CACHEDIR.TAG",
+                                AtFlags::SYMLINK_NOFOLLOW,
+                                StatxFlags::TYPE,
+                            )
+                            .is_ok_and(|tag| tag.stx_mode & 0o170000 == 0o100000)
+                            {
+                                visit(&child_rel, &st, None, Some("cache"))?;
+                                continue;
+                            }
+                            visit(&child_rel, &st, Some(&child), None)?;
+                            self.descend(&child, &child_rel, visit)?;
+                        } else {
+                            visit(&child_rel, &st, None, Some("symlink"))?;
+                        }
+                    }
+                    Err(rustix::io::Errno::XDEV) => visit(&child_rel, &st, None, Some("mount"))?,
+                    Err(
+                        rustix::io::Errno::LOOP
+                        | rustix::io::Errno::NOTDIR
+                        | rustix::io::Errno::NOENT,
+                    ) => visit(&child_rel, &st, None, Some("symlink"))?,
+                    Err(error) => {
+                        return Err(format!("open {}: {error}", child_rel.display()).into());
+                    }
+                }
+            } else {
+                visit(&child_rel, &st, None, None)?;
+            }
+        }
+        self.local.pop();
+        Ok(())
+    }
+    pub fn allowed_dir(&self, path: &Path) -> bool {
+        self.reason(path, true).is_none()
+    }
+    pub fn allowed_event(&mut self, rel: &Path, is_dir: bool) -> bool {
+        self.local.clear();
+        let Some(root_fd) = self.ready.root_fd.as_ref() else {
+            return false;
+        };
+        let mut opened: Option<OwnedFd> = None;
+        let mut path = self.root.to_path_buf();
+        self.local.push(self.load_rules(root_fd, &path));
+        let parts: Vec<_> = rel.components().collect();
+        for (n, part) in parts.iter().enumerate() {
+            path.push(part.as_os_str());
+            let directory = n + 1 < parts.len() || is_dir;
+            if self.reason(&path, directory).is_some() {
+                return false;
+            }
+            if n + 1 < parts.len() {
+                let Ok(name) = CString::new(part.as_os_str().as_bytes()) else {
+                    return false;
+                };
+                let fd = opened.as_ref().unwrap_or(root_fd);
+                let Ok(child) = open_dir(fd, &name) else {
+                    return false;
+                };
+                self.local.push(self.load_rules(&child, &path));
+                opened = Some(child);
+            }
+        }
+        true
+    }
+}
+
+pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
+    let i = ready.root.ok_or("missing root")?;
+    let root = &ready.config.roots[i];
+    let before = mount_state(&mut ready.mountinfo, &root.path)?;
+    let fd_id = root_mount_id(ready.root_fd.as_ref().ok_or("missing root fd")?)?;
+    let mut complete = before.1 == Some(fd_id);
+    let max_size = ready.config.limits.max_file_mb.saturating_mul(1024 * 1024);
+    let mut walker = Walker::new(ready)?;
+    if let Err(error) = walker.walk(|rel, st, _, reason| {
+        if rel.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let relpath = rel.to_string_lossy().into_owned();
+        let is_dir = st.stx_mode & 0o170000 == 0o040000;
+        if let Some(reason) =
+            reason.or_else(|| (!is_dir && st.stx_size > max_size).then_some("too_large"))
+        {
             output.send(&Message::Skipped {
                 relpath,
                 reason: reason.into(),
             })?;
-            continue;
-        }
-        let st = match statx(
-            CWD,
-            path,
-            AtFlags::SYMLINK_NOFOLLOW,
-            StatxFlags::SIZE | StatxFlags::MTIME,
-        ) {
-            Ok(st) => st,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        if !is_dir && st.stx_size > ready.config.limits.max_file_mb * 1024 * 1024 {
-            output.send(&Message::Skipped {
+        } else {
+            output.send(&Message::Entry {
                 relpath,
-                reason: "too_large".into(),
+                size: st.stx_size,
+                mtime_ns: st.stx_mtime.tv_sec * 1_000_000_000 + i64::from(st.stx_mtime.tv_nsec),
+                is_dir,
             })?;
-            continue;
+            output.entry(st.stx_size)?;
         }
-        let mtime_ns = st.stx_mtime.tv_sec * 1_000_000_000 + i64::from(st.stx_mtime.tv_nsec);
-        output.send(&Message::Entry {
-            relpath,
-            size: st.stx_size,
-            mtime_ns,
-            is_dir,
-        })?;
-        output.entry();
+        Ok(())
+    }) {
+        eprintln!("scan: {error}");
+        complete = false;
     }
-    let after = mount_identity(&mut ready.mountinfo, &root.path)?;
+    let after = mount_state(&mut ready.mountinfo, &root.path)?;
     complete &= before == after
-        && device_before == fstat(ready.root_fd.as_ref().ok_or("missing root fd")?)?.st_dev;
+        && after.1
+            == Some(root_mount_id(
+                ready.root_fd.as_ref().ok_or("missing root fd")?,
+            )?);
     output.send(&Message::ScanDone {
         complete,
-        identity_before: before,
-        identity_after: after,
+        identity_before: before.0,
+        identity_after: after.0,
     })
 }
 
 pub fn validate(paths: Vec<String>, output: &Output) -> Result<(), Box<dyn Error>> {
     for path in paths {
-        let result = validate_path(Path::new(&path));
         output.send(&Message::Validated {
+            result: validate_path(Path::new(&path)),
             path,
-            result: result.into(),
         })?;
     }
     Ok(())
 }
 
-pub fn validate_path(path: &Path) -> &'static str {
+pub fn validate_path(path: &Path) -> ValidationResult {
     let mut current = path;
     loop {
         match openat2(
             CWD,
             current,
-            OFlags::RDONLY | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         ) {
-            Ok(_) => return "ok",
-            Err(rustix::io::Errno::LOOP) => return "eloop",
+            Ok(fd) => {
+                if fstat(&fd).is_ok_and(|st| st.st_mode & 0o170000 == 0o120000) {
+                    return ValidationResult::Eloop;
+                }
+                return ValidationResult::Ok;
+            }
+            Err(rustix::io::Errno::LOOP) => return ValidationResult::Eloop,
             Err(rustix::io::Errno::NOENT) => match current.parent() {
                 Some(parent) if parent != current => current = parent,
-                _ => return "pending",
+                _ => return ValidationResult::Pending,
             },
-            Err(_) => return "pending",
+            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::ACCESS) => {
+                return ValidationResult::Ok;
+            }
+            Err(_) => return ValidationResult::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn mountinfo_identity() {
+        let data = "1 0 0:1 / / rw - ext4 /dev/root rw\n2 1 0:2 / /mnt/nas rw - nfs old rw\n3 1 0:3 / /mnt/nas rw - nfs new rw\n4 3 0:4 / /mnt/nas/x rw - tmpfs tmpfs rw\n5 1 0:5 / /mnt/nas2 rw - tmpfs tmpfs rw\n6 1 0:6 /a\\040b /space\\040name rw - fuse.x\\040y  rw";
+        let mut cursor = Cursor::new(data);
+        let identity = mount_identity(&mut cursor, Path::new("/mnt/nas"))
+            .unwrap()
+            .unwrap();
+        assert!(identity.starts_with("nfs|new|/|/mnt/nas|3|"));
+        assert!(identity.contains("/mnt/nas/x"));
+        assert!(!identity.contains("/mnt/nas2"));
+        let escaped = mount_identity(&mut cursor, Path::new("/space name"))
+            .unwrap()
+            .unwrap();
+        assert!(escaped.starts_with("fuse.x y||/a b|/space name|6|"));
+    }
+
+    #[test]
+    fn swapped_directory_is_not_followed() {
+        let base = std::env::temp_dir().join(format!("llm-index-swap-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("root/child")).unwrap();
+        let root = openat2(
+            CWD,
+            base.join("root"),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        std::fs::rename(base.join("root/child"), base.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&base, base.join("root/child")).unwrap();
+        let name = c"child";
+        assert!(open_dir(&root, name).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

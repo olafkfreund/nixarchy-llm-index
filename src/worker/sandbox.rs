@@ -3,15 +3,16 @@ use std::fs::{self, File};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-use ignore::gitignore::Gitignore;
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, PathBeneath, PathFd,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
+use super::scan;
 use crate::config::{self, Config};
+use ignore::gitignore::Gitignore;
 
 pub struct Ready {
     pub config: Config,
@@ -29,10 +30,7 @@ pub fn start(
 ) -> Result<Ready, Box<dyn Error>> {
     let mountinfo = File::open("/proc/self/mountinfo")?;
     let config = config::load(config_path)?;
-    let (global_ignore, error) = Gitignore::global();
-    if let Some(error) = error {
-        return Err(error.into());
-    }
+    let global_ignore = scan::global_ignore();
     fs::write("/proc/self/oom_score_adj", "1000")?;
     let oom_score_adj = fs::read_to_string("/proc/self/oom_score_adj")?;
     let old = getrlimit(Resource::As);
@@ -59,7 +57,7 @@ pub fn start(
         match openat2(
             CWD,
             &config.roots[i].path,
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         ) {
@@ -67,12 +65,15 @@ pub fn start(
             Err(rustix::io::Errno::LOOP) => {
                 return Err("config_error: root path contains a symlink".into());
             }
+            Err(rustix::io::Errno::NOTDIR) => {
+                return Err("config_error: root path is not a directory".into());
+            }
             Err(error) => return Err(format!("offline: {error}").into()),
         }
     } else {
         None
     };
-    restrict(role, root_fd.as_ref())?;
+    restrict(role, root_fd.as_ref()).map_err(|error| format!("offline: {error}"))?;
     Ok(Ready {
         config,
         root,
@@ -86,6 +87,7 @@ pub fn start(
 fn restrict(role: &str, root_fd: Option<&OwnedFd>) -> Result<(), Box<dyn Error>> {
     let abi = ABI::V6;
     let mut rules = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))?
         .handle_access(AccessNet::from_all(abi))?
         .create()?;
@@ -106,8 +108,10 @@ fn restrict(role: &str, root_fd: Option<&OwnedFd>) -> Result<(), Box<dyn Error>>
             ))?;
     }
     let status = rules.restrict_self()?;
-    if status.ruleset != RulesetStatus::FullyEnforced {
-        return Err("Landlock not fully enforced".into());
+    if status.ruleset == RulesetStatus::NotEnforced
+        || !matches!(status.landlock, LandlockStatus::Available { .. })
+    {
+        return Err("landlock unavailable".into());
     }
     Ok(())
 }

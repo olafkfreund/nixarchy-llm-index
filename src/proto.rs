@@ -31,6 +31,10 @@ pub struct Chunk {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "message")]
 pub enum Message {
+    RootError {
+        state: String,
+        reason: String,
+    },
     Progress {
         entries: Option<u64>,
         bytes: Option<u64>,
@@ -63,7 +67,7 @@ pub enum Message {
     },
     Validated {
         path: String,
-        result: String,
+        result: ValidationResult,
     },
     WatchEvent {
         relpath: String,
@@ -72,6 +76,14 @@ pub enum Message {
     WatchDegraded {
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationResult {
+    Ok,
+    Eloop,
+    Pending,
 }
 
 #[cfg(test)]
