@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod deny;
+pub mod extract;
 
 /// Store paths baked in at build time by `nix/package.nix`; "unset" outside Nix.
 pub fn pdfium_lib() -> &'static str {
