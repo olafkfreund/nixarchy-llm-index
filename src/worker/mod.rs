@@ -140,6 +140,9 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(ready.oom_score_adj.trim(), "1000");
+        let core_limit = rustix::process::getrlimit(rustix::process::Resource::Core);
+        assert_eq!(core_limit.current, Some(0));
+        assert_eq!(core_limit.maximum, Some(0));
         let inotify = inotify::Inotify::init().unwrap();
         let pinned = format!(
             "/proc/self/fd/{}/.",

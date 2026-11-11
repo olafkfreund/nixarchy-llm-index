@@ -201,6 +201,7 @@ fn append_range_segments(
     let mut chunk_first_row: u32 = 0;
     let mut chunk_last_row: u32 = 0;
     let mut chunk_rows: u32 = 0;
+    let mut chunk_row_numbers: Vec<u32> = Vec::with_capacity(ROWS_PER_SEGMENT);
     let mut chunk_text = String::new();
     let mut row_buf = String::new();
 
@@ -229,6 +230,7 @@ fn append_range_segments(
         }
         budget.push_str(&mut chunk_text, &row_buf)?;
         chunk_last_row = row_num;
+        chunk_row_numbers.push(row_num);
         chunk_rows += 1;
 
         if chunk_rows as usize == ROWS_PER_SEGMENT {
@@ -239,6 +241,7 @@ fn append_range_segments(
                     name: sheet_name.to_string(),
                     first_row: chunk_first_row,
                     last_row: chunk_last_row,
+                    row_numbers: std::mem::take(&mut chunk_row_numbers),
                 },
                 start_line,
                 end_line: *global_line,
@@ -256,6 +259,7 @@ fn append_range_segments(
                 name: sheet_name.to_string(),
                 first_row: chunk_first_row,
                 last_row: chunk_last_row,
+                row_numbers: chunk_row_numbers,
             },
             start_line,
             end_line: *global_line,
