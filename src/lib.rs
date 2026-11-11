@@ -3,10 +3,13 @@
 pub mod auth;
 pub mod chunk;
 pub mod config;
+pub mod db;
 pub mod deny;
+pub mod embed;
 pub mod extract;
 pub mod index;
 pub mod proto;
+pub mod rank;
 pub mod sanitize;
 pub mod worker;
 
