@@ -109,3 +109,10 @@ depend on core count and are indicative. Default limits (`workers = 2`,
 | `mcp --tier public` idle RSS | ≤ 100 MB | 14.3 MB |
 | `mcp --tier public` RSS after 1,000 distinct queries | ≤ 100 MB | 34.7 MB |
 | 100 local edits searchable | ≤ 5 min | 3.3 s |
+
+Second smoke run pinned to 4 cores (`taskset -c 0-3`, same Threadripper
+3995WX, default limits): initial index 83 s, cgroup `memory.peak` 223 MB
+(includes page cache of the files read, reclaimable under `MemoryHigh`),
+`mcp` 14.4 MB idle and 34.8 MB after 1,000 queries, 100 edits searchable in
+2.9 s. With `workers = 2` the core count barely matters; disk and per-core
+speed on the reference laptop decide the real figure.
