@@ -145,11 +145,35 @@ let
     "exclusion outside every root fires the exclusion assertion only" =
       only "at or under a root path" (fired { exclude.paths = [ "/elsewhere" ]; });
     "relative root fires the absolute-path assertion only" =
-      only "must be absolute" (fired { roots = roots // { rel.path = "rel"; }; });
+      only "absolute and normalized" (fired { roots = roots // { rel.path = "rel"; }; });
+    "non-normal roots fire the normalization assertion" = lib.all (
+      p: only "absolute and normalized" (fired { roots = roots // { x.path = p; }; })
+    ) [ "/a/./b" "/a/../b" "/a//b" "/a/b/" ];
+    "duplicate root path fires the duplicate assertion only" =
+      only "duplicate root path" (fired { roots = roots // { dup.path = "/mnt/nas"; }; });
+    "empty root name fires the name assertion only" =
+      only "names must be nonempty" (fired { roots = roots // { "".path = "/home/alice/e"; }; });
+    "non-normal exclusion fires the exclusion normalization assertion" =
+      only "absolute and normalized" (fired { exclude.paths = [ "/home/alice/Docs/./tmp" ]; });
+    "bad interval fires the interval assertion only" = lib.all (
+      i: only "interval must match" (fired { roots = roots // { docs = roots.docs // { interval = i; }; }; })
+    ) [ "15" "5x" "m" "0m" "1.5h" ];
+    "bad backoffMax fires the backoff assertion only" = lib.all (
+      b: only "backoffMax must match" (fired { limits.backoffMax = b; })
+    ) [ "60" "1w" "" "0s" ];
+    "MemoryHigh is 75% of memoryMaxMb" =
+      hUnit.MemoryHigh == "768M" && nxUnit.MemoryHigh == "768M"
+      && (hm (llm { limits.memoryMaxMb = 2000; })).systemd.user.services.llm-index.Service.MemoryHigh == "1500M";
     "HM workers = 1 fails" = !builds (hm (llm { limits.workers = 1; })).home.activationPackage;
     "HM exclusion outside every root fails" =
       !builds (hm (llm { exclude.paths = [ "/elsewhere" ]; })).home.activationPackage;
     "HM relative root fails" = !builds (hm (llm { roots.rel.path = "rel"; })).home.activationPackage;
+    "HM duplicate root path fails" =
+      !builds (hm (llm { roots.dup.path = "/mnt/nas"; })).home.activationPackage;
+    "HM bad interval fails" =
+      !builds (hm (llm { roots.docs.interval = "5x"; })).home.activationPackage;
+    "NixOS bad backoffMax fails" =
+      !builds (nixos (llm { limits.backoffMax = "1w"; })).system.build.toplevel;
     "NixOS workers = 1 fails" = !builds (nixos (llm { limits.workers = 1; })).system.build.toplevel;
     "NixOS exclusion outside every root fails" =
       !builds (nixos (llm { exclude.paths = [ "/elsewhere" ]; })).system.build.toplevel;

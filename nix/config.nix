@@ -126,11 +126,19 @@ rec {
     in
     16 + cfg.limits.workers + local + (lib.length kinds - local) + 8;
 
+  # Mirrors Config::validate in src/config.rs (normal_absolute, uniqueness, exclusions, workers)
+  # and parse_duration in src/index/mod.rs, so a bad config fails at eval time.
   assertions =
     prefix: cfg:
     let
       roots = lib.attrValues cfg.roots;
-      under = p: lib.any (r: p == r.path || lib.hasPrefix (r.path + "/") p) roots;
+      normal =
+        p:
+        lib.hasPrefix "/" p
+        && (p == "/" || lib.all (c: c != "" && c != "." && c != "..") (lib.splitString "/" (lib.removePrefix "/" p)));
+      under = p: lib.any (r: r.path == "/" || p == r.path || lib.hasPrefix (r.path + "/") p) roots;
+      duration = s: builtins.match "[0-9]+[smhd]" s != null && builtins.match "0+[smhd]" s == null;
+      paths = map (r: r.path) roots;
     in
     [
       {
@@ -138,12 +146,32 @@ rec {
         message = "${prefix}.limits.workers must be at least 2";
       }
       {
-        assertion = lib.all (r: lib.hasPrefix "/" r.path) roots;
-        message = "${prefix}.roots: every path must be absolute";
+        assertion = lib.all normal paths;
+        message = "${prefix}.roots: every path must be absolute and normalized (no ., .., // or trailing /)";
+      }
+      {
+        assertion = lib.length (lib.unique paths) == lib.length paths;
+        message = "${prefix}.roots: duplicate root path";
+      }
+      {
+        assertion = lib.all (n: n != "") (lib.attrNames cfg.roots);
+        message = "${prefix}.roots: root names must be nonempty";
+      }
+      {
+        assertion = lib.all normal cfg.exclude.paths;
+        message = "${prefix}.exclude.paths: every exclusion must be absolute and normalized";
       }
       {
         assertion = lib.all under cfg.exclude.paths;
         message = "${prefix}.exclude.paths: every exclusion must be at or under a root path";
+      }
+      {
+        assertion = lib.all (r: duration r.interval) roots;
+        message = "${prefix}.roots: interval must match [0-9]+[smhd] and be nonzero";
+      }
+      {
+        assertion = duration cfg.limits.backoffMax;
+        message = "${prefix}.limits.backoffMax must match [0-9]+[smhd] and be nonzero";
       }
     ];
 
@@ -163,7 +191,7 @@ rec {
       Nice = 19;
       IOSchedulingClass = "idle";
       CPUWeight = 20;
-      MemoryHigh = "768M";
+      MemoryHigh = "${toString (cfg.limits.memoryMaxMb * 3 / 4)}M"; # 75% of MemoryMax
       MemoryMax = "${toString cfg.limits.memoryMaxMb}M";
       OOMPolicy = "continue";
       TasksMax = tasksMax cfg;
