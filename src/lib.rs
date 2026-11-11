@@ -1,0 +1,27 @@
+//! llm-index library root.
+
+pub mod auth;
+pub mod chunk;
+pub mod config;
+pub mod db;
+pub mod deny;
+pub mod embed;
+#[cfg(feature = "eval")]
+pub mod eval;
+pub mod extract;
+pub mod index;
+pub mod mcp;
+pub mod proto;
+pub mod rank;
+pub mod sanitize;
+pub mod status;
+pub mod worker;
+
+/// Store paths baked in at build time by `nix/package.nix`; "unset" outside Nix.
+pub fn pdfium_lib() -> &'static str {
+    option_env!("LLM_INDEX_PDFIUM_LIB").unwrap_or("unset")
+}
+
+pub fn model_dir() -> &'static str {
+    option_env!("LLM_INDEX_MODEL_DIR").unwrap_or("unset")
+}

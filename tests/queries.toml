@@ -1,0 +1,179 @@
+# 40 labelled queries for `llm-index eval-recall`; paths are relative to the fixture root.
+
+[[query]]
+text = "how to grow red salad fruit in the sun"
+expect = ["docs/garden.md"]
+
+[[query]]
+text = "making a loaf with wild yeast"
+expect = ["docs/sourdough.md"]
+
+[[query]]
+text = "putting aside money every month"
+expect = ["docs/budget.md"]
+
+[[query]]
+text = "looking at planets through a lens"
+expect = ["docs/astronomy.md"]
+
+[[query]]
+text = "holiday in an ancient Japanese capital"
+expect = ["docs/travel-japan.md"]
+
+[[query]]
+text = "getting a good night of rest"
+expect = ["docs/medicine.md"]
+
+[[query]]
+text = "configuring wifi at home"
+expect = ["docs/networking.md"]
+
+[[query]]
+text = "dessert made with citrus fruit"
+expect = ["web/recipe.html"]
+
+[[query]]
+text = "ending a contract early"
+expect = ["docs/contract.docx"]
+
+[[query]]
+text = "cleaning a coffee maker"
+expect = ["docs/manual.odt"]
+
+[[query]]
+text = "error detecting hash over a byte buffer"
+expect = ["code/checksum.rs"]
+
+[[query]]
+text = "loading configuration from disk with default values"
+expect = ["code/config_loader.py"]
+
+[[query]]
+text = "adding work to a channel for workers"
+expect = ["code/queue.go"]
+
+[[query]]
+text = "company earnings went up"
+expect = ["docs/report.pdf"]
+
+[[query]]
+text = "Galilean"
+expect = ["docs/astronomy.md"]
+
+[[query]]
+text = "ryokan"
+expect = ["docs/travel-japan.md"]
+
+[[query]]
+text = "suckers"
+expect = ["docs/garden.md"]
+
+[[query]]
+text = '"Dutch oven"'
+expect = ["docs/sourdough.md"]
+
+[[query]]
+text = "forklift"
+expect = ["data/inventory.csv"]
+
+[[query]]
+text = "Scandinavia"
+expect = ["data/sales.xlsx"]
+
+[[query]]
+text = "Judit"
+expect = ["data/members.ods"]
+
+[[query]]
+text = "harbourlighthouse"
+expect = ["web/longline.html"]
+
+[[query]]
+text = "Quarterly planning"
+field = "title"
+expect = ["docs/meeting-notes.md"]
+
+[[query]]
+text = "Service agreement"
+field = "title"
+expect = ["docs/contract.docx"]
+
+[[query]]
+text = "Lemon cake"
+field = "title"
+expect = ["web/recipe.html"]
+
+[[query]]
+text = "Annual financial report"
+field = "title"
+expect = ["docs/report.pdf"]
+
+[[query]]
+text = "Espresso machine manual"
+field = "title"
+expect = ["docs/manual.odt"]
+
+[[query]]
+text = "japan"
+field = "path"
+expect = ["docs/travel-japan.md"]
+
+[[query]]
+text = "checksum"
+field = "path"
+expect = ["code/checksum.rs"]
+
+[[query]]
+text = "inventory"
+field = "path"
+expect = ["data/inventory.csv"]
+
+[[query]]
+text = "queue"
+field = "path"
+expect = ["code/queue.go"]
+
+[[query]]
+text = "turnover regions"
+folder = "data"
+expect = ["data/sales.xlsx"]
+
+[[query]]
+text = "work queue"
+folder = "code"
+expect = ["code/queue.go"]
+
+[[query]]
+text = "cake"
+folder = "web"
+expect = ["web/recipe.html"]
+
+[[query]]
+text = "revenue"
+type = "pdf"
+expect = ["docs/report.pdf"]
+
+[[query]]
+text = "terminate"
+type = "docx"
+expect = ["docs/contract.docx"]
+
+[[query]]
+text = "checksum"
+type = "code"
+expect = ["code/checksum.rs"]
+
+[[query]]
+text = "bread"
+before = 1609459200
+expect = ["docs/sourdough.md"]
+
+[[query]]
+text = "Kyoto temples"
+before = 1609459200
+expect = ["docs/travel-japan.md"]
+
+[[query]]
+text = "tomato"
+after = 1735689600
+expect = ["docs/garden.md"]
