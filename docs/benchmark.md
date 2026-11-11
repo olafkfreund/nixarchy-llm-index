@@ -94,3 +94,18 @@ To be filled by the owner after running `bench/run.sh` on the reference laptop:
 | `mcp --tier public` idle VmRSS | <= 100 MB | |
 | `mcp --tier public` warm VmRSS (1,000 queries) | <= 100 MB | |
 | 100 local edits searchable latency | <= 5 min (300 s) | |
+
+## Smoke run on p620 (not the reference laptop)
+
+Run on 2026-11-11 to prove the procedure works; p620 has 128 cores and 251 GB
+RAM, so the time is not evidence for the laptop bound. Memory figures do not
+depend on core count and are indicative. Default limits (`workers = 2`,
+`MemoryMax=1G`).
+
+| Metric | Bound | Measured |
+| --- | --- | --- |
+| Initial index, 10,000 files (99 MB, 15,000 PDF pages) | ≤ 2 h | 93 s |
+| Indexer cgroup `memory.peak` | ≤ 1 GB | 229 MB |
+| `mcp --tier public` idle RSS | ≤ 100 MB | 14.3 MB |
+| `mcp --tier public` RSS after 1,000 distinct queries | ≤ 100 MB | 34.7 MB |
+| 100 local edits searchable | ≤ 5 min | 3.3 s |

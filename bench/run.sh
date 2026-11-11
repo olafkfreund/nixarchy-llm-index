@@ -101,19 +101,12 @@ systemd-run --user --scope --unit="$SCOPE_UNIT" \
 INDEX_PID=$!
 
 read_cgroup_peak_bytes() {
-  local pid="$1"
+  # Read the scope's own cgroup, never the PID's: right after systemd-run starts, the PID can
+  # still sit in the parent (user slice) cgroup, whose memory.peak covers the whole session.
   local cg_rel=""
-  if [ -r "/proc/$pid/cgroup" ]; then
-    cg_rel="$(sed -n 's/^0:://p' "/proc/$pid/cgroup" | head -n1)"
-  fi
+  cg_rel="$(systemctl --user show "$SCOPE_UNIT" -p ControlGroup --value 2>/dev/null || true)"
   if [ -n "$cg_rel" ] && [ -r "/sys/fs/cgroup${cg_rel}/memory.peak" ]; then
     cat "/sys/fs/cgroup${cg_rel}/memory.peak"
-    return 0
-  fi
-  local prop=""
-  prop="$(systemctl --user show "$SCOPE_UNIT" -p MemoryPeak --value 2>/dev/null || true)"
-  if [[ "$prop" =~ ^[0-9]+$ ]]; then
-    echo "$prop"
     return 0
   fi
   echo "0"
