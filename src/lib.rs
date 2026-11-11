@@ -1,10 +1,12 @@
 //! llm-index library root.
 
 pub mod auth;
+pub mod chunk;
 pub mod config;
 pub mod deny;
 pub mod extract;
 pub mod proto;
+pub mod sanitize;
 pub mod worker;
 
 /// Store paths baked in at build time by `nix/package.nix`; "unset" outside Nix.

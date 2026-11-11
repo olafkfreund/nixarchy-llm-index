@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 use std::path::Path;
+use std::time::Instant;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -130,6 +132,7 @@ pub enum ExtractError {
     Skipped(Skip),
     ZipBomb,
     TooLarge,
+    Timeout,
     Parse(String),
 }
 
@@ -139,6 +142,7 @@ impl fmt::Display for ExtractError {
             Self::Skipped(skip) => write!(f, "skipped: {skip}"),
             Self::ZipBomb => f.write_str("zip decompression limit exceeded"),
             Self::TooLarge => f.write_str("extracted content limit exceeded"),
+            Self::Timeout => f.write_str("timeout"),
             Self::Parse(msg) => write!(f, "{msg}"),
         }
     }
@@ -152,14 +156,42 @@ impl From<Skip> for ExtractError {
     }
 }
 
+thread_local! {
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct DeadlineGuard;
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        DEADLINE.with(|d| d.set(None));
+    }
+}
+
+pub(crate) fn check_deadline() -> Result<(), ExtractError> {
+    if let Some(deadline) = DEADLINE.with(Cell::get)
+        && Instant::now() >= deadline
+    {
+        return Err(ExtractError::Timeout);
+    }
+    Ok(())
+}
+
 pub(crate) struct TextBudget {
     used: usize,
     max: usize,
+    deadline: Option<Instant>,
+    ticks: u32,
 }
 
 impl TextBudget {
     pub(crate) fn new(max: usize) -> Self {
-        Self { used: 0, max }
+        Self {
+            used: 0,
+            max,
+            deadline: DEADLINE.with(Cell::get),
+            ticks: 0,
+        }
     }
 
     pub(crate) fn used(&self) -> usize {
@@ -175,6 +207,13 @@ impl TextBudget {
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), ExtractError> {
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks & 0xFF == 0
+            && let Some(deadline) = self.deadline
+            && Instant::now() >= deadline
+        {
+            return Err(ExtractError::Timeout);
+        }
         self.used = self.used.saturating_add(bytes);
         if self.max > 0 && self.used > self.max {
             return Err(ExtractError::TooLarge);
@@ -273,6 +312,21 @@ pub fn detect(relpath: &str, head: &[u8]) -> Result<FileType, Skip> {
 
     check_text_heuristics(relpath, file_type, head, true)?;
     Ok(file_type)
+}
+
+pub fn extract_with_deadline(
+    relpath: &str,
+    file_type: FileType,
+    bytes: &[u8],
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<Extracted, ExtractError> {
+    DEADLINE.with(|d| d.set(Some(deadline)));
+    let _guard = DeadlineGuard;
+    check_deadline()?;
+    let res = extract(relpath, file_type, bytes, limits)?;
+    check_deadline()?;
+    Ok(res)
 }
 
 pub fn extract(
@@ -584,6 +638,7 @@ pub(crate) fn verify_zip_guard(bytes: &[u8]) -> Result<(), ExtractError> {
     let mut actual_total: u64 = 0;
     let mut cursor = Cursor::new(bytes);
     for (header_start, comp_size, is_xml) in entries_meta {
+        check_deadline()?;
         cursor.set_position(header_start);
         let opts = ZipReadOptions::new()
             .ignore_crc32(true)

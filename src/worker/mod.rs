@@ -1,3 +1,4 @@
+pub mod extract;
 pub mod sandbox;
 pub mod scan;
 pub mod watch;
@@ -40,6 +41,10 @@ impl Output {
     pub fn entry(&self, bytes: u64) -> Result<(), Box<dyn Error>> {
         self.entries.set(self.entries.get() + 1);
         self.bytes.set(self.bytes.get() + bytes);
+        self.progress()
+    }
+    pub fn add_bytes(&self, bytes: u64) -> Result<(), Box<dyn Error>> {
+        self.bytes.set(self.bytes.get().saturating_add(bytes));
         self.progress()
     }
     pub fn progress(&self) -> Result<(), Box<dyn Error>> {
@@ -88,11 +93,12 @@ pub fn run(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn 
                 Job::Scan if role == "scan" => scan::scan(&mut ready, &output)?,
                 Job::Validate { paths } if role == "validate" => scan::validate(paths, &output)?,
                 Job::Watch if role == "watch" => watch::watch(&mut ready, &output)?,
-                Job::Extract { relpath, .. } if role == "extract" => {
-                    output.send(&Message::Failed {
-                        relpath,
-                        reason: "not implemented".into(),
-                    })?
+                Job::Extract {
+                    relpath,
+                    expected_size,
+                    expected_mtime_ns,
+                } if role == "extract" => {
+                    extract::extract(&ready, relpath, expected_size, expected_mtime_ns, &output)?
                 }
                 _ => return Err("job does not match worker role".into()),
             }

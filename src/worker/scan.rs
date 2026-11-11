@@ -16,7 +16,7 @@ use crate::config::Tier;
 use crate::deny;
 use crate::proto::{Message, MountIdentity, Share, ValidationResult};
 
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "vendor",
@@ -27,7 +27,7 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
     ".direnv",
 ];
-const LOCKFILES: &[&str] = &[
+pub(crate) const LOCKFILES: &[&str] = &[
     "Cargo.lock",
     "package-lock.json",
     "yarn.lock",
@@ -40,7 +40,7 @@ const LOCKFILES: &[&str] = &[
     "go.sum",
     "uv.lock",
 ];
-const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+pub(crate) const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_XDEV);
@@ -49,7 +49,7 @@ fn recoverable(error: rustix::io::Errno) -> bool {
     matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::NOENT)
 }
 
-fn errno_reason(error: rustix::io::Errno) -> String {
+pub(crate) fn errno_reason(error: rustix::io::Errno) -> String {
     match error {
         rustix::io::Errno::ACCESS => "EACCES".into(),
         rustix::io::Errno::NOENT => "ENOENT".into(),

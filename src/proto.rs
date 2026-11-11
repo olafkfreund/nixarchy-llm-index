@@ -31,7 +31,7 @@ pub enum Job {
     Shutdown,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Chunk {
     pub ord: usize,
     pub kind: String,
