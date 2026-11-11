@@ -17,6 +17,12 @@ clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.2.1"
 blake3 = "1.8.7"
+scraper = "0.29.0"
+pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+calamine = "0.38.0"
+csv = "1.4.0"
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.42.0"
 landlock = "0.4.7"
 rustix = { version = "1.1.6", features = ["event", "fs", "process"] }
 ignore = "0.4.34"
