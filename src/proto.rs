@@ -1,5 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Share {
+    pub fstype: String,
+    pub source: String,
+    pub mount_root: String,
+    pub mount_point: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct MountIdentity {
+    pub share: Share,
+    pub mount_id: u64,
+    pub submounts: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum Job {
@@ -51,8 +66,8 @@ pub enum Message {
     },
     ScanDone {
         complete: bool,
-        identity_before: Option<String>,
-        identity_after: Option<String>,
+        identity_before: Option<MountIdentity>,
+        identity_after: Option<MountIdentity>,
     },
     Extracted {
         relpath: String,
@@ -100,5 +115,23 @@ mod tests {
             serde_json::from_str::<Job>(r#"{"type":"Shutdown"}"#).unwrap(),
             Job::Shutdown
         ));
+        assert_eq!(
+            serde_json::to_string(&Message::ScanDone {
+                complete: true,
+                identity_before: Some(MountIdentity {
+                    share: Share {
+                        fstype: "nfs".into(),
+                        source: "host:/share".into(),
+                        mount_root: "/".into(),
+                        mount_point: "/mnt/share".into(),
+                    },
+                    mount_id: 42,
+                    submounts: vec!["/mnt/share/sub".into()],
+                }),
+                identity_after: None,
+            })
+            .unwrap(),
+            r#"{"message":"ScanDone","complete":true,"identity_before":{"share":{"fstype":"nfs","source":"host:/share","mount_root":"/","mount_point":"/mnt/share"},"mount_id":42,"submounts":["/mnt/share/sub"]},"identity_after":null}"#
+        );
     }
 }

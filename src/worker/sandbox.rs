@@ -73,7 +73,10 @@ pub fn start(
     } else {
         None
     };
-    restrict(role, root_fd.as_ref()).map_err(|error| format!("offline: {error}"))?;
+    restrict(role, root_fd.as_ref()).map_err(|error| {
+        eprintln!("landlock: {error}");
+        "config_error: landlock unavailable"
+    })?;
     Ok(Ready {
         config,
         root,

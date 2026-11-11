@@ -4,7 +4,7 @@ pub mod watch;
 
 use std::cell::Cell;
 use std::error::Error;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -77,8 +77,12 @@ pub fn run(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn 
         }
     };
     (|| -> Result<(), Box<dyn Error>> {
-        for line in io::stdin().lock().lines() {
-            let job: Job = serde_json::from_str(&line?)?;
+        loop {
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line)? == 0 {
+                break;
+            }
+            let job: Job = serde_json::from_str(&line)?;
             match job {
                 Job::Shutdown => break,
                 Job::Scan if role == "scan" => scan::scan(&mut ready, &output)?,
@@ -160,6 +164,21 @@ mod tests {
         let base = std::env::temp_dir().join(format!("llm-index-worker-{}", std::process::id()));
         fs::create_dir_all(base.join("root/child")).unwrap();
         fs::write(base.join("root/parent.txt"), "parent").unwrap();
+        fs::write(base.join("root/ignored.txt"), "ignored").unwrap();
+        fs::create_dir_all(base.join("config-home/git")).unwrap();
+        fs::write(base.join("ignore-source"), "ignored.txt\n").unwrap();
+        std::os::unix::fs::symlink(
+            base.join("ignore-source"),
+            base.join("config-home/git/ignore"),
+        )
+        .unwrap();
+        fs::create_dir(base.join("root/noaccess")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            base.join("root/noaccess"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
         fs::write(base.join("root/.env"), "parent.txt\n").unwrap();
         std::os::unix::fs::symlink(".env", base.join("root/.llmindexignore")).unwrap();
         rustix::fs::mkfifoat(
@@ -182,6 +201,7 @@ mod tests {
             .args(["--exact", "worker::tests::sandbox_child", "--nocapture"])
             .env("LLM_INDEX_SANDBOX_CHILD", "1")
             .env("LLM_INDEX_TEST_BASE", &base)
+            .env("XDG_CONFIG_HOME", base.join("config-home"))
             .output()
             .unwrap();
         assert!(
@@ -192,6 +212,8 @@ mod tests {
         let stdout = String::from_utf8_lossy(&result.stdout);
         assert!(stdout.contains("1 passed"));
         assert!(stdout.contains("parent.txt"));
+        assert!(stdout.contains("\"relpath\":\"ignored.txt\",\"reason\":\"ignored\""));
+        assert!(stdout.contains("\"relpath\":\"noaccess\",\"reason\":\"EACCES\""));
         assert!(stdout.contains("\"reason\":\"symlink\""));
         assert!(stdout.contains("\"relpath\":\".llmindexignore\",\"reason\":\"symlink\""));
         assert!(stdout.contains("\"complete\":true"));
@@ -204,6 +226,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(done["identity_before"], done["identity_after"]);
+        assert!(done["identity_before"]["share"]["mount_point"].is_string());
+        assert!(done["identity_before"]["mount_id"].is_number());
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worker::tests::sandbox_child_root",
+                "--nocapture",
+            ])
+            .env("LLM_INDEX_SANDBOX_CHILD", "1")
+            .env("LLM_INDEX_TEST_BASE", &base)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let child_stdout = String::from_utf8_lossy(&child.stdout);
+        assert_eq!(child_stdout.matches("nested.txt").count(), 1);
         fs::remove_file(base.join("root/.llmindexignore")).unwrap();
         fs::rename(base.join("root/.ignore"), base.join("root/.llmindexignore")).unwrap();
         let fifo = Command::new(std::env::current_exe().unwrap())
@@ -218,7 +259,105 @@ mod tests {
             String::from_utf8_lossy(&fifo.stderr)
         );
         assert!(String::from_utf8_lossy(&fifo.stdout).contains("1 passed"));
+        fs::set_permissions(
+            base.join("root/noaccess"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn sandbox_child_root() {
+        if std::env::var_os("LLM_INDEX_SANDBOX_CHILD").is_none() {
+            return;
+        }
+        let base = std::env::var("LLM_INDEX_TEST_BASE").unwrap();
+        let mut ready =
+            sandbox::start(&Path::new(&base).join("config.toml"), "scan", Some("child")).unwrap();
+        scan::scan(&mut ready, &Output::new()).unwrap();
+    }
+
+    #[test]
+    fn watch_child() {
+        if std::env::var_os("LLM_INDEX_WATCH_CHILD").is_none() {
+            return;
+        }
+        let base = std::env::var("LLM_INDEX_TEST_BASE").unwrap();
+        let mut ready =
+            sandbox::start(&Path::new(&base).join("config.toml"), "watch", Some("root")).unwrap();
+        watch::watch(&mut ready, &Output::new()).unwrap();
+    }
+
+    #[test]
+    fn watcher_closes_fds_and_watches_recreated_directory() {
+        use std::process::Stdio;
+        let base = std::env::temp_dir().join(format!("llm-index-watch-{}", std::process::id()));
+        fs::create_dir_all(base.join("root/recreated")).unwrap();
+        for n in 0..1100 {
+            fs::create_dir(base.join(format!("root/dir-{n}"))).unwrap();
+        }
+        fs::write(
+            base.join("config.toml"),
+            format!(
+                "state_dir = \"/tmp/state\"\n[[root]]\nname = \"root\"\npath = \"{}\"\n",
+                base.join("root").display()
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worker::tests::watch_child", "--nocapture"])
+            .env("LLM_INDEX_WATCH_CHILD", "1")
+            .env("LLM_INDEX_TEST_BASE", &base)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let watched = fs::read_dir(format!("/proc/{}/fdinfo", child.id()))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+                .map(|info| {
+                    info.lines()
+                        .filter(|line| line.starts_with("inotify wd:"))
+                        .count()
+                })
+                .sum::<usize>();
+            if watched >= 1102 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "only {watched} directories watched"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let fds = fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .unwrap()
+            .count();
+        assert!(fds < 64, "watcher held {fds} fds");
+        fs::remove_dir(base.join("root/recreated")).unwrap();
+        fs::create_dir(base.join("root/recreated")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(base.join("root/recreated/new.txt"), "new").unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"type\":\"Shutdown\"}\n")
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("recreated/new.txt"));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
