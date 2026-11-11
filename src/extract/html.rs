@@ -181,7 +181,7 @@ fn prune_deep_html(html: &str, max_depth: usize) -> Cow<'_, str> {
     let bytes = html.as_bytes();
     let len = bytes.len();
     let mut pos = 0usize;
-    let mut depth = 0usize;
+    let mut stack: Vec<&str> = Vec::new();
     let mut keep_start = 0usize;
     let mut out: Option<String> = None;
 
@@ -242,27 +242,35 @@ fn prune_deep_html(html: &str, max_depth: usize) -> Cow<'_, str> {
         let Some(gt) = find_tag_close(bytes, name_end) else {
             break;
         };
-        let self_closing = !is_close && bytes[gt.saturating_sub(1)] == b'/';
+        // HTML ignores `/>` on non-void elements, so `<div/>` opens a div; treat it so.
         let next_pos = gt + 1;
 
         if is_close {
-            if !is_void_element(tag_name) && depth > 0 {
-                if depth == max_depth + 1 {
+            // Only a close tag matching a recently opened element pops (html5ever ignores
+            // stray ones); unmatched closes leave the depth high, which only prunes more.
+            if let Some(i) = stack
+                .iter()
+                .rev()
+                .take(64)
+                .position(|open| open.eq_ignore_ascii_case(tag_name))
+            {
+                let before = stack.len();
+                stack.truncate(before - 1 - i);
+                if before > max_depth && stack.len() <= max_depth {
                     keep_start = next_pos;
                 }
-                depth -= 1;
             }
             pos = next_pos;
             continue;
         }
 
-        if !self_closing && !is_void_element(tag_name) {
+        if !is_void_element(tag_name) {
             if tag_name.eq_ignore_ascii_case("script") || tag_name.eq_ignore_ascii_case("style") {
                 pos = skip_rawtext_element(html, next_pos, tag_name);
                 continue;
             }
-            depth += 1;
-            if depth == max_depth + 1 {
+            stack.push(tag_name);
+            if stack.len() == max_depth + 1 {
                 let buf = out.get_or_insert_with(|| String::with_capacity(len.min(64 * 1024)));
                 buf.push_str(&html[keep_start..lt]);
             }
@@ -274,7 +282,7 @@ fn prune_deep_html(html: &str, max_depth: usize) -> Cow<'_, str> {
     match out {
         None => Cow::Borrowed(html),
         Some(mut buf) => {
-            if depth <= max_depth && keep_start < len {
+            if stack.len() <= max_depth && keep_start < len {
                 buf.push_str(&html[keep_start..]);
             }
             Cow::Owned(buf)

@@ -1638,6 +1638,24 @@ mod tests {
     }
 
     #[test]
+    fn html_pruner_not_fooled_by_self_closing_or_stray_close_tags() {
+        let limits = Limits::default();
+        for unit in ["<div/>", "<div></b>"] {
+            let html = format!(
+                "<html><body><p>Top</p>{}x</body></html>",
+                unit.repeat(80_000)
+            );
+            let start = Instant::now();
+            extract("deep.html", FileType::Html, html.as_bytes(), &limits).unwrap();
+            assert!(
+                start.elapsed().as_secs() < 5,
+                "{unit} x80000 took {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
     fn deeply_nested_80k_html_depth_capped_without_stack_overflow() {
         let limits = Limits::default();
         let depth = 80_000;
