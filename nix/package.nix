@@ -37,6 +37,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../Cargo.toml
       ../Cargo.lock
       ../src
+      ../share
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
@@ -52,6 +53,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   postInstall = ''
     mkdir -p $out/share/llm-index/models
+    cp share/AGENTS.snippet.md $out/share/llm-index/AGENTS.snippet.md
     ln -s ${modelDir} $out/share/llm-index/models/potion-retrieval-32M
   '';
 
