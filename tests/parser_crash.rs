@@ -40,9 +40,10 @@ impl Sink for Mem {
     fn extracted(&mut self, _: &str, f: ExtractedFile) {
         self.extracted.push(f.relpath);
     }
-    fn failed(&mut self, _: &str, relpath: &str, _: &str) {
+    fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) {
         self.failed.push(relpath.into());
     }
+    fn validated(&mut self, _: &str, _: &str, _: llm_index::proto::ValidationResult) {}
     fn root_state(&mut self, _: &str, _: &str, _: &str) {}
 }
 

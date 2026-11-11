@@ -2,13 +2,15 @@
 //! Single-threaded (one `poll(2)` loop), so the 16-thread cap holds by construction.
 pub mod sched;
 pub mod shares;
+pub mod statedir;
+pub mod store;
+pub mod validate;
 pub mod watchers;
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,7 +23,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_setfl};
 
 use crate::config::{self, Config};
-use crate::proto::{Chunk, Job, Message, MountIdentity, Share};
+use crate::proto::{Chunk, Job, Message, MountIdentity, Share, ValidationResult};
 use crate::worker;
 use sched::{Allow, Params, RootSpec, Sched};
 use shares::{WorkerId, derive};
@@ -31,6 +33,8 @@ pub enum Role {
     Scan,
     Extract,
     Watch,
+    /// Resolves the root and exclusion paths of one root without following symlinks.
+    Validate,
 }
 
 #[allow(clippy::large_enum_variant)] // one short-lived value per message
@@ -77,7 +81,9 @@ pub trait Sink {
     fn known(&self, root: &str, relpath: &str) -> Option<(u64, i64)>;
     fn scan_done(&mut self, root: &str, scan: ScanResult);
     fn extracted(&mut self, root: &str, file: ExtractedFile);
-    fn failed(&mut self, root: &str, relpath: &str, reason: &str);
+    fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str);
+    /// Result of a `validate` worker for one root or exclusion path of `root`.
+    fn validated(&mut self, root: &str, path: &str, result: ValidationResult);
     fn root_state(&mut self, root: &str, state: &str, reason: &str);
 }
 
@@ -87,36 +93,6 @@ pub trait Spawner {
     fn send(&mut self, id: WorkerId, job: &Job) -> io::Result<()>;
     /// SIGKILL; the process still counts until an `Event::Exit` reports its reaping.
     fn kill(&mut self, id: WorkerId);
-}
-
-/// Stand-in sink until the store of step 9 exists: logs state changes, keeps nothing.
-pub struct LogSink;
-
-impl Sink for LogSink {
-    fn indexed_files(&self, _: &str) -> usize {
-        0
-    }
-    fn expected_identity(&self, _: &str) -> Option<Share> {
-        None
-    }
-    fn set_expected_identity(&mut self, _: &str, _: &Share) {}
-    fn known(&self, _: &str, _: &str) -> Option<(u64, i64)> {
-        None
-    }
-    fn scan_done(&mut self, root: &str, scan: ScanResult) {
-        eprintln!(
-            "scan {root}: {} entries, complete={}",
-            scan.entries.len(),
-            scan.complete
-        );
-    }
-    fn extracted(&mut self, _: &str, _: ExtractedFile) {}
-    fn failed(&mut self, root: &str, relpath: &str, reason: &str) {
-        eprintln!("extract failed {root}/{relpath}: {reason}");
-    }
-    fn root_state(&mut self, root: &str, state: &str, reason: &str) {
-        eprintln!("root {root}: {state} {reason}");
-    }
 }
 
 struct Proc {
@@ -293,6 +269,7 @@ impl Spawner for ProcSpawner {
             Role::Scan => "scan",
             Role::Extract => "extract",
             Role::Watch => "watch",
+            Role::Validate => "validate",
         };
         let mut child = Command::new(&self.exe)
             .arg("--config")
@@ -395,13 +372,6 @@ fn specs_of(config: &Config) -> Result<(Params, Vec<RootSpec>), Box<dyn Error>> 
     Ok((params, specs))
 }
 
-fn make_state_dir(path: &Path) -> io::Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-}
-
 /// Extract policy of one config generation: auth::visible (exclusions, denylist with
 /// private-only lifts) and the file must belong to its own root, not a nested one.
 fn allow(config: Config) -> Allow {
@@ -434,7 +404,7 @@ pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config_path = &std::path::absolute(config_path)?;
     let config = config::load(config_path)?;
     let (params, specs) = specs_of(&config)?;
-    make_state_dir(&config.state_dir)?;
+    statedir::prepare(&config.state_dir)?;
     restrict_coordinator(&config.state_dir)?;
     let mut mountinfo = File::open("/proc/self/mountinfo")?;
     // The config decides what is excluded: it must not sit on a share that can hang or lie.
@@ -448,9 +418,10 @@ pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         specs,
         &mut mountinfo,
         spawner,
-        LogSink,
+        store::DbSink::open(&config.state_dir, config_path)?,
         allow(config::load(config_path)?),
     );
+    sched.set_validate_paths(validate::paths(&config));
     let (running_params, running_specs) = specs_of(&config)?;
     let mut seen = stamp(config_path);
     let start = Instant::now();
@@ -470,7 +441,12 @@ pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
                     if p != running_params || sp != running_specs {
                         return Err("roots or limits changed: restarting to apply".into());
                     }
+                    let paths = validate::paths(&new);
+                    if let Err(e) = sched.sink.reload(config_path) {
+                        eprintln!("store reload: {e}");
+                    }
                     sched.reload(allow(new), now);
+                    sched.set_validate_paths(paths);
                 }
             }
         }
@@ -489,7 +465,7 @@ pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 /// Apply the coordinator ruleset, prove it holds, and prove workers are sandboxed on this host.
 pub fn self_test(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = config::load(config_path)?;
-    make_state_dir(&config.state_dir)?;
+    statedir::prepare(&config.state_dir)?;
     let dir = config
         .state_dir
         .join(format!("selftest-{}", std::process::id()));

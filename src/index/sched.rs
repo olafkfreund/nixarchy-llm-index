@@ -1,14 +1,14 @@
 //! Scheduler: pool, per-share rule, timeouts, abandonment, solo retry, watcher lifecycle.
 //! Pure state machine: time, process control and storage are injected, so it never does I/O.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::shares::{Derived, ShareBook, Time, Verdict, WorkerId, derive, is_network, verdict};
 use super::watchers::{DEGRADED_POLL, WatchState};
 use super::{Entry, Event, ExtractedFile, Role, ScanResult, Sink, Spawner};
 use crate::config::Kind;
-use crate::proto::{Job, Message, MountIdentity, Share};
+use crate::proto::{Job, Message, MountIdentity, Share, ValidationResult};
 use crate::worker::scan::ReadSeek;
 
 pub const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,6 +66,8 @@ struct Worker {
     /// Shutdown was sent at this time; SIGKILL after `GRACE` if still not reaped.
     closing: Option<Time>,
     served: u32,
+    /// Validate jobs: paths not yet answered.
+    vleft: usize,
     network: bool,
     solo: bool,
     started: Time,
@@ -83,6 +85,9 @@ struct RootRt {
     rescan: bool,
     /// No new jobs for this root before this time (root error, identity mismatch).
     hold: Time,
+    validate_paths: Vec<String>,
+    validate_due: bool,
+    validate_at: Time,
     queue: VecDeque<(String, u64, i64)>,
     queued: HashSet<String>,
     failed: HashMap<String, (u64, i64)>,
@@ -123,6 +128,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 scan_due: Time::ZERO,
                 rescan: false,
                 hold: Time::ZERO,
+                validate_paths: Vec::new(),
+                validate_due: true,
+                validate_at: Time::ZERO,
                 queue: VecDeque::new(),
                 queued: HashSet::new(),
                 failed: HashMap::new(),
@@ -224,6 +232,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     w.scan = None;
                     self.roots[i].scan_due = now;
                 }
+                Role::Validate => {
+                    w.vleft = 0;
+                    self.roots[i].validate_due = true;
+                    self.roots[i].validate_at = now;
+                }
                 Role::Watch => {
                     let r = &mut self.roots[i].watch;
                     r.ready = false;
@@ -232,6 +245,15 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 }
             }
             self.shutdown(id, now);
+        }
+    }
+
+    /// Per root: its path and the exclusions under it, to be validated now and after changes.
+    pub fn set_validate_paths(&mut self, paths: Vec<Vec<String>>) {
+        for (r, p) in self.roots.iter_mut().zip(paths) {
+            r.validate_paths = p;
+            r.validate_due = true;
+            r.validate_at = Time::ZERO;
         }
     }
 
@@ -392,6 +414,24 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 }
                 self.shutdown(id, now);
             }
+            Message::Validated { path, result } if role == Role::Validate => {
+                w.vleft = w.vleft.saturating_sub(1);
+                let done = w.vleft == 0;
+                let r = &mut self.roots[i];
+                let name = r.spec.name.clone();
+                if result == ValidationResult::Pending {
+                    r.validate_due = true;
+                    r.validate_at = now + RETRY;
+                }
+                let is_root = Path::new(&path) == r.spec.path;
+                self.sink.validated(&name, &path, result);
+                if is_root && result == ValidationResult::Eloop {
+                    self.set_state(i, "config_error", "symlink in path");
+                }
+                if done {
+                    self.shutdown(id, now);
+                }
+            }
             Message::WatchReady if role == Role::Watch => {
                 self.roots[i].watch.ready = true;
                 self.roots[i].watch.degraded = false;
@@ -427,7 +467,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     fn fail(&mut self, i: usize, job: &ExtractJob, reason: &str) {
         let r = &mut self.roots[i];
         r.failed.insert(job.rel.clone(), (job.size, job.mtime));
-        self.sink.failed(&r.spec.name, &job.rel, reason);
+        self.sink
+            .failed(&r.spec.name, &job.rel, job.size, job.mtime, reason);
     }
 
     /// Feed the extract worker its next file, or let it exit.
@@ -469,10 +510,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     }
 
     fn others_waiting(&self, i: usize, now: Time) -> bool {
-        self.roots
-            .iter()
-            .enumerate()
-            .any(|(j, r)| j != i && r.busy.is_none() && (!r.queue.is_empty() || r.scan_due <= now))
+        self.roots.iter().enumerate().any(|(j, r)| {
+            j != i
+                && r.busy.is_none()
+                && (!r.queue.is_empty() || r.scan_due <= now || r.validate_due)
+        })
     }
 
     fn mark_overlap(&mut self, id: WorkerId) {
@@ -560,6 +602,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             },
         );
         if accepted {
+            self.roots[i].validate_due = true;
+            self.roots[i].validate_at = now;
             let share = self.roots[i].derived.share.clone();
             self.shares.healthy(&share);
             if self.roots[i].watch.degraded {
@@ -624,6 +668,12 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     self.extract_died(i, job);
                 }
             }
+            Role::Validate => {
+                if w.vleft > 0 {
+                    self.roots[i].validate_due = true;
+                    self.roots[i].validate_at = now + RETRY;
+                }
+            }
         }
     }
 
@@ -658,6 +708,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         let (network, progressed) = (w.network, w.progressed);
         let job = w.job.take();
         let was_scanning = w.scan.take().is_some();
+        let validating = std::mem::take(&mut w.vleft) > 0;
         if self.solo_running == Some(id) {
             self.solo_running = None;
         }
@@ -670,7 +721,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
         // Only a network share that stopped answering goes offline; a slow or crashing
         // extract (it made progress) only fails its file, and local roots never go offline.
-        let stuck = network && silent && (role == Role::Scan || !progressed);
+        let stuck = network && silent && (role != Role::Extract || !progressed);
+        if validating {
+            self.roots[i].validate_due = true;
+            self.roots[i].validate_at = now + RETRY;
+        }
         if let Some(job) = job {
             if stuck {
                 let r = &mut self.roots[i];
@@ -707,6 +762,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     {
                         Some((*id, "scan timeout", false))
                     }
+                    Role::Validate if w.vleft > 0 && silent => Some((*id, "no progress", true)),
                     Role::Extract if w.job.is_some() && silent => {
                         Some((*id, "extract timeout", true))
                     }
@@ -814,14 +870,19 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if r.busy.is_some() || now < r.hold || self.root_blocked(i) {
             return;
         }
-        let role = if self.has_allowed(i) {
+        let role = if self.roots[i].validate_due
+            && now >= self.roots[i].validate_at
+            && !self.roots[i].validate_paths.is_empty()
+        {
+            Role::Validate
+        } else if self.has_allowed(i) {
             Role::Extract
         } else if self.roots[i].scan_due <= now {
             Role::Scan
         } else {
             return;
         };
-        if !self.identity_allows(i, now) {
+        if role != Role::Validate && !self.identity_allows(i, now) {
             return;
         }
         if self.network(i) && !self.shares.free(&self.roots[i].derived.share, now) {
@@ -869,6 +930,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
         let mut w = new_worker(i, role, self.network(i), now);
         self.roots[i].busy = Some((id, role));
+        if role == Role::Validate {
+            let paths = self.roots[i].validate_paths.clone();
+            w.vleft = paths.len();
+            self.roots[i].validate_due = false;
+            let _ = self.spawner.send(id, &Job::Validate { paths });
+            self.workers.insert(id, w);
+            return;
+        }
         if role == Role::Scan {
             w.scan = Some(ScanBuf::default());
             let _ = self.spawner.send(id, &Job::Scan);
@@ -915,6 +984,7 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
         progressed: false,
         closing: None,
         served: 0,
+        vleft: 0,
         network,
         solo: false,
         started: now,
@@ -966,6 +1036,7 @@ mod tests {
         expected: HashMap<String, Share>,
         scans: Vec<(String, bool)>,
         failed: Vec<String>,
+        validated: Vec<(String, ValidationResult)>,
         states: RefCell<Vec<(String, String, String)>>,
     }
     impl Sink for Mem {
@@ -985,8 +1056,11 @@ mod tests {
             self.scans.push((root.into(), scan.complete));
         }
         fn extracted(&mut self, _: &str, _: ExtractedFile) {}
-        fn failed(&mut self, _: &str, relpath: &str, _: &str) {
+        fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) {
             self.failed.push(relpath.into());
+        }
+        fn validated(&mut self, _: &str, path: &str, result: ValidationResult) {
+            self.validated.push((path.into(), result));
         }
         fn root_state(&mut self, root: &str, state: &str, reason: &str) {
             self.states
@@ -1855,6 +1929,60 @@ mod tests {
             s.handle(e, Event::Exit, secs(41));
             assert_eq!(!s.shares.free(&share, secs(42)), offline);
         }
+    }
+
+    #[test]
+    fn validation_runs_first_reports_results_and_retries_pending() {
+        let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
+        s.set_validate_paths(vec![vec!["/mnt/la".into(), "/mnt/la/x".into()]]);
+        s.tick(secs(0));
+        watchers_ready(&mut s, secs(0));
+        let v = s
+            .spawner
+            .spawned
+            .iter()
+            .find(|x| x.1 == Role::Validate)
+            .unwrap()
+            .0;
+        assert_eq!(roles(&s, Role::Scan), 0, "validation goes before the scan");
+        assert!(
+            s.spawner
+                .sent
+                .iter()
+                .any(|(w, j)| *w == v && j.contains("Validate"))
+        );
+        let msg = |p: &str, r| {
+            Event::Msg(Message::Validated {
+                path: p.into(),
+                result: r,
+            })
+        };
+        s.handle(v, msg("/mnt/la/x", ValidationResult::Pending), secs(1));
+        assert!(
+            !s.spawner
+                .sent
+                .iter()
+                .any(|(w, j)| *w == v && j.contains("Shutdown"))
+        );
+        s.handle(v, msg("/mnt/la", ValidationResult::Eloop), secs(1));
+        assert!(
+            s.spawner
+                .sent
+                .iter()
+                .any(|(w, j)| *w == v && j.contains("Shutdown"))
+        );
+        assert_eq!(s.sink.validated.len(), 2);
+        assert_eq!(s.sink.states.borrow().last().unwrap().1, "config_error");
+        s.handle(v, Event::Exit, secs(2));
+        s.tick(secs(30));
+        assert_eq!(
+            roles(&s, Role::Validate),
+            1,
+            "pending path waits for the retry delay"
+        );
+        s.handle(scans(&s)[0].0, Event::Exit, secs(40)); // the scan that ran meanwhile ends
+        s.tick(secs(62));
+        assert_eq!(roles(&s, Role::Validate), 2);
     }
 
     /// Runs in a child process under a Landlock ruleset that cannot read the fixture roots.

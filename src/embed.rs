@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 pub const DIM: usize = 512;
 const ROW_BYTES: usize = DIM * 4;
 const MAX_TOKENS: usize = 512;
-const MODEL_REV: &str = "6fc8051fab2a1e0ee76689cf08c853792ac285e7";
+pub const MODEL_REV: &str = "6fc8051fab2a1e0ee76689cf08c853792ac285e7";
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
