@@ -87,6 +87,14 @@ pub fn start(
     })
 }
 
+/// Whether this kernel's Landlock can restrict TCP (ABI >= 4).
+pub fn tcp_restriction_supported() -> bool {
+    Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessNet::BindTcp)
+        .is_ok()
+}
+
 fn restrict(role: &str, root_fd: Option<&OwnedFd>) -> Result<(), Box<dyn Error>> {
     let abi = ABI::V6;
     let mut rules = Ruleset::default()

@@ -72,16 +72,18 @@ fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn
         return Err("worker created a file in its root".into());
     }
     let denied = |e: io::Result<()>| e.is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
-    use landlock::{AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr};
-    let has_net = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(AccessNet::BindTcp)
-        .is_ok();
-    if has_net
+    if sandbox::tcp_restriction_supported()
         && !(denied(std::net::TcpListener::bind("127.0.0.1:0").map(drop))
             && denied(std::net::TcpStream::connect("127.0.0.1:1").map(drop)))
     {
         return Err("worker can open TCP".into());
+    }
+    // The root stays readable, the config next to it (outside the root) does not.
+    if std::fs::read(dir.join("fixture.txt")).is_err() {
+        return Err("worker cannot read its root".into());
+    }
+    if !std::fs::read(config).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied) {
+        return Err("worker can read outside its root".into());
     }
     let oom = ready.oom_score_adj.trim();
     if oom != "1000" {
