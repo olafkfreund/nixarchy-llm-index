@@ -23,7 +23,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_setfl};
 
 use crate::config::{self, Config};
-use crate::proto::{Chunk, Job, Message, MountIdentity, Share, ValidationResult};
+use crate::proto::{Chunk, Job, Message, Share, ValidationResult};
 use crate::worker;
 use sched::{Allow, Params, RootSpec, Sched};
 use shares::{WorkerId, derive};
@@ -56,7 +56,6 @@ pub struct Entry {
 pub struct ScanResult {
     /// Complete with equal identities before and after: deletions are allowed.
     pub complete: bool,
-    pub identity: Option<MountIdentity>,
     pub entries: Vec<Entry>,
     pub skipped: Vec<(String, String)>,
 }
@@ -82,8 +81,8 @@ pub trait Sink {
     fn scan_done(&mut self, root: &str, scan: ScanResult);
     fn extracted(&mut self, root: &str, file: ExtractedFile);
     fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str);
-    /// Result of a `validate` worker for one root or exclusion path of `root`.
-    fn validated(&mut self, root: &str, path: &str, result: ValidationResult);
+    /// Result of a `validate` worker for one root or exclusion path.
+    fn validated(&mut self, path: &str, result: ValidationResult);
     fn root_state(&mut self, root: &str, state: &str, reason: &str);
 }
 

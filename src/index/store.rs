@@ -266,7 +266,20 @@ impl DbSink {
     }
 
     /// `public.db.roots` holds only public roots; private roots live only in `private.db`.
+    /// A root that changes tier keeps its recorded share identity while its path is unchanged;
+    /// a changed path clears it so the next scan derives it again.
     fn sync_roots(&self) -> Res<()> {
+        let mut old: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+            Default::default();
+        for t in TIERS {
+            let mut stmt = self
+                .conn(t)
+                .prepare("SELECT name, path, share_id FROM roots")?;
+            for r in stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))? {
+                let (name, v) = r?;
+                old.insert(name, v);
+            }
+        }
         for t in TIERS {
             let c = self.conn(t);
             let mine: Vec<_> = self.config.roots.iter().filter(|r| r.tier == t).collect();
@@ -280,14 +293,22 @@ impl DbSink {
                 }
             }
             for r in mine {
+                let path = r.path.to_string_lossy();
+                let carried = old
+                    .get(&r.name)
+                    .filter(|(p, _)| p.as_deref() == Some(&*path))
+                    .and_then(|(_, id)| id.clone());
                 c.execute(
-                    "INSERT INTO roots(name, path, kind, state, queued, done, skipped_symlinks)
-                     VALUES(?1, ?2, ?3, '', 0, 0, 0)
-                     ON CONFLICT(name) DO UPDATE SET path = excluded.path, kind = excluded.kind",
+                    "INSERT INTO roots(name, path, kind, share_id, state, queued, done, skipped_symlinks)
+                     VALUES(?1, ?2, ?3, ?4, '', 0, 0, 0)
+                     ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,
+                       share_id = CASE WHEN path IS excluded.path THEN share_id ELSE NULL END,
+                       path = excluded.path",
                     params![
                         r.name,
-                        r.path.to_string_lossy(),
-                        format!("{:?}", r.kind).to_lowercase()
+                        path,
+                        format!("{:?}", r.kind).to_lowercase(),
+                        carried
                     ],
                 )?;
             }
@@ -295,8 +316,60 @@ impl DbSink {
         Ok(())
     }
 
+    /// Drop rows of roots no longer configured, and validation records of paths no longer
+    /// validated (root paths and exclusions under them).
+    fn prune(&self) -> Res<()> {
+        let paths: HashSet<String> = super::validate::paths(&self.config)
+            .into_iter()
+            .flatten()
+            .collect();
+        let hashes: HashSet<Vec<u8>> = paths
+            .iter()
+            .filter_map(|p| path_hash(Path::new(p)))
+            .map(|h| h.as_bytes().to_vec())
+            .collect();
+        for t in TIERS {
+            let c = self.conn(t);
+            let orphans: Vec<i64> = c
+                .prepare("SELECT id, root_id FROM files")?
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, root)| self.root(root).is_none())
+                .map(|(id, _)| id)
+                .collect();
+            let stale: Vec<Vec<u8>> = c
+                .prepare("SELECT path_blake3 FROM validated")?
+                .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|h| !hashes.contains(h))
+                .collect();
+            let tx = c.unchecked_transaction()?;
+            delete_files(&tx, &orphans)?;
+            for h in stale {
+                tx.execute("DELETE FROM validated WHERE path_blake3 = ?1", [h])?;
+            }
+            if t == Tier::Private {
+                let bad: Vec<String> = tx
+                    .prepare("SELECT path FROM config_errors")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|p| !paths.contains(p))
+                    .collect();
+                for p in bad {
+                    tx.execute("DELETE FROM config_errors WHERE path = ?1", [p])?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     /// Remove rows `visible` now rejects; move rows whose tier changed (public delete first).
     pub fn purge(&mut self) -> Res<()> {
+        self.prune()?;
         for t in TIERS {
             let c = self.conn(t);
             let ids = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Res<Vec<i64>> {
@@ -609,7 +682,7 @@ impl Sink for DbSink {
             .map_err(Into::into));
     }
 
-    fn validated(&mut self, _root: &str, path: &str, result: ValidationResult) {
+    fn validated(&mut self, path: &str, result: ValidationResult) {
         let Some(hash) = path_hash(Path::new(path)) else {
             return;
         };
@@ -718,7 +791,6 @@ mod tests {
     fn scan(complete: bool, entries: &[&str], skipped: &[(&str, &str)]) -> ScanResult {
         ScanResult {
             complete,
-            identity: None,
             entries: entries.iter().map(|e| entry(e)).collect(),
             skipped: skipped
                 .iter()
@@ -785,12 +857,9 @@ mod tests {
             },
         );
         f.sink
-            .validated("secret", "/data/secret-things", ValidationResult::Ok);
-        f.sink.validated(
-            "secret",
-            "/data/secret-things/link",
-            ValidationResult::Eloop,
-        );
+            .validated("/data/secret-things", ValidationResult::Ok);
+        f.sink
+            .validated("/data/secret-things/link", ValidationResult::Eloop);
         let ck = |c: &Connection| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         ck(&f.sink.store.public);
         let bytes = fs::read(f.dir.join("state/public.db")).unwrap();
@@ -815,17 +884,11 @@ mod tests {
     fn validation_hashes_in_both_dbs_clear_path_only_in_private() {
         let mut f = fx("valid");
         f.sink
-            .validated("secret", "/data/secret-things", ValidationResult::Ok);
-        f.sink.validated(
-            "secret",
-            "/data/secret-things/link",
-            ValidationResult::Eloop,
-        );
-        f.sink.validated(
-            "secret",
-            "/data/secret-things/later",
-            ValidationResult::Pending,
-        );
+            .validated("/data/secret-things", ValidationResult::Ok);
+        f.sink
+            .validated("/data/secret-things/link", ValidationResult::Eloop);
+        f.sink
+            .validated("/data/secret-things/later", ValidationResult::Pending);
         for t in TIERS {
             assert_eq!(count(f.sink.conn(t), "SELECT count(*) FROM validated"), 2);
             assert_eq!(
@@ -851,7 +914,7 @@ mod tests {
             "public.db has no config_errors table"
         );
         f.sink
-            .validated("secret", "/data/secret-things/link", ValidationResult::Ok);
+            .validated("/data/secret-things/link", ValidationResult::Ok);
         assert_eq!(
             count(
                 f.sink.conn(Tier::Private),
@@ -1033,6 +1096,80 @@ mod tests {
         assert_eq!(
             count(f.sink.conn(Tier::Public), "SELECT count(*) FROM chunks_fts"),
             1
+        );
+    }
+
+    fn share_of(f: &Fx, t: Tier, root: &str) -> Option<String> {
+        f.sink
+            .conn(t)
+            .query_row("SELECT share_id FROM roots WHERE name = ?1", [root], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn share_id_follows_a_tier_move_and_clears_on_a_path_change() {
+        let mut f = move_fixture("shareid");
+        let s = Share {
+            fstype: "nfs".into(),
+            source: "nas:/m".into(),
+            mount_root: "/".into(),
+            mount_point: "/data/pub/moving".into(),
+        };
+        f.sink.set_expected_identity("moving", &s);
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(
+            share_of(&f, Tier::Private, "moving"),
+            Some(serde_json::to_string(&s).unwrap())
+        );
+        assert_eq!(f.sink.expected_identity("moving"), Some(s));
+        // same tier, other path: the share is derived again
+        fs::write(
+            &f.cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"pub\"\npath = \"/data/pub\"\ntier = \"public\"\n\
+                 [[root]]\nname = \"moving\"\npath = \"/data/pub/elsewhere\"\ntier = \"private\"\n",
+                f.dir.join("state").display()
+            ),
+        )
+        .unwrap();
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(share_of(&f, Tier::Private, "moving"), None);
+    }
+
+    #[test]
+    fn rows_and_validation_of_removed_roots_are_purged() {
+        let mut f = fx("orphans");
+        f.sink.extracted("pub", extracted("a.txt", "alpha"));
+        f.sink.extracted("secret", extracted("b.txt", "beta"));
+        f.sink
+            .validated("/data/secret-things", ValidationResult::Eloop);
+        f.sink.validated("/data/pub", ValidationResult::Ok);
+        fs::write(
+            &f.cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"pub\"\npath = \"/data/pub\"\ntier = \"public\"\n",
+                f.dir.join("state").display()
+            ),
+        )
+        .unwrap();
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(files(&f.sink, Tier::Public), 1);
+        assert_eq!(files(&f.sink, Tier::Private), 0);
+        assert_eq!(
+            count(f.sink.conn(Tier::Private), "SELECT count(*) FROM chunks"),
+            0
+        );
+        for t in TIERS {
+            assert_eq!(count(f.sink.conn(t), "SELECT count(*) FROM validated"), 1);
+        }
+        assert_eq!(
+            count(
+                f.sink.conn(Tier::Private),
+                "SELECT count(*) FROM config_errors"
+            ),
+            0
         );
     }
 }

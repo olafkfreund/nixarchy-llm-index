@@ -202,7 +202,7 @@ impl Fixture {
         }) {
             Ok(id) => id,
             Err(_) => {
-                c.execute("INSERT INTO files(root_id, relpath, abspath, title, type, mtime_ns) VALUES(?1, ?2, ?2, ?3, ?4, ?5)", rusqlite::params![root, path, title, ty, now_ns()]).unwrap();
+                c.execute("INSERT INTO files(root_id, relpath, abspath, title, type, mtime_ns, state) VALUES(?1, ?2, ?2, ?3, ?4, ?5, 'ok')", rusqlite::params![root, path, title, ty, now_ns()]).unwrap();
                 let id = c.last_insert_rowid();
                 c.execute(
                     "INSERT INTO files_fts(rowid, title, path) VALUES(?1, ?2, ?3)",
