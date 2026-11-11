@@ -25,12 +25,20 @@ enum WorkerRole {
     Extract,
     Watch,
     Validate,
+    #[value(hide = true)]
+    SelftestScan,
+    #[value(hide = true)]
+    SelftestExtract,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Long-running indexing service
-    Index,
+    Index {
+        /// Check the sandbox on this host and exit
+        #[arg(long)]
+        self_test: bool,
+    },
     /// Sandboxed worker child of `index`
     Worker {
         #[arg(long, value_enum)]
@@ -50,6 +58,16 @@ enum Command {
     Paths,
 }
 
+fn config_path(given: Option<PathBuf>) -> Result<PathBuf, ExitCode> {
+    given
+        .map(Ok)
+        .unwrap_or_else(llm_index::config::default_path)
+        .map_err(|error| {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        })
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if matches!(cli.command, Command::Paths) {
@@ -63,19 +81,32 @@ fn main() -> ExitCode {
             WorkerRole::Extract => "extract",
             WorkerRole::Watch => "watch",
             WorkerRole::Validate => "validate",
+            WorkerRole::SelftestScan => "selftest-scan",
+            WorkerRole::SelftestExtract => "selftest-extract",
         };
-        let config = match cli
-            .config
-            .map(Ok)
-            .unwrap_or_else(llm_index::config::default_path)
-        {
+        let config = match config_path(cli.config) {
             Ok(path) => path,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::from(2);
-            }
+            Err(code) => return code,
         };
         return match llm_index::worker::run(&config, role, root.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if let Command::Index { self_test } = cli.command {
+        let config = match config_path(cli.config) {
+            Ok(path) => path,
+            Err(code) => return code,
+        };
+        let result = if self_test {
+            llm_index::index::self_test(&config)
+        } else {
+            llm_index::index::run(&config)
+        };
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

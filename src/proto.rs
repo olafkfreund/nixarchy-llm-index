@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 pub struct Share {
     pub fstype: String,
     pub source: String,
@@ -87,10 +87,15 @@ pub enum Message {
     WatchEvent {
         relpath: String,
         kind: String,
+        /// statx of the file at event time; `None` when gone or not a regular file.
+        size: Option<u64>,
+        mtime_ns: Option<i64>,
     },
     WatchDegraded {
         reason: String,
     },
+    /// Initial watches are in place; ends the coordinator's setup progress timeout.
+    WatchReady,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]

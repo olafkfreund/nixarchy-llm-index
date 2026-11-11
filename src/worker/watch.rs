@@ -130,6 +130,7 @@ fn watch_inner(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>>
     let mut watched = Watches::new();
     let mut by_wd = HashMap::new();
     add_watches(ready, output, &mut inotify, &mut watched, &mut by_wd, None)?;
+    output.send(&Message::WatchReady)?;
     const IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".llmindexignore"];
     let mut buffer = [0; 8192];
     let mut pending = HashMap::<PathBuf, (Instant, String)>::new();
@@ -237,11 +238,45 @@ fn watch_inner(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>>
             .collect::<Vec<_>>()
         {
             let (_, kind) = pending.remove(&path).ok_or("pending event disappeared")?;
+            let (size, mtime_ns) = stat_regular(ready, &path);
             output.send(&Message::WatchEvent {
                 relpath: path.to_string_lossy().into_owned(),
                 kind,
+                size,
+                mtime_ns,
             })?;
         }
+    }
+}
+
+/// (size, mtime_ns) of a regular file, read through fd-relative `openat2` + `statx`.
+fn stat_regular(ready: &Ready, rel: &Path) -> (Option<u64>, Option<i64>) {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (Some(root), Some(name)) = (ready.root_fd.as_ref(), rel.file_name()) else {
+        return (None, None);
+    };
+    let st = (|| {
+        let mut fd = rustix::io::dup(root).ok()?;
+        for part in rel.parent()?.components() {
+            fd = super::scan::open_dir(&fd, &CString::new(part.as_os_str().as_bytes()).ok()?)
+                .ok()?;
+        }
+        statx(
+            &fd,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::TYPE | StatxFlags::SIZE | StatxFlags::MTIME,
+        )
+        .ok()
+    })();
+    match st {
+        Some(st) if st.stx_mode & 0o170000 == 0o100000 => (
+            Some(st.stx_size),
+            Some(st.stx_mtime.tv_sec * 1_000_000_000 + i64::from(st.stx_mtime.tv_nsec)),
+        ),
+        _ => (None, None),
     }
 }
 

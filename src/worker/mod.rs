@@ -64,7 +64,37 @@ impl Output {
     }
 }
 
+/// `index --self-test` probe: the sandbox must hold for a worker on this host.
+fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let ready = sandbox::start(config, role, root)?;
+    let dir = &ready.config.roots[ready.root.ok_or("missing root")?].path;
+    if std::fs::File::create(dir.join("selftest-probe")).is_ok() {
+        return Err("worker created a file in its root".into());
+    }
+    let denied = |e: io::Result<()>| e.is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    use landlock::{AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr};
+    let has_net = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessNet::BindTcp)
+        .is_ok();
+    if has_net
+        && !(denied(std::net::TcpListener::bind("127.0.0.1:0").map(drop))
+            && denied(std::net::TcpStream::connect("127.0.0.1:1").map(drop)))
+    {
+        return Err("worker can open TCP".into());
+    }
+    let oom = ready.oom_score_adj.trim();
+    if oom != "1000" {
+        return Err(format!("oom_score_adj is {oom}").into());
+    }
+    println!("selftest ok oom_score_adj={oom}");
+    Ok(())
+}
+
 pub fn run(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(sub) = role.strip_prefix("selftest-") {
+        return selftest(config, sub, root);
+    }
     let output = Output::new();
     let mut ready = match sandbox::start(config, role, root) {
         Ok(ready) => ready,

@@ -5,6 +5,7 @@ pub mod chunk;
 pub mod config;
 pub mod deny;
 pub mod extract;
+pub mod index;
 pub mod proto;
 pub mod sanitize;
 pub mod worker;
