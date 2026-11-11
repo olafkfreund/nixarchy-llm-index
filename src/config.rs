@@ -98,11 +98,17 @@ fn default_backoff_max() -> String {
 }
 
 pub fn default_path() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(dir).join("llm-index/config.toml"));
+    // XDG spec: an empty or relative XDG_CONFIG_HOME is ignored; never resolve against the CWD.
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir.join("llm-index/config.toml"));
     }
-    let home = std::env::var_os("HOME").ok_or("HOME and XDG_CONFIG_HOME are unset")?;
-    Ok(PathBuf::from(home).join(".config/llm-index/config.toml"))
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or("no absolute XDG_CONFIG_HOME or HOME")?;
+    Ok(home.join(".config/llm-index/config.toml"))
 }
 
 pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
@@ -120,9 +126,13 @@ impl Config {
             return Err("workers must be at least 2".into());
         }
         let mut names = HashSet::new();
+        let mut paths = HashSet::new();
         for root in &self.roots {
             if root.name.is_empty() || !names.insert(&root.name) {
                 return Err("root names must be nonempty and unique".into());
+            }
+            if !paths.insert(&root.path) {
+                return Err(format!("duplicate root path: {}", root.path.display()).into());
             }
             if !normal_absolute(&root.path) {
                 return Err(format!("invalid root path: {}", root.path.display()).into());
@@ -157,6 +167,11 @@ mod tests {
     fn missing_corrupt_and_outside_exclusion() {
         assert!(load(Path::new("/surely/nonexistent/llm-index-config.toml")).is_err());
         assert!(toml::from_str::<Config>("not valid toml = [").is_err());
+        let corrupt =
+            std::env::temp_dir().join(format!("llm-index-corrupt-{}.toml", std::process::id()));
+        fs::write(&corrupt, "not valid toml = [").unwrap();
+        assert!(load(&corrupt).is_err());
+        fs::remove_file(&corrupt).unwrap();
         let config: Config = toml::from_str(
             r#"
             state_dir = "/state"
@@ -187,6 +202,25 @@ mod tests {
         assert!(config.validate().is_err());
         config.limits.workers = 2;
         config.roots[0].path = "/home/x/../other".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_root_paths() {
+        let config: Config = toml::from_str(
+            r#"
+            state_dir = "/state"
+            [[root]]
+            name = "a"
+            path = "/home/x/docs"
+            tier = "private"
+            [[root]]
+            name = "b"
+            path = "/home/x/docs"
+            tier = "public"
+        "#,
+        )
+        .unwrap();
         assert!(config.validate().is_err());
     }
 }

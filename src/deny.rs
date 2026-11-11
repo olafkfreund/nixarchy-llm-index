@@ -74,8 +74,11 @@ fn matches(abspath: &str, pattern: &str) -> bool {
     } else {
         0..path_parts.len() - parts.len() + 1
     };
+    // A match on any run of components denies that file or directory and everything below
+    // it (gitignore semantics); a trailing `/` additionally requires the match to be a
+    // directory, i.e. not the last component.
     starts.into_iter().any(|start| {
-        (directory || start + parts.len() == path_parts.len())
+        (!directory || start + parts.len() < path_parts.len())
             && parts
                 .iter()
                 .zip(&path_parts[start..])
@@ -120,5 +123,10 @@ mod tests {
         assert!(!denied("/home/x/run/x"));
         assert!(denied("/home/x/.local/state/llm-index/data"));
         assert!(denied("/home/x//.ssh/key"));
+        // patterns without a trailing slash also deny directories they name, and their contents
+        assert!(denied("/home/x/proj/.envs/.production/.django"));
+        assert!(denied("/home/x/id_rsa.d/work"));
+        assert!(denied("/home/x/.cargo/credentials.d/token"));
+        assert!(!denied("/home/x/envs/file"));
     }
 }

@@ -14,51 +14,71 @@ pub enum RootState {
 
 pub type RootStates = HashMap<String, RootState>;
 
+/// BLAKE3 hashes of validated path strings (the `validated` table): `ok` passed the
+/// symlink check, `errors` failed it (ELOOP). Only paths in the current config matter.
 #[derive(Default)]
 pub struct Validated {
-    pub paths: HashSet<blake3::Hash>,
-    pub config_error: bool,
+    pub ok: HashSet<blake3::Hash>,
+    pub errors: HashSet<blake3::Hash>,
+}
+
+pub fn path_hash(path: &Path) -> Option<blake3::Hash> {
+    path.to_str().map(|value| blake3::hash(value.as_bytes()))
 }
 
 impl Validated {
-    pub fn contains(&self, path: &Path) -> bool {
-        path.to_str()
-            .is_some_and(|value| self.paths.contains(&blake3::hash(value.as_bytes())))
+    fn state(&self, path: &Path) -> PathCheck {
+        match path_hash(path) {
+            Some(h) if self.errors.contains(&h) => PathCheck::Error,
+            Some(h) if self.ok.contains(&h) => PathCheck::Ok,
+            _ => PathCheck::Pending,
+        }
     }
 }
 
-/// Call before every public tool; the error deliberately contains no path.
+#[derive(Eq, PartialEq)]
+enum PathCheck {
+    Ok,
+    Pending,
+    Error,
+}
+
+/// Call once per public tool call, before any query; the error deliberately contains no
+/// path. Only roots and exclusions in the current config are checked, so removing a broken
+/// or pending path, or changing a tier to private, never waits for the indexer.
 pub fn public_gate(
     config: &Config,
     states: &RootStates,
     validated: &Validated,
 ) -> Result<(), &'static str> {
-    if validated.config_error
-        || config
-            .roots
-            .iter()
-            .any(|root| states.get(&root.name) == Some(&RootState::ConfigError))
-        || config
-            .roots
-            .iter()
-            .any(|root| !validated.contains(&root.path))
-        || config
-            .exclude
-            .paths
-            .iter()
-            .any(|path| !validated.contains(path))
+    let paths = config
+        .roots
+        .iter()
+        .map(|root| root.path.as_path())
+        .chain(config.exclude.paths.iter().map(|path| path.as_path()));
+    if config
+        .roots
+        .iter()
+        .any(|root| states.get(&root.name) == Some(&RootState::ConfigError))
     {
         return Err(PUBLIC_CHECKING);
+    }
+    for path in paths {
+        if validated.state(path) != PathCheck::Ok {
+            return Err(PUBLIC_CHECKING);
+        }
     }
     Ok(())
 }
 
-/// Return the tier permitted by the current configuration, using strings only.
+/// Return the tier permitted by the current configuration, using strings only. This is the
+/// pure per-row rule shared by both servers and the indexer's purge; the public server must
+/// also pass `public_gate` once per call. It never looks at validation state.
 pub fn visible(
     abspath: &str,
     config: &Config,
     states: &RootStates,
-    validated: &Validated,
+    _validated: &Validated,
 ) -> Option<Tier> {
     let path = Path::new(abspath);
     if !crate::config::normal_absolute(path) {
@@ -75,7 +95,6 @@ pub fn visible(
             .paths
             .iter()
             .any(|exclude| path.starts_with(exclude))
-        || (root.tier == Tier::Public && public_gate(config, states, validated).is_err())
     {
         return None;
     }
@@ -115,9 +134,7 @@ mod tests {
     fn validated(config: &Config) -> Validated {
         let mut result = Validated::default();
         for root in &config.roots {
-            result
-                .paths
-                .insert(blake3::hash(root.path.to_str().unwrap().as_bytes()));
+            result.ok.insert(path_hash(&root.path).unwrap());
         }
         result
     }
@@ -164,8 +181,13 @@ mod tests {
             public_gate(&config, &states, &validated),
             Err(PUBLIC_CHECKING)
         );
-        assert!(!PUBLIC_CHECKING.contains("/home"));
-        assert_eq!(visible("/home/x/a", &config, &states, &validated), None);
+        assert!(!PUBLIC_CHECKING.contains('/'));
+        // visible() is the pure per-row rule; the gate is separate, so the private server and
+        // the purge are unaffected by a pending public validation
+        assert_eq!(
+            visible("/home/x/a", &config, &states, &validated),
+            Some(Tier::Public)
+        );
         assert_eq!(
             visible("/home/x/private/a", &config, &states, &validated),
             Some(Tier::Private)
@@ -184,10 +206,47 @@ mod tests {
         );
         assert_eq!(visible("/home/x/.env", &config, &states, &validated), None);
         config.roots[0].path = "/home/x/.ssh".into();
+        let validated = self::validated(&config);
+        assert!(public_gate(&config, &states, &validated).is_ok());
         assert_eq!(
             visible("/home/x/.ssh/a", &config, &states, &validated),
             None
         );
+    }
+
+    #[test]
+    fn gate_follows_current_config_only() {
+        let mut config = fixture_config();
+        let mut validated = validated(&config);
+        let states = RootStates::new();
+        // a newly added root (any tier) closes public until validated
+        config.roots.push(
+            toml::from_str("name = \"child\"\npath = \"/home/x/child\"\ntier = \"private\"")
+                .unwrap(),
+        );
+        assert_eq!(
+            public_gate(&config, &states, &validated),
+            Err(PUBLIC_CHECKING)
+        );
+        config.roots.pop();
+        // public -> private needs no validation
+        config.roots[0].tier = Tier::Private;
+        assert!(public_gate(&config, &states, &validated).is_ok());
+        assert_eq!(
+            visible("/home/x/a", &config, &states, &validated),
+            Some(Tier::Private)
+        );
+        // a path that failed validation closes public; removing it reopens at once
+        config.exclude.paths.push("/home/x/bad-link".into());
+        validated
+            .errors
+            .insert(path_hash(Path::new("/home/x/bad-link")).unwrap());
+        assert_eq!(
+            public_gate(&config, &states, &validated),
+            Err(PUBLIC_CHECKING)
+        );
+        config.exclude.paths.clear();
+        assert!(public_gate(&config, &states, &validated).is_ok());
     }
 
     #[test]
@@ -197,9 +256,10 @@ mod tests {
             .env("LLM_INDEX_SANDBOX_CHILD", "1")
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
-            "{}",
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
