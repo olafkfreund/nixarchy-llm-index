@@ -8,9 +8,11 @@ pub mod deny;
 pub mod embed;
 pub mod extract;
 pub mod index;
+pub mod mcp;
 pub mod proto;
 pub mod rank;
 pub mod sanitize;
+pub mod status;
 pub mod worker;
 
 /// Store paths baked in at build time by `nix/package.nix`; "unset" outside Nix.

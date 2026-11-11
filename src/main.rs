@@ -114,6 +114,19 @@ fn main() -> ExitCode {
             }
         };
     }
-    eprintln!("not implemented");
-    ExitCode::from(2)
+    let config = match config_path(cli.config) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let result = match cli.command {
+        Command::Mcp { tier } => llm_index::mcp::run(&config, matches!(tier, Tier::Public)),
+        _ => llm_index::status::run(&config),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
+    }
 }

@@ -154,13 +154,22 @@ impl Store {
         })
     }
 
-    fn conns(&self) -> impl Iterator<Item = &Connection> {
+    pub fn conns(&self) -> impl Iterator<Item = &Connection> {
         std::iter::once(&self.public).chain(self.private.as_ref())
     }
 
     /// The caller's in-memory config; root states and `validated` come from the DBs per call.
     pub fn set_config(&self, config: Config) {
         self.state.lock().unwrap().config = Some(config);
+    }
+
+    pub fn with_config<R>(&self, f: impl FnOnce(&Config) -> R) -> Option<R> {
+        self.state.lock().unwrap().config.as_ref().map(f)
+    }
+
+    /// Config became missing or invalid: nothing is visible and the public gate stays closed.
+    pub fn clear_config(&self) {
+        self.state.lock().unwrap().config = None;
     }
 
     /// Start of every tool call: open a read transaction on each DB, then load `roots`

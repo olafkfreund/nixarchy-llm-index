@@ -89,14 +89,19 @@ fn fts_expr(text: &str) -> Option<String> {
     })
 }
 
-// Cheap column filters first; `visible` last. Public server rows must be public.
-// `:folder` matches case-sensitively by whole path components.
-fn eligible(mode: StoreMode) -> String {
-    let vis = if mode == StoreMode::PublicOnly {
+/// The tier test every query on `f.abspath` carries.
+pub fn visible_sql(mode: StoreMode) -> &'static str {
+    if mode == StoreMode::PublicOnly {
         "visible(f.abspath) = 'public'"
     } else {
         "visible(f.abspath) IS NOT NULL"
-    };
+    }
+}
+
+// Cheap column filters first; `visible` last. Public server rows must be public.
+// `:folder` matches case-sensitively by whole path components.
+pub fn eligible(mode: StoreMode) -> String {
+    let vis = visible_sql(mode);
     format!(
         "(:folder IS NULL OR f.abspath = :folder
            OR substr(f.abspath, 1, length(:folder) + 1) = :folder || '/')
@@ -115,7 +120,7 @@ fn run(
     extra: &[(&str, &dyn rusqlite::ToSql)],
     pool: usize,
 ) -> Res<Vec<(Hit, i64)>> {
-    let folder = q.folder.map(|f| f.trim_end_matches('/'));
+    let folder = norm_folder(q.folder)?;
     let pool = pool as i64;
     let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
         (":folder", &folder),
@@ -197,12 +202,22 @@ fn words_list(store: &Store, conn: &Connection, src: u8, q: &Query, pool: usize)
 /// One snapshot per call; the public store re-checks its gate here.
 pub fn search(store: &Store, q: &Query, qvec: Option<&[i8; DIM]>) -> Res<Vec<Hit>> {
     let _snapshot = store.begin()?;
-    store.gate()?;
-    if let Some(f) = q.folder
-        && !f.starts_with('/')
-    {
-        return Err("folder must be an absolute path".into());
+    search_in_snapshot(store, q, qvec)
+}
+
+/// The folder argument as the SQL expects it: absolute, no trailing `/`.
+pub fn norm_folder(folder: Option<&str>) -> Res<Option<&str>> {
+    match folder {
+        Some(f) if !f.starts_with('/') => Err("folder must be an absolute path".into()),
+        f => Ok(f.map(|f| f.trim_end_matches('/'))),
     }
+}
+
+/// `search` inside a snapshot the caller holds (`Store::begin`), so the caller can read
+/// hit details from the same snapshot.
+pub fn search_in_snapshot(store: &Store, q: &Query, qvec: Option<&[i8; DIM]>) -> Res<Vec<Hit>> {
+    store.gate()?;
+    norm_folder(q.folder)?;
     let limit = q.limit.clamp(1, 50);
     let pool = limit.saturating_mul(4);
     let conns: Vec<(u8, &Connection)> = std::iter::once((0, &store.public))
