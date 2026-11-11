@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 
 pub const DIM: usize = 512;
 const ROW_BYTES: usize = DIM * 4;
+const MAX_TOKENS: usize = 512;
 const MODEL_REV: &str = "6fc8051fab2a1e0ee76689cf08c853792ac285e7";
 
 type Res<T> = Result<T, Box<dyn Error>>;
@@ -31,6 +32,7 @@ pub struct Embedder {
     rows: Rows,
     data_start: u64,
     vocab: usize,
+    unk_id: Option<u32>,
 }
 
 /// The one embedding-input format: path, symbol or heading, then the chunk text.
@@ -46,10 +48,45 @@ pub fn cache_key(input: &str) -> blake3::Hash {
     h.finalize()
 }
 
+/// Validate the safetensors header; returns (absolute data start, vocab). Every size and
+/// offset is checked arithmetic and must lie inside the file.
+fn parse_header(json: &serde_json::Value, n: u64, file_len: u64) -> Res<(u64, u64)> {
+    let bad = || -> Box<dyn Error> { "embeddings must be F32 [vocab, 512] inside the file".into() };
+    let t = json.get("embeddings").ok_or("no embeddings tensor")?;
+    let shape = t["shape"].as_array().ok_or_else(bad)?;
+    if shape.len() != 2 || t["dtype"] != "F32" {
+        return Err(bad());
+    }
+    let vocab = shape[0].as_u64().ok_or_else(bad)?;
+    if shape[1].as_u64() != Some(DIM as u64) {
+        return Err(bad());
+    }
+    let offsets = t["data_offsets"].as_array().ok_or_else(bad)?;
+    if offsets.len() != 2 {
+        return Err(bad());
+    }
+    let begin = offsets[0].as_u64().ok_or_else(bad)?;
+    let end = offsets[1].as_u64().ok_or_else(bad)?;
+    let size = end.checked_sub(begin).ok_or_else(bad)?;
+    if size != vocab.checked_mul(ROW_BYTES as u64).ok_or_else(bad)? {
+        return Err(bad());
+    }
+    let start = 8u64.checked_add(n).ok_or_else(bad)?;
+    if start.checked_add(end).ok_or_else(bad)? != file_len {
+        return Err(bad());
+    }
+    Ok((start + begin, vocab)) // begin <= end, so this is <= file_len
+}
+
 impl Embedder {
     pub fn open(model_dir: &Path, mode: Mode) -> Res<Self> {
-        let tok =
-            Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
+        let tok_bytes = std::fs::read(model_dir.join("tokenizer.json"))?;
+        let tok = Tokenizer::from_bytes(&tok_bytes).map_err(|e| e.to_string())?;
+        let unk = serde_json::from_slice::<serde_json::Value>(&tok_bytes)?["model"]["unk_token"]
+            .as_str()
+            .unwrap_or("[UNK]")
+            .to_string();
+        let unk_id = tok.token_to_id(&unk);
         let file = File::open(model_dir.join("model.safetensors"))?;
         let mut len = [0u8; 8];
         file.read_exact_at(&mut len, 0)?;
@@ -60,20 +97,7 @@ impl Embedder {
         let mut header = vec![0u8; n as usize];
         file.read_exact_at(&mut header, 8)?;
         let json: serde_json::Value = serde_json::from_slice(&header)?;
-        let t = json.get("embeddings").ok_or("no embeddings tensor")?;
-        let shape = t["shape"].as_array().ok_or("bad shape")?;
-        let (vocab, dim) = (
-            shape[0].as_u64().unwrap_or(0),
-            shape[1].as_u64().unwrap_or(0),
-        );
-        let (begin, end) = (t["data_offsets"][0].as_u64(), t["data_offsets"][1].as_u64());
-        if t["dtype"] != "F32" || shape.len() != 2 || dim as usize != DIM {
-            return Err("embeddings must be F32 [vocab, 512]".into());
-        }
-        let (begin, end) = (begin.ok_or("bad offsets")?, end.ok_or("bad offsets")?);
-        if end - begin != vocab * ROW_BYTES as u64 || file.metadata()?.len() != 8 + n + end {
-            return Err("embeddings size does not match the file".into());
-        }
+        let (data_start, vocab) = parse_header(&json, n, file.metadata()?.len())?;
         let rows = match mode {
             Mode::Query => Rows::File(file),
             Mode::Bulk => {
@@ -86,13 +110,15 @@ impl Embedder {
         Ok(Self {
             tok,
             rows,
-            data_start: 8 + n + begin,
+            data_start,
             vocab: vocab as usize,
+            unk_id,
         })
     }
 
     fn add_row(&self, id: usize, acc: &mut [f32; DIM]) -> Res<()> {
-        let at = self.data_start + (id * ROW_BYTES) as u64;
+        // id < vocab and vocab * ROW_BYTES was checked against the file length at open.
+        let at = self.data_start + id as u64 * ROW_BYTES as u64;
         let mut buf = [0u8; ROW_BYTES];
         let bytes: &[u8] = match &self.rows {
             Rows::File(f) => {
@@ -107,31 +133,37 @@ impl Embedder {
         Ok(())
     }
 
-    /// Mean of the token rows, L2-normalised, ×127, rounded, clamped to i8.
-    pub fn embed(&self, text: &str) -> Res<[i8; DIM]> {
+    /// Mean of the token rows (no `[UNK]`, at most 512 tokens), L2-normalised, ×127,
+    /// rounded, clamped to i8. `None` when no usable token remains: never a zero vector.
+    pub fn embed(&self, text: &str) -> Res<Option<[i8; DIM]>> {
         let enc = self.tok.encode(text, false).map_err(|e| e.to_string())?;
         let mut acc = [0f32; DIM];
         let mut count = 0usize;
-        for &id in enc.get_ids() {
-            if (id as usize) < self.vocab {
-                self.add_row(id as usize, &mut acc)?;
-                count += 1;
-            }
+        let usable = enc
+            .get_ids()
+            .iter()
+            .filter(|&&id| Some(id) != self.unk_id && (id as usize) < self.vocab)
+            .take(MAX_TOKENS);
+        for &id in usable {
+            self.add_row(id as usize, &mut acc)?;
+            count += 1;
         }
         let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let mut out = [0i8; DIM];
-        if count > 0 && norm > 0.0 {
-            for (o, a) in out.iter_mut().zip(acc) {
-                *o = (a / norm * 127.0).round().clamp(-127.0, 127.0) as i8;
-            }
+        if count == 0 || norm == 0.0 || !norm.is_finite() {
+            return Ok(None);
         }
-        Ok(out)
+        let mut out = [0i8; DIM];
+        for (o, a) in out.iter_mut().zip(acc) {
+            *o = (a / norm * 127.0).round().clamp(-127.0, 127.0) as i8;
+        }
+        Ok(Some(out))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn rss_kb() -> u64 {
         let s = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -148,25 +180,72 @@ mod tests {
     }
 
     #[test]
-    fn query_mode_rss_stays_flat() {
+    fn malformed_headers_error_without_panic() {
+        let ok =
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 512], "data_offsets": [0, 4096]}});
+        assert_eq!(parse_header(&ok, 100, 8 + 100 + 4096).unwrap(), (108, 2));
+        let cases = [
+            json!({"embeddings": {"dtype": "F32", "shape": [], "data_offsets": [0, 0]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4096]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 512, 1], "data_offsets": [0, 4096]}}),
+            json!({"embeddings": {"dtype": "F16", "shape": [2, 512], "data_offsets": [0, 4096]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 256], "data_offsets": [0, 4096]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [u64::MAX, 512], "data_offsets": [0, 4096]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 512], "data_offsets": [4096, 0]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 512], "data_offsets": [0]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [0, 512], "data_offsets": [u64::MAX, u64::MAX]}}),
+            json!({"embeddings": {"dtype": "F32", "shape": [2, 512], "data_offsets": [0, 8192]}}),
+            json!({"embeddings": "x"}),
+            json!({}),
+        ];
+        for c in &cases {
+            assert!(parse_header(c, 100, 8 + 100 + 4096).is_err(), "{c}");
+        }
+        assert!(parse_header(&ok, u64::MAX, u64::MAX).is_err()); // 8 + n overflows
+    }
+
+    #[test]
+    fn zero_usable_tokens_give_no_vector() {
         let dir = crate::model_dir();
         if dir == "unset" {
             println!("skipped: LLM_INDEX_MODEL_DIR unset");
             return;
         }
         let e = Embedder::open(Path::new(dir), Mode::Query).unwrap();
-        let v = e.embed("warm up the tokenizer").unwrap();
-        assert!(v.iter().any(|&x| x != 0));
-        let before = rss_kb();
-        for i in 0..1000 {
-            e.embed(&format!(
-                "distinct query {i} about topic {} and {}",
-                i * 7919,
-                i * 31
-            ))
-            .unwrap();
+        assert!(e.embed("").unwrap().is_none());
+        assert!(e.embed("hello world").unwrap().is_some());
+    }
+
+    #[test]
+    fn query_mode_does_not_map_and_rss_stays_flat() {
+        let dir = crate::model_dir();
+        if dir == "unset" {
+            println!("skipped: LLM_INDEX_MODEL_DIR unset");
+            return;
+        }
+        let before = rss_kb(); // before the tokenizer and header are loaded
+        let e = Embedder::open(Path::new(dir), Mode::Query).unwrap();
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(!maps.contains("model.safetensors"), "matrix is mapped");
+        // 1,000 queries of token ids drawn from across the whole vocabulary
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for _ in 0..1000 {
+            let ids: Vec<u32> = (0..12)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x % e.vocab as u64) as u32
+                })
+                .collect();
+            let text = e.tok.decode(&ids, true).unwrap();
+            e.embed(&text).unwrap();
         }
         let grown = rss_kb().saturating_sub(before);
-        assert!(grown < 10 * 1024, "RSS grew {grown} kB");
+        let matrix_kb = (e.vocab * ROW_BYTES / 1024) as u64;
+        assert!(
+            grown < matrix_kb / 2,
+            "RSS grew {grown} kB, matrix is {matrix_kb} kB"
+        );
     }
 }
