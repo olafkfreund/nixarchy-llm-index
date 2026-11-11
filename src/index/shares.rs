@@ -66,7 +66,9 @@ pub fn verdict(
     let configured_ok = configured.is_none_or(|s| s == current.source);
     match expected {
         Some(e) if e == current => Verdict::Ok,
-        None if configured_ok => Verdict::Adopt,
+        // An unrecorded identity is adopted only by an empty root, or one whose `share` setting
+        // names the source; otherwise a restart over a missing mount could delete everything.
+        None if configured_ok && (indexed_files == 0 || configured.is_some()) => Verdict::Adopt,
         Some(e)
             if indexed_files == 0
                 && configured_ok
@@ -153,6 +155,8 @@ mod tests {
         let a = share("/mnt/nas", "nas:/a");
         let deeper = share("/mnt/nas/x", "nas:/b");
         assert_eq!(verdict(None, None, &a, 0), Verdict::Adopt);
+        assert_eq!(verdict(None, None, &a, 5), Verdict::Mismatch);
+        assert_eq!(verdict(None, Some("nas:/a"), &a, 5), Verdict::Adopt);
         assert_eq!(verdict(Some(&a), None, &a, 5), Verdict::Ok);
         assert_eq!(verdict(Some(&a), None, &deeper, 0), Verdict::Adopt);
         assert_eq!(verdict(Some(&a), None, &deeper, 1), Verdict::Mismatch);

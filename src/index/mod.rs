@@ -21,7 +21,8 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_setfl};
 
 use crate::config::{self, Config};
-use crate::proto::{Chunk, Job, Message, MountIdentity};
+use crate::proto::{Chunk, Job, Message, MountIdentity, Share};
+use crate::worker;
 use sched::{Allow, Params, RootSpec, Sched};
 use shares::{WorkerId, derive};
 
@@ -37,6 +38,8 @@ pub enum Event {
     Msg(Message),
     /// The process was reaped by `waitpid`.
     Exit,
+    /// Its stdin queue has not drained within the no-progress timeout.
+    WriteStalled,
 }
 
 pub struct Entry {
@@ -67,6 +70,9 @@ pub struct ExtractedFile {
 /// What the coordinator needs from storage; step 9 implements it over the databases.
 pub trait Sink {
     fn indexed_files(&self, root: &str) -> usize;
+    /// Share identity recorded for the root (survives restarts); `None` before the first scan.
+    fn expected_identity(&self, root: &str) -> Option<Share>;
+    fn set_expected_identity(&mut self, root: &str, share: &Share);
     /// Stored (size, mtime_ns) of a file, if indexed.
     fn known(&self, root: &str, relpath: &str) -> Option<(u64, i64)>;
     fn scan_done(&mut self, root: &str, scan: ScanResult);
@@ -90,6 +96,10 @@ impl Sink for LogSink {
     fn indexed_files(&self, _: &str) -> usize {
         0
     }
+    fn expected_identity(&self, _: &str) -> Option<Share> {
+        None
+    }
+    fn set_expected_identity(&mut self, _: &str, _: &Share) {}
     fn known(&self, _: &str, _: &str) -> Option<(u64, i64)> {
         None
     }
@@ -113,6 +123,12 @@ struct Proc {
     child: Child,
     out: ChildStdout,
     buf: Vec<u8>,
+    /// Stdout reached EOF: no longer polled, the process is reaped via `try_wait`.
+    eof: bool,
+    /// Bytes for the worker's stdin that did not fit the pipe yet.
+    outq: Vec<u8>,
+    blocked_since: Option<Instant>,
+    stalled_reported: bool,
 }
 
 pub struct ProcSpawner {
@@ -123,43 +139,90 @@ pub struct ProcSpawner {
 }
 
 const MAX_LINE: usize = 256 << 20;
+const READ_CHUNK: usize = 64 << 10;
+/// A worker whose stdin queue has not drained for this long is reported as stuck.
+const WRITE_STALL: Duration = Duration::from_secs(30);
+
+impl Proc {
+    fn parse(&mut self) -> Vec<Message> {
+        let mut out = Vec::new();
+        while let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=end).collect();
+            match serde_json::from_slice(&line) {
+                Ok(m) => out.push(m),
+                Err(e) => eprintln!("bad worker message: {e}"),
+            }
+        }
+        if self.buf.len() > MAX_LINE {
+            self.buf.clear();
+            let _ = self.child.kill();
+        }
+        out
+    }
+
+    /// At most one 64 KiB read, so a chatty worker cannot starve the loop.
+    fn read_some(&mut self) -> Vec<Message> {
+        let mut tmp = [0u8; READ_CHUNK];
+        match self.out.read(&mut tmp) {
+            Ok(0) => self.eof = true,
+            Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+            Err(_) => {}
+        }
+        self.parse()
+    }
+
+    /// After the process exited: whatever is left in the pipe is finite.
+    fn drain(&mut self) -> Vec<Message> {
+        let mut tmp = [0u8; READ_CHUNK];
+        loop {
+            match self.out.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        self.parse()
+    }
+
+    fn flush(&mut self) {
+        if let Some(stdin) = self.child.stdin.as_mut() {
+            while !self.outq.is_empty() {
+                match stdin.write(&self.outq) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        self.outq.drain(..n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        self.outq.clear(); // worker is gone; it will be reaped
+                    }
+                }
+            }
+        }
+        if self.outq.is_empty() {
+            self.blocked_since = None;
+        } else if self.blocked_since.is_none() {
+            self.blocked_since = Some(Instant::now());
+        }
+    }
+}
 
 impl ProcSpawner {
     pub fn new(config: &Path) -> io::Result<Self> {
+        Self::with_exe(std::env::current_exe()?, config)
+    }
+
+    pub fn with_exe(exe: PathBuf, config: &Path) -> io::Result<Self> {
         Ok(Self {
-            exe: std::env::current_exe()?,
+            exe,
             config: config.into(),
             next: 1,
             procs: HashMap::new(),
         })
     }
 
-    fn read_messages(p: &mut Proc) -> Vec<Message> {
-        let mut tmp = [0u8; 65536];
-        loop {
-            match p.out.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => p.buf.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        let mut out = Vec::new();
-        while let Some(end) = p.buf.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = p.buf.drain(..=end).collect();
-            match serde_json::from_slice(&line) {
-                Ok(m) => out.push(m),
-                Err(e) => eprintln!("bad worker message: {e}"),
-            }
-        }
-        if p.buf.len() > MAX_LINE {
-            p.buf.clear();
-            let _ = p.child.kill();
-        }
-        out
-    }
-
-    /// Wait up to `timeout` for worker output or a mountinfo change; reap exited workers.
+    /// Wait up to `timeout` for worker output, writable stdin or a mountinfo change; reap
+    /// exited workers.
     pub fn poll(
         &mut self,
         mountinfo: &File,
@@ -167,10 +230,20 @@ impl ProcSpawner {
     ) -> io::Result<(bool, Vec<(WorkerId, Event)>)> {
         let ids: Vec<WorkerId> = self.procs.keys().copied().collect();
         let mut fds = vec![PollFd::new(mountinfo, PollFlags::PRI | PollFlags::ERR)];
-        fds.extend(
-            ids.iter()
-                .map(|id| PollFd::new(&self.procs[id].out, PollFlags::IN)),
-        );
+        let mut which = Vec::new(); // (worker, is_stdin) per fd after the first
+        for id in &ids {
+            let p = &self.procs[id];
+            if !p.eof {
+                fds.push(PollFd::new(&p.out, PollFlags::IN));
+                which.push((*id, false));
+            }
+            if !p.outq.is_empty()
+                && let Some(stdin) = &p.child.stdin
+            {
+                fds.push(PollFd::new(stdin, PollFlags::OUT));
+                which.push((*id, true));
+            }
+        }
         let ts = Timespec {
             tv_sec: timeout.as_secs() as i64,
             tv_nsec: timeout.subsec_nanos() as i64,
@@ -180,25 +253,34 @@ impl ProcSpawner {
             Err(e) => return Err(e.into()),
         }
         let changed = fds[0].revents().intersects(PollFlags::PRI | PollFlags::ERR);
-        let ready: Vec<bool> = fds[1..].iter().map(|f| !f.revents().is_empty()).collect();
+        let ready: Vec<_> = which
+            .iter()
+            .zip(&fds[1..])
+            .filter(|(_, f)| !f.revents().is_empty())
+            .map(|(w, _)| *w)
+            .collect();
+        drop(fds);
         let mut events = Vec::new();
-        for (id, ready) in ids.into_iter().zip(ready) {
+        let msgs = |id, v: Vec<Message>| v.into_iter().map(move |m| (id, Event::Msg(m)));
+        for (id, is_stdin) in ready {
             let p = self.procs.get_mut(&id).expect("listed");
-            if ready {
-                events.extend(
-                    Self::read_messages(p)
-                        .into_iter()
-                        .map(|m| (id, Event::Msg(m))),
-                );
+            if is_stdin {
+                p.flush();
+            } else {
+                events.extend(msgs(id, p.read_some()));
             }
+        }
+        for id in ids {
+            let p = self.procs.get_mut(&id).expect("listed");
             if matches!(p.child.try_wait(), Ok(Some(_))) {
-                events.extend(
-                    Self::read_messages(p)
-                        .into_iter()
-                        .map(|m| (id, Event::Msg(m))),
-                );
+                events.extend(msgs(id, p.drain()));
                 events.push((id, Event::Exit));
                 self.procs.remove(&id);
+            } else if !p.stalled_reported
+                && p.blocked_since.is_some_and(|t| t.elapsed() >= WRITE_STALL)
+            {
+                p.stalled_reported = true;
+                events.push((id, Event::WriteStalled));
             }
         }
         Ok((changed, events))
@@ -221,6 +303,7 @@ impl Spawner for ProcSpawner {
             .spawn()?;
         let out = child.stdout.take().expect("piped");
         fcntl_setfl(&out, OFlags::NONBLOCK)?;
+        fcntl_setfl(child.stdin.as_ref().expect("piped"), OFlags::NONBLOCK)?;
         let id = self.next;
         self.next += 1;
         self.procs.insert(
@@ -229,6 +312,10 @@ impl Spawner for ProcSpawner {
                 child,
                 out,
                 buf: Vec::new(),
+                eof: false,
+                outq: Vec::new(),
+                blocked_since: None,
+                stalled_reported: false,
             },
         );
         Ok(id)
@@ -236,10 +323,10 @@ impl Spawner for ProcSpawner {
 
     fn send(&mut self, id: WorkerId, job: &Job) -> io::Result<()> {
         let p = self.procs.get_mut(&id).ok_or(io::ErrorKind::NotFound)?;
-        let stdin = p.child.stdin.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
-        let mut line = serde_json::to_vec(job).map_err(io::Error::other)?;
-        line.push(b'\n');
-        stdin.write_all(&line)
+        serde_json::to_writer(&mut p.outq, job).map_err(io::Error::other)?;
+        p.outq.push(b'\n');
+        p.flush();
+        Ok(())
     }
 
     fn kill(&mut self, id: WorkerId) {
@@ -344,11 +431,17 @@ fn stamp(path: &Path) -> Option<(u64, i64, i64, u64)> {
 }
 
 pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let config_path = &std::path::absolute(config_path)?;
     let config = config::load(config_path)?;
     let (params, specs) = specs_of(&config)?;
     make_state_dir(&config.state_dir)?;
     restrict_coordinator(&config.state_dir)?;
     let mut mountinfo = File::open("/proc/self/mountinfo")?;
+    // The config decides what is excluded: it must not sit on a share that can hang or lie.
+    if shares::is_network(&derive(&mut mountinfo, config_path).share.fstype) {
+        return Err("config.toml is on a network or FUSE filesystem: refusing to start".into());
+    }
+    std::env::set_current_dir("/")?;
     let spawner = ProcSpawner::new(config_path)?;
     let mut sched = Sched::new(
         params,
@@ -427,6 +520,12 @@ fn self_test_in(config: &Config, dir: &Path) -> Result<(), Box<dyn Error>> {
         }
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
         Err(e) => return Err(format!("unexpected error writing outside state dir: {e}").into()),
+    }
+    if worker::sandbox::tcp_restriction_supported() {
+        match std::net::TcpStream::connect("127.0.0.1:1") {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            other => return Err(format!("coordinator can open TCP: {other:?}").into()),
+        }
     }
     for role in ["selftest-scan", "selftest-extract"] {
         let out = Command::new(std::env::current_exe()?)

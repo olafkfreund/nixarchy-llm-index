@@ -18,6 +18,9 @@ pub const RETRY: Duration = Duration::from_secs(60);
 pub const TOUCH_DELAY: Duration = Duration::from_secs(5);
 /// Time a retiring worker gets to exit after `Shutdown` before SIGKILL.
 pub const GRACE: Duration = Duration::from_secs(5);
+/// An extract worker serves at most this many files / this long while others wait.
+const MAX_FILES: u32 = 64;
+const MAX_RUN: Duration = Duration::from_secs(60);
 
 /// Current-config check `(root name, relpath) -> may be extracted`, applied right before dispatch.
 pub type Allow = Box<dyn Fn(&str, &str) -> bool>;
@@ -60,6 +63,9 @@ struct Worker {
     retired: bool,
     /// Sent a byte/entry Progress during its job; silence from one that never did means stuck I/O.
     progressed: bool,
+    /// Shutdown was sent at this time; SIGKILL after `GRACE` if still not reaped.
+    closing: Option<Time>,
+    served: u32,
     network: bool,
     solo: bool,
     started: Time,
@@ -96,7 +102,6 @@ pub struct Sched<S, K> {
     solo_running: Option<WorkerId>,
     cursor: usize,
     allow: Allow,
-    retire_deadline: Time,
 }
 
 impl<S: Spawner, K: Sink> Sched<S, K> {
@@ -112,8 +117,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             .into_iter()
             .map(|spec| RootRt {
                 derived: derive(mountinfo, &spec.path),
+                expected: sink.expected_identity(&spec.name),
                 spec,
-                expected: None,
                 state: String::new(),
                 scan_due: Time::ZERO,
                 rescan: false,
@@ -137,7 +142,6 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             solo_running: None,
             cursor: 0,
             allow,
-            retire_deadline: Time::ZERO,
         }
     }
 
@@ -145,7 +149,15 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         match self.roots[i].spec.kind {
             Kind::Network => true,
             Kind::Local => false,
-            Kind::Auto => is_network(&self.roots[i].derived.share.fstype),
+            // A root recorded on a network share stays network when the share is unmounted
+            // and its path falls through to a local mount.
+            Kind::Auto => {
+                is_network(&self.roots[i].derived.share.fstype)
+                    || self.roots[i]
+                        .expected
+                        .as_ref()
+                        .is_some_and(|e| is_network(&e.fstype))
+            }
         }
     }
 
@@ -188,7 +200,6 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     /// (Shutdown now, SIGKILL after `GRACE`) and dispatch nothing until they are reaped.
     pub fn reload(&mut self, allow: Allow, now: Time) {
         self.allow = allow;
-        self.retire_deadline = now + GRACE;
         let ids: Vec<_> = self
             .workers
             .iter()
@@ -199,6 +210,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             let w = self.workers.get_mut(&id).expect("listed");
             w.retired = true;
             let i = w.root;
+            if matches!(self.roots[i].busy, Some((b, _)) if b == id) {
+                self.roots[i].busy = None;
+            }
             match w.role {
                 Role::Extract => {
                     if let Some(j) = w.job.take() {
@@ -217,8 +231,20 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     r.retry_at = now;
                 }
             }
-            let _ = self.spawner.send(id, &Job::Shutdown);
+            self.shutdown(id, now);
         }
+    }
+
+    fn shutdown(&mut self, id: WorkerId, now: Time) {
+        if let Some(w) = self.workers.get_mut(&id) {
+            w.closing.get_or_insert(now);
+        }
+        let _ = self.spawner.send(id, &Job::Shutdown);
+    }
+
+    /// No new work on a root while one of its workers is abandoned and not yet reaped.
+    fn root_blocked(&self, i: usize) -> bool {
+        self.workers.values().any(|w| w.root == i && w.abandoned)
     }
 
     /// Pop the next queued file that the current config still allows; drop the rest.
@@ -227,7 +253,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             let r = &mut self.roots[i];
             let (rel, size, mtime) = r.queue.pop_front()?;
             r.queued.remove(&rel);
-            if (self.allow)(&self.roots[i].spec.name, &rel) {
+            let (name, cur) = (&r.spec.name, (size, mtime));
+            if (self.allow)(name, &rel)
+                && self.sink.known(name, &rel) != Some(cur)
+                && r.failed.get(&rel) != Some(&cur)
+            {
                 return Some((rel, size, mtime));
             }
         }
@@ -276,6 +306,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     pub fn handle(&mut self, id: WorkerId, ev: Event, now: Time) {
         match ev {
             Event::Exit => self.reap(id, now),
+            Event::WriteStalled => self.abandon(id, "stdin blocked", true, now),
             Event::Msg(m) => self.message(id, m, now),
         }
     }
@@ -359,6 +390,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 if state == "offline" && self.network(i) {
                     self.share_offline(id, now);
                 }
+                self.shutdown(id, now);
             }
             Message::WatchReady if role == Role::Watch => {
                 self.roots[i].watch.ready = true;
@@ -404,31 +436,43 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             return;
         };
         let i = w.root;
-        let next = if w.solo || !self.identity_allows(i, now) {
-            None
-        } else {
-            self.next_allowed(i)
+        let capped = w.served >= MAX_FILES || now.saturating_sub(w.started) >= MAX_RUN;
+        let stop = w.solo
+            || !self.solo.is_empty()
+            || (capped && self.others_waiting(i, now))
+            || !self.identity_allows(i, now);
+        let next = if stop { None } else { self.next_allowed(i) };
+        let Some((rel, size, mtime)) = next else {
+            self.shutdown(id, now);
+            return;
         };
         let w = self.workers.get_mut(&id).expect("checked");
-        let job = match next {
-            Some((rel, size, mtime)) => {
-                w.job = Some(ExtractJob {
-                    rel: rel.clone(),
-                    size,
-                    mtime,
-                    started: now,
-                    overlap: false,
-                });
-                Job::Extract {
-                    relpath: rel,
-                    expected_size: size,
-                    expected_mtime_ns: mtime,
-                }
-            }
-            None => Job::Shutdown,
-        };
-        let _ = self.spawner.send(id, &job);
+        w.served += 1;
+        w.progressed = false;
+        w.last_seen = now;
+        w.job = Some(ExtractJob {
+            rel: rel.clone(),
+            size,
+            mtime,
+            started: now,
+            overlap: false,
+        });
+        let _ = self.spawner.send(
+            id,
+            &Job::Extract {
+                relpath: rel,
+                expected_size: size,
+                expected_mtime_ns: mtime,
+            },
+        );
         self.mark_overlap(id);
+    }
+
+    fn others_waiting(&self, i: usize, now: Time) -> bool {
+        self.roots
+            .iter()
+            .enumerate()
+            .any(|(j, r)| j != i && r.busy.is_none() && (!r.queue.is_empty() || r.scan_due <= now))
     }
 
     fn mark_overlap(&mut self, id: WorkerId) {
@@ -455,6 +499,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             r.queue.clear();
             r.queued.clear();
             r.hold = now + RETRY;
+            self.solo.retain(|s| s.0 != i);
             self.set_state(i, "offline", "identity mismatch");
         }
         v != Verdict::Mismatch
@@ -475,6 +520,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             return;
         };
         let i = w.root;
+        self.shutdown(id, now);
         let name = self.roots[i].spec.name.clone();
         let changed = matches!((&before, &after), (Some(b), Some(a)) if b != a);
         let v = before.as_ref().map(|b| {
@@ -499,6 +545,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         let accepted = complete && before.is_some() && before == after;
         if accepted && v == Some(Verdict::Adopt) {
             self.roots[i].expected = before.as_ref().map(|b| b.share.clone());
+            if let Some(b) = &before {
+                self.sink.set_expected_identity(&name, &b.share);
+            }
         }
         self.queue_extracts(i, &buf.entries);
         self.sink.scan_done(
@@ -595,16 +644,20 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
     }
 
-    fn abandon(&mut self, id: WorkerId, why: &str, now: Time) {
+    /// `silent`: no message for `PROGRESS_TIMEOUT` (as opposed to a deadline hit while progressing).
+    fn abandon(&mut self, id: WorkerId, why: &str, silent: bool, now: Time) {
         self.spawner.kill(id);
         let Some(w) = self.workers.get_mut(&id) else {
             return;
         };
+        if w.abandoned {
+            return;
+        }
         w.abandoned = true;
         let (i, role) = (w.root, w.role);
         let (network, progressed) = (w.network, w.progressed);
         let job = w.job.take();
-        w.scan = None;
+        let was_scanning = w.scan.take().is_some();
         if self.solo_running == Some(id) {
             self.solo_running = None;
         }
@@ -615,15 +668,21 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.mark_degraded(i, why, now);
             return;
         }
-        let stuck_io = role == Role::Scan || !progressed;
-        if let Some(job) = job {
-            self.fail(i, &job, why);
-        } else {
-            self.scan_finished(i, now, RETRY);
-        }
         // Only a network share that stopped answering goes offline; a slow or crashing
         // extract (it made progress) only fails its file, and local roots never go offline.
-        if network && stuck_io {
+        let stuck = network && silent && (role == Role::Scan || !progressed);
+        if let Some(job) = job {
+            if stuck {
+                let r = &mut self.roots[i];
+                r.queued.insert(job.rel.clone());
+                r.queue.push_front((job.rel, job.size, job.mtime));
+            } else {
+                self.fail(i, &job, why);
+            }
+        } else if was_scanning {
+            self.scan_finished(i, now, RETRY);
+        }
+        if stuck {
             let shares = self.shares.charged(id);
             self.share_offline(id, now);
             for j in 0..self.roots.len() {
@@ -638,42 +697,59 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         let stalled: Vec<_> = self
             .workers
             .iter()
-            .filter(|(_, w)| !w.abandoned)
+            .filter(|(_, w)| !w.abandoned && w.closing.is_none())
             .filter_map(|(id, w)| {
                 let silent = now.saturating_sub(w.last_seen) >= PROGRESS_TIMEOUT;
                 match w.role {
-                    Role::Scan if silent => Some((*id, "no progress")),
-                    Role::Scan if now.saturating_sub(w.started) >= SCAN_TIMEOUT => {
-                        Some((*id, "scan timeout"))
+                    Role::Scan if w.scan.is_some() && silent => Some((*id, "no progress", true)),
+                    Role::Scan
+                        if w.scan.is_some() && now.saturating_sub(w.started) >= SCAN_TIMEOUT =>
+                    {
+                        Some((*id, "scan timeout", false))
+                    }
+                    Role::Extract if w.job.is_some() && silent => {
+                        Some((*id, "extract timeout", true))
                     }
                     Role::Extract
-                        if silent
-                            || w.job.as_ref().is_some_and(|j| {
-                                now.saturating_sub(j.started) >= EXTRACT_TIMEOUT
-                            }) =>
+                        if w.job
+                            .as_ref()
+                            .is_some_and(|j| now.saturating_sub(j.started) >= EXTRACT_TIMEOUT) =>
                     {
-                        Some((*id, "extract timeout"))
+                        Some((*id, "extract timeout", false))
                     }
                     Role::Watch if silent && !self.roots[w.root].watch.ready => {
-                        Some((*id, "watch setup stalled"))
+                        Some((*id, "watch setup stalled", true))
                     }
                     _ => None,
                 }
             })
             .collect();
-        for (id, why) in stalled {
-            self.abandon(id, why, now);
+        for (id, why, silent) in stalled {
+            self.abandon(id, why, silent, now);
         }
-        if now >= self.retire_deadline {
-            for (id, w) in &mut self.workers {
-                if w.retired && !w.abandoned {
-                    w.abandoned = true;
-                    self.spawner.kill(*id);
-                }
+        // Shutdown sent but not exited within the grace: SIGKILL (still counts until reaped).
+        let overdue: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| !w.abandoned && w.closing.is_some_and(|t| now >= t + GRACE))
+            .map(|(id, w)| (*id, w.root))
+            .collect();
+        for (id, i) in overdue {
+            self.spawner.kill(id);
+            self.workers.get_mut(&id).expect("listed").abandoned = true;
+            if matches!(self.roots[i].busy, Some((b, _)) if b == id) {
+                self.roots[i].busy = None;
+            }
+            if self.solo_running == Some(id) {
+                self.solo_running = None;
             }
         }
         for i in 0..self.roots.len() {
-            if !self.network(i) && self.roots[i].watch.should_spawn(now) {
+            if !self.network(i)
+                && self.roots[i].watch.should_spawn(now)
+                && !self.root_blocked(i)
+                && self.identity_allows(i, now)
+            {
                 self.start_watcher(i, now);
             }
         }
@@ -701,16 +777,22 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if self.solo_running.is_some() || self.workers.values().any(|w| w.retired && !w.abandoned) {
             return;
         }
-        while let Some((i, rel, ..)) = self.solo.front() {
-            if (self.allow)(&self.roots[*i].spec.name, rel) {
+        while let Some((i, rel, size, mtime)) = self.solo.front().cloned() {
+            let (name, cur) = (&self.roots[i].spec.name, (size, mtime));
+            if (self.allow)(name, &rel)
+                && self.sink.known(name, &rel) != Some(cur)
+                && self.roots[i].failed.get(&rel) != Some(&cur)
+            {
                 break;
             }
             self.solo.pop_front();
         }
-        if let Some((i, ..)) = self.solo.front() {
-            let i = *i;
+        if let Some((i, ..)) = self.solo.front().cloned() {
             let share = self.roots[i].derived.share.clone();
-            if !self.network(i) || self.shares.free(&share, now) {
+            let held = now < self.roots[i].hold
+                || self.root_blocked(i)
+                || (self.network(i) && !self.shares.free(&share, now));
+            if !held && self.identity_allows(i, now) {
                 if self.pool_live() == 0 {
                     let (_, rel, size, mtime) = self.solo.pop_front().expect("front");
                     self.start(i, Role::Extract, Some((rel, size, mtime)), now);
@@ -729,7 +811,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
 
     fn try_root(&mut self, i: usize, now: Time) {
         let r = &self.roots[i];
-        if r.busy.is_some() || now < r.hold {
+        if r.busy.is_some() || now < r.hold || self.root_blocked(i) {
             return;
         }
         let role = if self.has_allowed(i) {
@@ -795,6 +877,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
         let item = solo.clone().or_else(|| self.next_allowed(i));
         w.solo = solo.is_some();
+        w.served = 1;
         if w.solo {
             self.solo_running = Some(id);
         }
@@ -830,6 +913,8 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
         abandoned: false,
         retired: false,
         progressed: false,
+        closing: None,
+        served: 0,
         network,
         solo: false,
         started: now,
@@ -878,11 +963,18 @@ mod tests {
     #[derive(Default)]
     struct Mem {
         indexed: usize,
+        expected: HashMap<String, Share>,
         scans: Vec<(String, bool)>,
         failed: Vec<String>,
         states: RefCell<Vec<(String, String, String)>>,
     }
     impl Sink for Mem {
+        fn expected_identity(&self, root: &str) -> Option<Share> {
+            self.expected.get(root).cloned()
+        }
+        fn set_expected_identity(&mut self, root: &str, share: &Share) {
+            self.expected.insert(root.into(), share.clone());
+        }
         fn indexed_files(&self, _: &str) -> usize {
             self.indexed
         }
@@ -995,6 +1087,23 @@ mod tests {
             }),
             now,
         );
+    }
+
+    /// A finished scan is told to shut down and then exits, as a real worker does.
+    fn done_scan(
+        s: &mut T,
+        id: WorkerId,
+        who: MountIdentity,
+        files: &[(&str, u64, i64)],
+        now: Time,
+    ) {
+        finish_scan(s, id, who, files, now);
+        assert!(
+            s.spawner
+                .sent
+                .iter()
+                .any(|(w, j)| *w == id && j.contains("Shutdown"))
+        );
         s.handle(id, Event::Exit, now);
     }
 
@@ -1061,7 +1170,7 @@ mod tests {
         s.tick(t);
         assert_eq!(scans(&s).len(), 1);
         assert!(s.max_live_per_share() <= 1);
-        finish_scan(&mut s, x.0, ident("/mnt/x", "nas:/x", "nfs", 4), &[], t);
+        done_scan(&mut s, x.0, ident("/mnt/x", "nas:/x", "nfs", 4), &[], t);
         t += secs(1);
         s.tick(t);
         assert_eq!(scans(&s).len(), 2);
@@ -1125,7 +1234,7 @@ mod tests {
         let names: Vec<_> = scans(&s).into_iter().map(|(_, n)| n).collect();
         assert_eq!(names, ["a", "l"]);
         let l = scans(&s)[1].0;
-        finish_scan(
+        done_scan(
             &mut s,
             l,
             ident("/home", "/dev/d5", "ext4", 5),
@@ -1151,16 +1260,197 @@ mod tests {
             ]),
             secs(61),
         );
-        let c = scans(&s).last().unwrap().0;
+        // c is still live when the local root starts
+        let c = scans(&s).iter().find(|(_, n)| n == "c").unwrap().0;
+        assert!(!s.spawner.killed.contains(&c));
+        s.tick(secs(61));
+        assert_eq!(scans(&s).last().unwrap().1, "l");
+        assert_eq!(s.pool_live(), 2);
+    }
+
+    fn mem_sched(sink: Mem, kind: Kind, mount: &[String]) -> T {
+        let lines: Vec<&str> = mount.iter().map(String::as_str).collect();
+        let mut spec = spec("r", "/mnt/nas");
+        spec.kind = kind;
+        Sched::new(
+            Params {
+                workers: 2,
+                backoff_max: secs(3600),
+            },
+            vec![spec],
+            &mut mi(&lines),
+            Fake::default(),
+            sink,
+            Box::new(|_, _| true),
+        )
+    }
+
+    #[test]
+    fn restart_with_indexed_files_and_unmounted_share_never_scans() {
+        let mut sink = Mem {
+            indexed: 10_000,
+            ..Mem::default()
+        };
+        sink.expected
+            .insert("r".into(), ident("/mnt/nas", "nas:/a", "nfs", 2).share);
+        // share not mounted: /mnt/nas falls through to the local root fs
+        let mut s = mem_sched(sink, Kind::Auto, &[ext4(1, "/")]);
+        for t in [0, 70, 200, 4000] {
+            s.tick(secs(t));
+        }
+        assert!(s.spawner.spawned.is_empty()); // no scan, no watcher: nothing to delete with
+        assert!(s.sink.scans.is_empty());
+        let states = s.sink.states.borrow();
+        assert_eq!(states.last().unwrap().1, "offline");
+        assert_eq!(states.last().unwrap().2, "identity mismatch");
+    }
+
+    #[test]
+    fn unrecorded_identity_with_indexed_files_is_a_mismatch() {
+        let sink = Mem {
+            indexed: 3,
+            ..Mem::default()
+        };
+        let mut s = mem_sched(
+            sink,
+            Kind::Auto,
+            &[ext4(1, "/"), nfs(2, "/mnt/nas", "nas:/a")],
+        );
+        s.tick(secs(0));
+        assert!(scans(&s).is_empty());
+    }
+
+    #[test]
+    fn expected_identity_is_persisted_on_first_scan() {
+        let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        done_scan(
+            &mut s,
+            id,
+            ident("/mnt/nas", "nas:/a", "nfs", 2),
+            &[],
+            secs(1),
+        );
+        assert_eq!(s.sink.expected["r"].source, "nas:/a");
+    }
+
+    #[test]
+    fn repeated_hangs_on_a_local_root_leave_one_unreaped_worker() {
+        let mut s = sched(2, &[("l", "/home/l")], &[ext4(1, "/")]);
+        for t in (0..2000).step_by(10) {
+            s.tick(secs(t));
+        }
+        // one scan and one watcher hung and unreaped: nothing else ever starts on the root
+        assert_eq!(roles(&s, Role::Scan), 1);
+        assert_eq!(roles(&s, Role::Watch), 1);
+        assert_eq!(roles(&s, Role::Extract), 0);
+    }
+
+    #[test]
+    fn finished_scan_is_not_later_declared_hung() {
+        let mut s = sched(
+            2,
+            &[("a", "/mnt/a")],
+            &[ext4(1, "/"), nfs(2, "/mnt/a", "nas:/a")],
+        );
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        // the worker is slow to exit after ScanDone (no Exit event)
         finish_scan(
             &mut s,
-            c,
-            ident("/mnt/c", "nas:/c", "nfs", 4),
+            id,
+            ident("/mnt/a", "nas:/a", "nfs", 2),
             &[],
-            secs(62),
+            secs(1),
         );
-        s.tick(secs(62));
-        assert_eq!(scans(&s).last().unwrap().1, "l");
+        assert!(
+            s.spawner
+                .sent
+                .iter()
+                .any(|(w, j)| *w == id && j.contains("Shutdown"))
+        );
+        s.tick(secs(33));
+        let states = s.sink.states.borrow();
+        assert_eq!(states.last().unwrap().1, "ok");
+        assert!(!states.iter().any(|x| x.1 == "offline"));
+        drop(states);
+        let share = s.roots[0].derived.share.clone();
+        s.handle(id, Event::Exit, secs(34));
+        assert!(s.shares.free(&share, secs(34)));
+    }
+
+    #[test]
+    fn progress_resets_per_job_so_a_later_silent_file_takes_the_share_offline() {
+        let mut s = sched(
+            2,
+            &[("a", "/mnt/a")],
+            &[ext4(1, "/"), nfs(2, "/mnt/a", "nas:/a")],
+        );
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        done_scan(
+            &mut s,
+            id,
+            ident("/mnt/a", "nas:/a", "nfs", 2),
+            &[("f", 1, 1), ("g", 1, 1)],
+            secs(1),
+        );
+        s.tick(secs(1));
+        let e = s.spawner.spawned.last().unwrap().0;
+        s.handle(
+            e,
+            Event::Msg(Message::Progress {
+                entries: None,
+                bytes: Some(5),
+            }),
+            secs(2),
+        );
+        s.handle(
+            e,
+            Event::Msg(Message::Extracted {
+                relpath: "f".into(),
+                title: "t".into(),
+                r#type: "text".into(),
+                blake3: "h".into(),
+                chunks: vec![],
+            }),
+            secs(3),
+        );
+        assert!(extracts(&s)[1].1.contains("\"g\""));
+        s.tick(secs(40)); // g never reports anything: stuck in I/O
+        let share = s.roots[0].derived.share.clone();
+        s.handle(e, Event::Exit, secs(41));
+        assert!(!s.shares.free(&share, secs(42)));
+        assert!(s.sink.failed.is_empty()); // g is retried later, not failed
+        assert!(s.roots[0].queue.iter().any(|q| q.0 == "g"));
+    }
+
+    #[test]
+    fn scan_deadline_while_progressing_does_not_take_the_share_offline() {
+        let mut s = sched(
+            2,
+            &[("a", "/mnt/a")],
+            &[ext4(1, "/"), nfs(2, "/mnt/a", "nas:/a")],
+        );
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        for t in (20..=600).step_by(20) {
+            s.handle(
+                id,
+                Event::Msg(Message::Progress {
+                    entries: Some(t),
+                    bytes: None,
+                }),
+                secs(t),
+            );
+            s.tick(secs(t));
+        }
+        assert!(s.spawner.killed.contains(&id));
+        s.handle(id, Event::Exit, secs(601));
+        let share = s.roots[0].derived.share.clone();
+        assert!(s.shares.free(&share, secs(601)));
+        assert!(!s.sink.states.borrow().iter().any(|x| x.1 == "offline"));
     }
 
     #[test]
@@ -1171,10 +1461,9 @@ mod tests {
                 &[("r", "/mnt/a/sub/docs")],
                 &[ext4(1, "/"), nfs(2, "/mnt/a", "nas:/a")],
             );
-            s.sink.indexed = indexed;
             s.tick(secs(0));
             let id = scans(&s)[0].0;
-            finish_scan(
+            done_scan(
                 &mut s,
                 id,
                 ident("/mnt/a", "nas:/a", "nfs", 2),
@@ -1182,6 +1471,7 @@ mod tests {
                 secs(1),
             );
             assert_eq!(s.sink.scans, [("r".to_string(), true)]);
+            s.sink.indexed = indexed;
             s.rederive(
                 &mut mi(&[
                     &ext4(1, "/"),
@@ -1194,7 +1484,7 @@ mod tests {
             if indexed == 0 {
                 assert_eq!(scans(&s).len(), 2);
                 let id = scans(&s)[1].0;
-                finish_scan(
+                done_scan(
                     &mut s,
                     id,
                     ident("/mnt/a/sub", "nas:/b", "nfs", 3),
@@ -1221,7 +1511,7 @@ mod tests {
         );
         s.tick(secs(0));
         let id = scans(&s)[0].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/a", "nas:/a", "nfs", 2),
@@ -1230,7 +1520,7 @@ mod tests {
         );
         s.tick(secs(1000));
         let id = scans(&s)[1].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/a", "other:/z", "nfs", 2),
@@ -1248,8 +1538,9 @@ mod tests {
             &[ext4(1, "/"), ext4(2, "/mnt/la"), ext4(3, "/mnt/lb")],
         );
         s.tick(secs(0));
+        watchers_ready(&mut s, secs(0));
         let (a, b) = (scans(&s)[0].0, scans(&s)[1].0);
-        finish_scan(
+        done_scan(
             &mut s,
             a,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
@@ -1265,7 +1556,7 @@ mod tests {
         let spawned = s.spawner.spawned.len();
         s.tick(secs(3));
         assert_eq!(s.spawner.spawned.len(), spawned);
-        finish_scan(
+        done_scan(
             &mut s,
             b,
             ident("/mnt/lb", "/dev/d3", "ext4", 3),
@@ -1281,37 +1572,48 @@ mod tests {
         s.handle(solo.0, Event::Exit, secs(6));
         assert_eq!(s.sink.failed, ["f"]);
         // not retried on an unchanged rescan, retried when mtime changes
-        s.tick(secs(200));
+        let w = watch_id(&s);
+        let touch = |s: &mut T, t: u64| {
+            let gone = Message::WatchEvent {
+                relpath: "x".into(),
+                kind: "x".into(),
+                size: None,
+                mtime_ns: None,
+            };
+            s.handle(w, Event::Msg(gone), secs(t));
+            s.tick(secs(t + 6));
+        };
+        touch(&mut s, 200);
         let a2 = *scans(&s)
             .iter()
             .filter(|(_, n)| n == "a")
             .map(|(i, _)| i)
             .next_back()
             .unwrap();
-        finish_scan(
+        done_scan(
             &mut s,
             a2,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
             &[("f", 10, 5)],
-            secs(201),
+            secs(207),
         );
-        s.tick(secs(201));
+        s.tick(secs(207));
         assert_eq!(roles(&s, Role::Extract), 2);
-        s.tick(secs(500));
+        touch(&mut s, 300);
         let a3 = *scans(&s)
             .iter()
             .filter(|(_, n)| n == "a")
             .map(|(i, _)| i)
             .next_back()
             .unwrap();
-        finish_scan(
+        done_scan(
             &mut s,
             a3,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
             &[("f", 10, 6)],
-            secs(501),
+            secs(307),
         );
-        s.tick(secs(501));
+        s.tick(secs(307));
         assert_eq!(roles(&s, Role::Extract), 3);
     }
 
@@ -1332,8 +1634,18 @@ mod tests {
         s.tick(secs(100));
         assert_eq!(roles(&s, Role::Watch), 1);
         s.handle(w, Event::Exit, secs(100));
+        s.handle(scans(&s)[0].0, Event::Exit, secs(100)); // the silent scan is abandoned too
         s.tick(secs(100));
         assert_eq!(roles(&s, Role::Watch), 1); // retry only after the poll interval
+        let rescan = scans(&s).last().unwrap().0;
+        s.handle(
+            rescan,
+            Event::Msg(Message::Progress {
+                entries: Some(1),
+                bytes: None,
+            }),
+            secs(140),
+        );
         s.tick(secs(150));
         assert_eq!(roles(&s, Role::Watch), 2);
     }
@@ -1351,8 +1663,9 @@ mod tests {
     fn config_change_retires_workers_and_rechecks_queued_extracts() {
         let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
         s.tick(secs(0));
+        watchers_ready(&mut s, secs(0));
         let id = scans(&s)[0].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
@@ -1382,6 +1695,7 @@ mod tests {
         s.tick(secs(12)); // grace over: SIGKILL, abandoned, share still held until reaped
         assert!(s.spawner.killed.contains(&old));
         s.handle(old, Event::Exit, secs(13));
+        s.handle(watch_id(&s), Event::Exit, secs(13));
         s.tick(secs(13));
         let sent = extracts(&s);
         assert_eq!(sent.len(), 2);
@@ -1395,7 +1709,7 @@ mod tests {
         let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
         s.tick(secs(0));
         let id = scans(&s)[0].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
@@ -1413,7 +1727,7 @@ mod tests {
         let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
         s.tick(secs(0));
         let id = scans(&s)[0].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
@@ -1427,6 +1741,20 @@ mod tests {
         let share = s.roots[0].derived.share.clone();
         assert!(s.shares.free(&share, secs(2)));
         assert!(s.solo.is_empty());
+    }
+
+    /// Healthy local watchers: every spawned watcher reports its initial watches in place.
+    fn watchers_ready(s: &mut T, now: Time) {
+        let ids: Vec<_> = s
+            .spawner
+            .spawned
+            .iter()
+            .filter(|x| x.1 == Role::Watch)
+            .map(|x| x.0)
+            .collect();
+        for id in ids {
+            s.handle(id, Event::Msg(Message::WatchReady), now);
+        }
     }
 
     fn watch_id(s: &T) -> WorkerId {
@@ -1443,7 +1771,7 @@ mod tests {
         let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
         s.tick(secs(0));
         let id = scans(&s)[0].0;
-        finish_scan(
+        done_scan(
             &mut s,
             id,
             ident("/mnt/la", "/dev/d2", "ext4", 2),
@@ -1507,7 +1835,7 @@ mod tests {
             } else {
                 ident("/mnt/a", "/dev/d2", "ext4", 2)
             };
-            finish_scan(&mut s, id, who, &[("f", 1, 1)], secs(1));
+            done_scan(&mut s, id, who, &[("f", 1, 1)], secs(1));
             s.tick(secs(1));
             let e = s.spawner.spawned.last().unwrap().0;
             if progress {
@@ -1521,7 +1849,8 @@ mod tests {
                 );
             }
             s.tick(secs(40));
-            assert_eq!(s.sink.failed, ["f"]);
+            // a stuck network extract goes back in the queue; otherwise only the file fails
+            assert_eq!(s.sink.failed.is_empty(), offline);
             let share = s.roots[0].derived.share.clone();
             s.handle(e, Event::Exit, secs(41));
             assert_eq!(!s.shares.free(&share, secs(42)), offline);
@@ -1568,7 +1897,7 @@ mod tests {
         s.tick(secs(0));
         let id = scans(&s)[0].0;
         let who = derive_for(&mut mount, &root);
-        finish_scan(&mut s, id, who, &[("f", 1, 1)], secs(1));
+        done_scan(&mut s, id, who, &[("f", 1, 1)], secs(1));
         s.rederive(&mut mount, secs(2));
         s.tick(secs(3));
         assert_eq!(s.sink.scans, [("r".to_string(), true)]);
