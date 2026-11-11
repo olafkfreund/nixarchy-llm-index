@@ -59,9 +59,24 @@ fn open(path: &Path, mode: Mode, private: bool) -> Res<Connection> {
         }
         conn
     } else {
+        // A symlinked database file is refused (O_NOFOLLOW); sqlite then opens the same path.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
         conn.pragma_update(None, "query_only", 1)?;
+        if mode == Mode::PublicOnly {
+            let n: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'config_errors'",
+                [],
+                |r| r.get(0),
+            )?;
+            if n > 0 {
+                return Err("public.db must not contain config_errors".into());
+            }
+        }
         conn
     };
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?; // no ATTACH, ever

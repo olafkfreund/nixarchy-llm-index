@@ -27,6 +27,17 @@ pub fn sandbox_state() -> &'static str {
     }
 }
 
+const STATES: [&str; 4] = ["ok", "offline", "degraded", "config_error"];
+
+/// A state word, `mount`, or an errno name such as `EACCES`.
+fn public_reason(r: &str) -> bool {
+    STATES.contains(&r)
+        || r == "mount"
+        || (r.starts_with('E')
+            && r.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+}
+
 fn count(conn: &Connection, sql: &str, root: &str) -> Res<i64> {
     Ok(conn.query_row(sql, [root], |r| r.get(0))?)
 }
@@ -40,7 +51,13 @@ pub fn build(store: &Store, public: bool) -> Res<Value> {
                 .roots
                 .iter()
                 .filter(|r| !public || r.tier == Tier::Public)
-                .map(|r| (r.name.clone(), r.tier))
+                .map(|r| {
+                    (
+                        r.name.clone(),
+                        r.path.to_string_lossy().into_owned(),
+                        r.tier,
+                    )
+                })
                 .collect();
             (c.state_dir.clone(), roots)
         })
@@ -50,13 +67,14 @@ pub fn build(store: &Store, public: bool) -> Res<Value> {
         "SELECT count(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.root_id = ?1 AND {vis}"
     );
     let mut out = Vec::new();
-    for (name, tier) in roots {
+    for (name, path, tier) in roots {
         let mut row = json!({"name": name, "state": "pending", "files": 0, "chunks": 0});
         for conn in store.conns() {
             let found = conn
                 .query_row(
-                    "SELECT state, reason, last_scan, queued, done, skipped_symlinks FROM roots WHERE name = ?1",
-                    [&name],
+                    "SELECT state, reason, last_scan, queued, done, skipped_symlinks FROM roots
+                     WHERE name = ?1 AND path = ?2",
+                    [&name, &path],
                     |r| {
                         Ok(json!({
                             "state": r.get::<_, Option<String>>(0)?,
@@ -69,7 +87,20 @@ pub fn build(store: &Store, public: bool) -> Res<Value> {
                     },
                 )
                 .optional()?;
-            if let Some(Value::Object(f)) = found {
+            if let Some(Value::Object(mut f)) = found {
+                if public {
+                    // the public tier shows a fixed vocabulary only, never free text
+                    let state = f["state"]
+                        .as_str()
+                        .filter(|s| STATES.contains(s))
+                        .unwrap_or("pending");
+                    f["state"] = state.into();
+                    let reason = f["reason"]
+                        .as_str()
+                        .filter(|r| public_reason(r))
+                        .map(String::from);
+                    f["reason"] = reason.into();
+                }
                 row.as_object_mut().unwrap().extend(f);
                 row["files"] = count(conn, &files, &name)?.into();
                 row["chunks"] = count(conn, &chunks, &name)?.into();
