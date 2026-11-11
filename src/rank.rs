@@ -92,9 +92,9 @@ fn fts_expr(text: &str) -> Option<String> {
 /// The tier test every query on `f.abspath` carries.
 pub fn visible_sql(mode: StoreMode) -> &'static str {
     if mode == StoreMode::PublicOnly {
-        "visible(f.abspath) = 'public'"
+        "f.state = 'ok' AND visible(f.abspath) = 'public'"
     } else {
-        "visible(f.abspath) IS NOT NULL"
+        "f.state = 'ok' AND visible(f.abspath) IS NOT NULL"
     }
 }
 
@@ -302,7 +302,7 @@ mod tests {
 
     fn add_titled(conn: &Connection, abspath: &str, title: &str, text: &str, hot: usize) {
         conn.execute(
-            "INSERT INTO files(root_id, relpath, abspath, title, type, mtime_ns) VALUES('h', ?1, ?1, ?2, 'text', 1)",
+            "INSERT INTO files(root_id, relpath, abspath, title, type, mtime_ns, state) VALUES('h', ?1, ?1, ?2, 'text', 1, 'ok')",
             [abspath, title],
         )
         .unwrap();
@@ -399,6 +399,22 @@ mod tests {
                 .abspath,
             "/home/x/ok.txt"
         );
+    }
+
+    #[test]
+    fn failed_rows_are_not_searchable() {
+        let fx = Fx::new("failedrows");
+        add(&fx.w.public, "/home/x/f.txt", "needle", 5);
+        fx.w.public
+            .execute("UPDATE files SET state = 'failed'", [])
+            .unwrap();
+        for mode in [SearchMode::Words, SearchMode::Meaning, SearchMode::Hybrid] {
+            assert!(
+                fx.search(PUB, &q("needle", mode), Some(&qv(5)))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

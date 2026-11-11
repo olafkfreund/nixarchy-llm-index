@@ -305,7 +305,7 @@ impl Core {
     fn hit(&self, h: &Hit) -> Result<Option<Value>, Fail> {
         let vis = rank::visible_sql(self.store().mode);
         let sql = format!(
-            "SELECT f.title, f.type, f.mtime_ns, visible(f.abspath), f.state, r.state,
+            "SELECT f.title, f.type, f.mtime_ns, visible(f.abspath), r.state,
                     c.kind, c.start, c.end, c.decl_start, c.decl_end, c.heading_or_symbol, c.text
              FROM files f LEFT JOIN roots r ON r.name = f.root_id
              LEFT JOIN chunks c ON c.id = ?2 AND c.file_id = f.id
@@ -316,9 +316,7 @@ impl Core {
             .query_row(&sql, rusqlite::params![h.file_id, h.chunk_id], |r| {
                 let s = |i| r.get::<_, Option<String>>(i);
                 let n = |i| r.get::<_, Option<i64>>(i);
-                let (fs, rs) = (s(4)?, s(5)?);
-                let stale = fs.as_deref() == Some("stale")
-                    || matches!(rs.as_deref(), Some("offline" | "degraded"));
+                let stale = matches!(s(4)?.as_deref(), Some("offline" | "degraded"));
                 let mut m = Map::new();
                 m.insert("path".into(), h.abspath.clone().into());
                 m.insert("title".into(), untrusted(&s(0)?.unwrap_or_default()).into());
@@ -328,11 +326,11 @@ impl Core {
                     m.insert("tier".into(), s(3)?.into());
                 }
                 m.insert("stale".into(), stale.into());
-                let (start, end) = (n(7)?, n(8)?);
-                let sym = s(11)?.map(|x| Value::from(untrusted(&x)));
-                match s(6)?.as_deref() {
+                let (start, end) = (n(6)?, n(7)?);
+                let sym = s(10)?.map(|x| Value::from(untrusted(&x)));
+                match s(5)?.as_deref() {
                     Some("code") => {
-                        m.insert("lines".into(), json!([n(9)?.or(start), n(10)?.or(end)]));
+                        m.insert("lines".into(), json!([n(8)?.or(start), n(9)?.or(end)]));
                         m.extend(sym.map(|v| ("symbol".to_string(), v)));
                     }
                     Some("section") => {
@@ -348,7 +346,7 @@ impl Core {
                     }
                     _ => {}
                 }
-                let text = s(12)?.unwrap_or_default();
+                let text = s(11)?.unwrap_or_default();
                 m.insert(
                     "passage".into(),
                     wrap(&h.abspath, head(&text, PASSAGE_MAX_CHARS)).into(),
@@ -492,7 +490,7 @@ impl Core {
         let store = self.store();
         let _snapshot = self.snapshot()?;
         let sql = format!(
-            "SELECT f.abspath, f.title, f.mtime_ns, f.type, visible(f.abspath), f.state, r.state
+            "SELECT f.abspath, f.title, f.mtime_ns, f.type, visible(f.abspath), r.state
              FROM files f LEFT JOIN roots r ON r.name = f.root_id
              WHERE {} ORDER BY f.mtime_ns DESC LIMIT {RECENT_MAX}",
             rank::eligible(store.mode)
@@ -506,9 +504,7 @@ impl Core {
                 },
                 |r| {
                     let s = |i| r.get::<_, Option<String>>(i);
-                    let (fs, rs) = (s(5)?, s(6)?);
-                    let stale = fs.as_deref() == Some("stale")
-                        || matches!(rs.as_deref(), Some("offline" | "degraded"));
+                    let stale = matches!(s(5)?.as_deref(), Some("offline" | "degraded"));
                     let mtime: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
                     let mut m = Map::new();
                     m.insert("path".into(), r.get::<_, String>(0)?.into());

@@ -394,11 +394,29 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             }
             Message::Failed { relpath, reason } => {
                 if let Some(job) = take_job(w, &relpath) {
-                    self.fail(i, &job, &reason);
+                    let transient = transient(&reason);
+                    if !transient {
+                        self.fail(i, &job, &reason);
+                    }
                     self.send_next(id, now);
+                    if transient {
+                        // keep the indexed row; try again later, not in a tight loop
+                        let r = &mut self.roots[i];
+                        r.hold = now + RETRY;
+                        if r.queued.insert(job.rel.clone()) {
+                            r.queue.push_back((job.rel, job.size, job.mtime));
+                        }
+                    }
                 }
             }
             Message::RootError { state, reason } if role != Role::Watch => {
+                // protocol: only these two states exist; anything else counts as offline
+                let state = if matches!(state.as_str(), "config_error" | "offline") {
+                    state
+                } else {
+                    eprintln!("sched: bad RootError state {state:?} from worker {id:?}");
+                    "offline".into()
+                };
                 w.scan = None;
                 let requeue = w.job.take();
                 if let Some(j) = requeue {
@@ -418,13 +436,12 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 w.vleft = w.vleft.saturating_sub(1);
                 let done = w.vleft == 0;
                 let r = &mut self.roots[i];
-                let name = r.spec.name.clone();
                 if result == ValidationResult::Pending {
                     r.validate_due = true;
                     r.validate_at = now + RETRY;
                 }
                 let is_root = Path::new(&path) == r.spec.path;
-                self.sink.validated(&name, &path, result);
+                self.sink.validated(&path, result);
                 if is_root && result == ValidationResult::Eloop {
                     self.set_state(i, "config_error", "symlink in path");
                 }
@@ -596,7 +613,6 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             &name,
             ScanResult {
                 complete: accepted,
-                identity: before,
                 entries: buf.entries,
                 skipped: buf.skipped,
             },
@@ -994,6 +1010,21 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
     }
 }
 
+/// An extract failure caused by the share, not by the file: keep the old row. A deadline
+/// timeout is the file's fault and stays permanent, or it would retry forever.
+fn transient(reason: &str) -> bool {
+    matches!(
+        reason,
+        "EIO"
+            | "ESTALE"
+            | "ENOTCONN"
+            | "ETIMEDOUT"
+            | "EHOSTDOWN"
+            | "ENETDOWN"
+            | "ENETUNREACH"
+    )
+}
+
 fn take_job(w: &mut Worker, rel: &str) -> Option<ExtractJob> {
     if w.job.as_ref().is_some_and(|j| j.rel == rel) {
         w.job.take()
@@ -1059,7 +1090,7 @@ mod tests {
         fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) {
             self.failed.push(relpath.into());
         }
-        fn validated(&mut self, _: &str, path: &str, result: ValidationResult) {
+        fn validated(&mut self, path: &str, result: ValidationResult) {
             self.validated.push((path.into(), result));
         }
         fn root_state(&mut self, root: &str, state: &str, reason: &str) {
@@ -1815,6 +1846,55 @@ mod tests {
         let share = s.roots[0].derived.share.clone();
         assert!(s.shares.free(&share, secs(2)));
         assert!(s.solo.is_empty());
+    }
+
+    #[test]
+    fn transient_extract_failure_keeps_the_row_and_requeues() {
+        let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
+        s.tick(secs(0));
+        watchers_ready(&mut s, secs(0));
+        let id = scans(&s)[0].0;
+        done_scan(
+            &mut s,
+            id,
+            ident("/mnt/la", "/dev/d2", "ext4", 2),
+            &[("f", 10, 5)],
+            secs(1),
+        );
+        s.tick(secs(1));
+        let e = s.spawner.spawned.last().unwrap().0;
+        s.handle(
+            e,
+            Event::Msg(Message::Failed {
+                relpath: "f".into(),
+                reason: "EIO".into(),
+            }),
+            secs(2),
+        );
+        assert!(s.sink.failed.is_empty());
+        assert!(s.roots[0].failed.is_empty());
+        assert_eq!(s.roots[0].queue.len(), 1);
+        s.handle(e, Event::Exit, secs(2));
+        s.tick(secs(10)); // held
+        assert_eq!(extracts(&s).len(), 1);
+        s.tick(secs(70));
+        assert_eq!(extracts(&s).len(), 2);
+    }
+
+    #[test]
+    fn unknown_root_error_state_is_treated_as_offline() {
+        let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        s.handle(
+            id,
+            Event::Msg(Message::RootError {
+                state: "ok".into(),
+                reason: "x".into(),
+            }),
+            secs(1),
+        );
+        assert_eq!(s.roots[0].state, "offline");
     }
 
     /// Healthy local watchers: every spawned watcher reports its initial watches in place.
