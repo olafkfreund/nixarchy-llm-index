@@ -20,7 +20,9 @@
           rustfmt
           pkg-config
           pdfium
+          oniguruma
         ];
+        RUSTONIG_SYSTEM_LIBONIG = true;
         LLM_INDEX_PDFIUM_LIB = "${pkgs.pdfium}/lib/libpdfium.so";
         LLM_INDEX_MODEL_DIR = "${self.packages.${system}.default.passthru.modelDir}";
       };

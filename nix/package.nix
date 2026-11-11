@@ -4,6 +4,9 @@
   fetchurl,
   linkFarm,
   pdfium,
+  pkg-config,
+  oniguruma,
+  sqlite,
 }:
 let
   base = "https://huggingface.co/minishlab/potion-retrieval-32M/resolve/6fc8051fab2a1e0ee76689cf08c853792ac285e7";
@@ -37,6 +40,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
+
+  # tokenizers' onig feature: link nixpkgs' oniguruma (BSD-2) instead of building a vendored copy.
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ oniguruma sqlite ];
+  RUSTONIG_SYSTEM_LIBONIG = true;
 
   # Read with option_env! so both paths land in the binary and hence the closure.
   LLM_INDEX_PDFIUM_LIB = "${pdfium}/lib/libpdfium.so";
