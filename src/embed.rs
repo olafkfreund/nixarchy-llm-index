@@ -133,9 +133,9 @@ impl Embedder {
         Ok(())
     }
 
-    /// Mean of the token rows (no `[UNK]`, at most 512 tokens), L2-normalised, ×127,
-    /// rounded, clamped to i8. `None` when no usable token remains: never a zero vector.
-    pub fn embed(&self, text: &str) -> Res<Option<[i8; DIM]>> {
+    /// Mean of the token rows (no `[UNK]`, at most 512 tokens), L2-normalised. `None` when
+    /// no usable token remains: never a zero vector.
+    fn pooled(&self, text: &str) -> Res<Option<[f32; DIM]>> {
         let enc = self.tok.encode(text, false).map_err(|e| e.to_string())?;
         let mut acc = [0f32; DIM];
         let mut count = 0usize;
@@ -152,11 +152,25 @@ impl Embedder {
         if count == 0 || norm == 0.0 || !norm.is_finite() {
             return Ok(None);
         }
-        let mut out = [0i8; DIM];
-        for (o, a) in out.iter_mut().zip(acc) {
-            *o = (a / norm * 127.0).round().clamp(-127.0, 127.0) as i8;
-        }
-        Ok(Some(out))
+        acc.iter_mut().for_each(|a| *a /= norm);
+        Ok(Some(acc))
+    }
+
+    /// ×127, rounded, clamped to i8.
+    pub fn embed(&self, text: &str) -> Res<Option<[i8; DIM]>> {
+        Ok(self.pooled(text)?.map(|v| {
+            let mut out = [0i8; DIM];
+            for (o, a) in out.iter_mut().zip(v) {
+                *o = (a * 127.0).round().clamp(-127.0, 127.0) as i8;
+            }
+            out
+        }))
+    }
+
+    /// The unquantised vector, for the recall evaluation only.
+    #[cfg(feature = "eval")]
+    pub fn embed_f32(&self, text: &str) -> Res<Option<[f32; DIM]>> {
+        self.pooled(text)
     }
 }
 

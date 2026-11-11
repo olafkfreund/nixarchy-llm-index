@@ -17,6 +17,16 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
+      evalPackage = pkgs.callPackage ./nix/package.nix { features = [ "eval" ]; };
+      vmChecks = import ./nix/checks/vm.nix {
+        inherit pkgs nixosModule;
+        inherit (nixpkgs) lib;
+        package = self.packages.${system}.default;
+        src = nixpkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = ./tests;
+        };
+      };
       hmModule = import ./nix/hm-module.nix { inherit self; };
       nixosModule = import ./nix/nixos-module.nix { inherit self; };
     in
@@ -24,7 +34,10 @@
       homeManagerModules.default = hmModule;
       nixosModules.default = nixosModule;
 
-      packages.${system}.default = pkgs.callPackage ./nix/package.nix { };
+      packages.${system} = {
+        default = pkgs.callPackage ./nix/package.nix { };
+        eval = evalPackage;
+      };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
@@ -41,7 +54,14 @@
         LLM_INDEX_MODEL_DIR = "${self.packages.${system}.default.passthru.modelDir}";
       };
 
-      checks.${system} = {
+      checks.${system} = vmChecks // {
+        fixture = pkgs.callPackage ./nix/checks/fixture.nix {
+          inherit evalPackage;
+          src = nixpkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = ./tests;
+          };
+        };
         closure = pkgs.callPackage ./nix/checks/closure.nix {
           package = self.packages.${system}.default;
         };

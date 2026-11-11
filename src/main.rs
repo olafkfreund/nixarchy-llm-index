@@ -53,6 +53,13 @@ enum Command {
     },
     /// Show index status
     Status,
+    /// Recall evaluation on an indexed fixture (test-only)
+    #[cfg(feature = "eval")]
+    #[command(hide = true)]
+    EvalRecall {
+        #[arg(long)]
+        queries: PathBuf,
+    },
     /// Print build-time store paths
     #[command(hide = true)]
     Paths,
@@ -118,6 +125,16 @@ fn main() -> ExitCode {
         Ok(path) => path,
         Err(code) => return code,
     };
+    #[cfg(feature = "eval")]
+    if let Command::EvalRecall { queries } = &cli.command {
+        return match llm_index::eval::run(&config, queries) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let result = match cli.command {
         Command::Mcp { tier } => llm_index::mcp::run(&config, matches!(tier, Tier::Public)),
         _ => llm_index::status::run(&config),
