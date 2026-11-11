@@ -37,6 +37,9 @@
       packages.${system} = {
         default = pkgs.callPackage ./nix/package.nix { };
         eval = evalPackage;
+        bench-corpus = import ./bench/corpus.nix {
+          inherit pkgs nixpkgs;
+        };
       };
 
       devShells.${system}.default = pkgs.mkShell {
