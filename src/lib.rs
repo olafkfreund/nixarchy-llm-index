@@ -6,6 +6,8 @@ pub mod config;
 pub mod db;
 pub mod deny;
 pub mod embed;
+#[cfg(feature = "eval")]
+pub mod eval;
 pub mod extract;
 pub mod index;
 pub mod mcp;

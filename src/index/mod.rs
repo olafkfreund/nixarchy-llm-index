@@ -499,7 +499,7 @@ fn self_test_in(config: &Config, dir: &Path) -> Result<(), Box<dyn Error>> {
     }
     if worker::sandbox::tcp_restriction_supported() {
         match std::net::TcpStream::connect("127.0.0.1:1") {
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) if worker::tcp_denied(&e) => {}
             other => return Err(format!("coordinator can open TCP: {other:?}").into()),
         }
     }

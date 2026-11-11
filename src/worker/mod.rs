@@ -64,6 +64,12 @@ impl Output {
     }
 }
 
+/// TCP is closed by Landlock (EACCES) or, under the unit's `RestrictAddressFamilies=AF_UNIX`,
+/// by the socket call itself (EAFNOSUPPORT).
+pub fn tcp_denied(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(97)
+}
+
 /// `index --self-test` probe: the sandbox must hold for a worker on this host.
 fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
     let ready = sandbox::start(config, role, root)?;
@@ -71,7 +77,7 @@ fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn
     if std::fs::File::create(dir.join("selftest-probe")).is_ok() {
         return Err("worker created a file in its root".into());
     }
-    let denied = |e: io::Result<()>| e.is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    let denied = |e: io::Result<()>| e.is_err_and(|e| tcp_denied(&e));
     if sandbox::tcp_restriction_supported()
         && !(denied(std::net::TcpListener::bind("127.0.0.1:0").map(drop))
             && denied(std::net::TcpStream::connect("127.0.0.1:1").map(drop)))

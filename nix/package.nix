@@ -7,6 +7,8 @@
   pkg-config,
   oniguruma,
   sqlite,
+  # [ "eval" ] builds the test-only recall evaluation (llm-index-eval, used by checks).
+  features ? [ ],
 }:
 let
   base = "https://huggingface.co/minishlab/potion-retrieval-32M/resolve/6fc8051fab2a1e0ee76689cf08c853792ac285e7";
@@ -28,7 +30,7 @@ let
   modelDir = linkFarm "potion-retrieval-32M" model;
 in
 rustPlatform.buildRustPackage (finalAttrs: {
-  pname = "llm-index";
+  pname = if features == [ ] then "llm-index" else "llm-index-eval";
   version = "0.1.0";
 
   src = lib.fileset.toSource {
@@ -41,6 +43,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
+  buildFeatures = features;
+  doCheck = features == [ ];
 
   # tokenizers' onig feature: link nixpkgs' oniguruma (BSD-2) instead of building a vendored copy.
   nativeBuildInputs = [ pkg-config ];
