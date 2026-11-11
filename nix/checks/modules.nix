@@ -68,6 +68,24 @@ let
       ];
     }).config;
 
+  # Which assertions fire: the modules' own assertion function (nix/config.nix) over an
+  # evaluated option set. Home Manager throws when its `assertions` are read, so this is
+  # the way to see the messages.
+  shared = import ../config.nix { inherit lib; };
+  fired =
+    extra:
+    let
+      cfg =
+        (lib.evalModules {
+          modules = [
+            { options.c = shared.instanceOptions { stateDir = "/state"; }; }
+            { c = llm extra; }
+          ];
+        }).config.c;
+    in
+    map (a: a.message) (lib.filter (a: !a.assertion) (shared.assertions "p" cfg));
+  only = sub: msgs: lib.length msgs == 1 && lib.hasInfix sub (lib.head msgs);
+
   builds = drv: (builtins.tryEval drv.drvPath).success;
   hActivation = h.home.activationPackage;
   nxToplevel = nx.system.build.toplevel;
@@ -121,6 +139,13 @@ let
 
     # The module assertions make the whole configuration unbuildable.
     "valid HM and NixOS configs build" = builds hActivation && builds nxToplevel;
+    "no assertion fires for the valid config" = fired { } == [ ];
+    "workers = 1 fires the workers assertion only" =
+      only "workers must be at least 2" (fired { limits.workers = 1; });
+    "exclusion outside every root fires the exclusion assertion only" =
+      only "at or under a root path" (fired { exclude.paths = [ "/elsewhere" ]; });
+    "relative root fires the absolute-path assertion only" =
+      only "must be absolute" (fired { roots = roots // { rel.path = "rel"; }; });
     "HM workers = 1 fails" = !builds (hm (llm { limits.workers = 1; })).home.activationPackage;
     "HM exclusion outside every root fails" =
       !builds (hm (llm { exclude.paths = [ "/elsewhere" ]; })).home.activationPackage;

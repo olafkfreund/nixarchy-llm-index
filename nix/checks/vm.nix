@@ -497,4 +497,181 @@ in
         wait_public_open(client)
       '';
     };
+
+  # Mount cases: automount, a tmpfs over a subdirectory, dead shares next to a healthy one,
+  # a share mounted after `index` started, and reclassify with the share unmounted.
+  # `server` hosts the shares that die, `server2` the healthy one.
+  network-mounts =
+    let
+      share =
+        path: src: interval:
+        (localRoot path "private")
+        // {
+          kind = "network";
+          share = src;
+          inherit interval;
+        };
+      nfsServer = {
+        networking.firewall.enable = false;
+        services.nfs.server = {
+          enable = true;
+          exports = ''
+            /export *(rw,no_root_squash,insecure,fsid=0)
+            /export/alt *(rw,no_root_squash,insecure)
+          '';
+        };
+      };
+    in
+    pkgs.testers.runNixOSTest {
+      name = "llm-index-network-mounts";
+      nodes.server = nfsServer;
+      nodes.server2 = nfsServer;
+      nodes.client = node {
+        instance = {
+          roots = {
+            auto = (share "/mnt/auto/autodir" "server2:/" "30s") // {
+              kind = "auto";
+            };
+            ok = share "/mnt/ok/okdir" "server2:/" "30s";
+            d1 = share "/mnt/d1/d1dir" "server:/" "30s";
+            d2 = share "/mnt/d2" "server:/alt" "30s";
+            late = share "/mnt/late" "server2:/late" "1d";
+          };
+          limits.backoffMax = "60s";
+        };
+        extra = {
+          networking.firewall.enable = false;
+          boot.supportedFilesystems = [ "nfs" ];
+          environment.systemPackages = [ pkgs.nfs-utils ];
+          systemd.mounts = [
+            {
+              what = "server2:/";
+              where = "/mnt/auto";
+              type = "nfs4";
+              options = "hard";
+            }
+          ];
+          systemd.automounts = [
+            {
+              where = "/mnt/auto";
+              wantedBy = [ "multi-user.target" ];
+            }
+          ];
+        };
+      };
+      testScript = ''
+        ${preamble}
+        start_all()
+        server.wait_for_unit("nfs-server")
+        server2.wait_for_unit("nfs-server")
+        client.wait_for_unit("multi-user.target")
+        machine = client
+        START = "systemctl start llm-index-alice"
+        STOP = "systemctl stop llm-index-alice"
+        NFS = "mount -t nfs4 -o hard,timeo=30,retrans=2"
+
+        for s in (server, server2):
+            s.succeed("mkdir -p /export/alt /export/late /export/pub/sub /export/pub/skip /export/autodir /export/okdir/sub /export/d1dir")
+        server2.succeed("echo automarker > /export/autodir/x.md; echo okonemarker > /export/okdir/ok1.md; echo insubmarker > /export/okdir/sub/in.md; echo latemarker > /export/late/l.md")
+        server2.succeed("echo pubsharemarker > /export/pub/a.md; echo submarker > /export/pub/sub/s.md; echo skipmarker > /export/pub/skip/k.md")
+        server.succeed("echo d1marker > /export/d1dir/y.md; echo d2marker > /export/alt/z.md")
+        for s in (server, server2):
+            s.succeed("chmod -R a+rwX /export; exportfs -ra")
+        client.succeed("mkdir -p /mnt/ok /mnt/d1 /mnt/d2 /mnt/late /mnt/pubshare")
+        client.succeed(f"{NFS} server2:/ /mnt/ok && {NFS} server:/ /mnt/d1 && {NFS} server:/alt /mnt/d2")
+
+        def fcount():
+            out = client.succeed(
+                "sudo -u alice python3 -c \"import sqlite3; "
+                "print(sum(sqlite3.connect('file:/var/lib/llm-index/alice/%s.db?mode=ro' % d, uri=True)"
+                ".execute('select count(*) from files').fetchone()[0] for d in ('public','private')))\"")
+            return int(out.strip())
+
+        def hits(tier, q):
+            err, text = mcp(client, tier, "search", {"query": q, "mode": "words"})
+            assert not err, text
+            return json.loads(text)["hits"]
+
+        def state(root):
+            m = [l for l in status(client).splitlines() if l.startswith(root + " ")]
+            return m[0] if m else ""
+
+        def seconds(n):
+            return dt.timedelta(seconds=n)
+
+        # the automount point itself; the NFS mount appears on first access
+        client.succeed("systemctl start mnt-auto.automount")
+        assert "autofs" in client.succeed("findmnt -n -o FSTYPE /mnt/auto")
+        client.succeed(START)
+
+        # (1) an automount share indexes like a plain mount
+        for r in ["auto", "ok", "d1", "d2"]:
+            try:
+                client.wait_until_succeeds(
+                    f"sudo -u alice {EXE} status --config {CFG} | grep -E '^{r} .* ok .*queued/done: 0/[1-9]'",
+                    timeout=90)
+            except Exception:
+                print("DIAG status:\n" + status(client))
+                print("DIAG journal:\n" + client.succeed("journalctl -u llm-index-alice --no-pager | tail -30"))
+                print("DIAG mounts:\n" + client.succeed("grep -E 'mnt' /proc/self/mountinfo"))
+                raise
+        assert hits("private", "automarker"), state("auto")
+        assert "nfs4" in client.succeed("findmnt -n -o FSTYPE /mnt/auto")
+        assert hits("private", "okonemarker") and hits("private", "d1marker") and hits("private", "d2marker")
+
+        # (2) an empty tmpfs over a subdirectory of the indexed share deletes nothing
+        before = fcount()
+        client.succeed("mount -t tmpfs tmpfs /mnt/ok/okdir/sub")
+        client.sleep(100)   # at least two scans
+        print("state with tmpfs over a subdirectory:", state("ok"))
+        assert fcount() >= before
+        assert hits("private", "insubmarker"), "files below the covered subdirectory were deleted"
+        client.succeed("umount /mnt/ok/okdir/sub")
+
+        # (3) two dead shares: the healthy one keeps being scanned
+        server.block()
+        retry(lambda _: "offline" in state("d1") and "offline" in state("d2"), timeout=seconds(300))
+        server2.succeed("echo deadsharemarker > /export/okdir/new.md")
+        retry(lambda _: bool(hits("private", "deadsharemarker")), timeout=seconds(150))
+        assert " ok " in state("ok"), state("ok")
+        server.unblock()
+
+        # (4) a share mounted after `index` started is scanned at once (interval is 1 day)
+        assert not hits("private", "latemarker")
+        client.succeed(f"{NFS} server2:/late /mnt/late")
+        retry(lambda _: bool(hits("private", "latemarker")), timeout=seconds(60))
+
+        # (5) reclassify (a)-(c) with the share unmounted
+        client.succeed(f"{NFS} server2:/pub /mnt/pubshare")
+        def nconf(roots, exclude=()):
+            out = 'state_dir = "/var/lib/llm-index/alice"\n'
+            for name, path, tier in roots:
+                out += f'[[root]]\nname = "{name}"\npath = "{path}"\ntier = "{tier}"\nkind = "network"\ninterval = "30s"\nshare = "server2:/pub"\n'
+            return out + "[exclude]\npaths = [" + ", ".join(f'"{e}"' for e in exclude) + "]\n"
+        P = ("ps", "/mnt/pubshare", "public")
+        client.succeed(STOP)
+        set_config(client, nconf([P]))
+        client.succeed(START)
+        wait_indexed(client, "ps")
+        wait_public_open(client)
+        assert hits("public", "pubsharemarker") and hits("public", "submarker") and hits("public", "skipmarker")
+        client.succeed(STOP)
+        client.succeed("umount -l /mnt/pubshare")
+        set_config(client, nconf([("ps", "/mnt/pubshare", "private")]))         # (a)
+        assert not hits("public", "pubsharemarker")
+        set_config(client, nconf([]))                                            # (d)
+        assert not hits("public", "pubsharemarker")
+        set_config(client, nconf([P, ("child", "/mnt/pubshare/sub", "private")]))   # (b)
+        public_closed(client)
+        set_config(client, nconf([P], exclude=["/mnt/pubshare/skip"]))           # (c)
+        public_closed(client)
+        set_config(client, nconf([P, ("child", "/mnt/pubshare/sub", "private")], exclude=["/mnt/pubshare/skip"]))
+        public_closed(client)
+        client.succeed(START)   # validation succeeds on the mount point of the unmounted share
+        wait_public_open(client)
+        assert hits("public", "pubsharemarker")
+        assert not hits("public", "submarker"), "private child root leaked"
+        assert not hits("public", "skipmarker"), "excluded file leaked"
+      '';
+    };
 }
