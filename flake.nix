@@ -24,7 +24,12 @@
       homeManagerModules.default = hmModule;
       nixosModules.default = nixosModule;
 
-      packages.${system}.default = pkgs.callPackage ./nix/package.nix { };
+      packages.${system} = {
+        default = pkgs.callPackage ./nix/package.nix { };
+        bench-corpus = import ./bench/corpus.nix {
+          inherit pkgs nixpkgs;
+        };
+      };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
