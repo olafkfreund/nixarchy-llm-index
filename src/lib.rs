@@ -1,4 +1,8 @@
-//! llm-index library root. Later steps add modules here.
+//! llm-index library root.
+
+pub mod auth;
+pub mod config;
+pub mod deny;
 
 /// Store paths baked in at build time by `nix/package.nix`; "unset" outside Nix.
 pub fn pdfium_lib() -> &'static str {
