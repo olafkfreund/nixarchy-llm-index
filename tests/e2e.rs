@@ -191,3 +191,137 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
     );
     let _ = fs::remove_dir_all(&base);
 }
+
+/// ~10 KB of varied text; `i` and the line number make every line distinct.
+fn filler(i: usize) -> String {
+    (0..150)
+        .map(|l| {
+            format!(
+                "note {i} line {l}: kestrel{} harbor{} lantern{} orchard{}\n",
+                i * 31 + l,
+                l * 17 + i,
+                i * l,
+                (i + l) * 7
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn removing_a_root_restarts_cleanly_and_compacts() {
+    use std::fs::File;
+    const N: usize = 400;
+    let base = std::env::temp_dir().join(format!("llm-index-e2e-rm-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let (a, b) = (base.join("a"), base.join("b"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(a.join("alpha.md"), "# Alpha\n\nmarmalade on toast\n").unwrap();
+    for i in 0..N {
+        fs::write(a.join(format!("n{i}.md")), filler(i)).unwrap();
+        fs::write(b.join(format!("n{i}.md")), filler(i + N)).unwrap();
+    }
+    let state = base.join("state");
+    let cfg = base.join("config.toml");
+    let write_cfg = |with_b: bool| {
+        let mut t = format!(
+            "state_dir = \"{}\"\n[[root]]\nname = \"a\"\npath = \"{}\"\ntier = \"public\"\n",
+            state.display(),
+            a.display()
+        );
+        if with_b {
+            t += &format!(
+                "[[root]]\nname = \"b\"\npath = \"{}\"\ntier = \"public\"\n",
+                b.display()
+            );
+        }
+        fs::write(&cfg, t).unwrap();
+    };
+    let run = |log: Option<File>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_llm-index"));
+        c.arg("--config")
+            .arg(&cfg)
+            .arg("index")
+            .env_remove("SQLITE_TMPDIR");
+        match log {
+            Some(f) => c.stderr(Stdio::from(f)),
+            None => c.stderr(Stdio::inherit()),
+        };
+        c.spawn().unwrap()
+    };
+    let indexed = "SELECT count(DISTINCT f.id) FROM files f JOIN chunks c ON c.file_id = f.id \
+                   WHERE f.root_id = ";
+    let marmalade = "SELECT count(*) FROM files f JOIN chunks c ON c.file_id = f.id \
+                     JOIN chunks_fts ON chunks_fts.rowid = c.id \
+                     WHERE f.relpath = 'alpha.md' AND chunks_fts MATCH 'marmalade'";
+
+    // run 1: both roots
+    write_cfg(true);
+    let mut child = run(None);
+    let start = Instant::now();
+    let ready = loop {
+        if let Ok(s) = Store::open(&state, Mode::Both) {
+            let p = &s.public;
+            if count(p, &format!("{indexed}'a'")) == N as i64 + 1
+                && count(p, &format!("{indexed}'b'")) == N as i64
+                && count(p, marmalade) == 1
+            {
+                break true;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(300) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    eprintln!("run 1 took {:?}", start.elapsed());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(ready, "run 1 did not index both roots in time");
+    let baseline = {
+        let s = Store::open(&state, Mode::Both).unwrap();
+        count(&s.public, "PRAGMA page_count")
+    };
+
+    // run 2: root b removed, no SQLITE_TMPDIR inherited
+    write_cfg(false);
+    let log = base.join("run2.log");
+    let mut child = run(Some(File::create(&log).unwrap()));
+    let start = Instant::now();
+    let text = loop {
+        let t = fs::read_to_string(&log).unwrap_or_default();
+        if t.contains("store: compacted public") || t.contains("store: compact public:") {
+            break t;
+        }
+        if start.elapsed() > Duration::from_secs(300) {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let alive = child.try_wait().unwrap().is_none();
+    let s = Store::open(&state, Mode::Both).unwrap();
+    let p = &s.public;
+    let (pages, free, size) = (
+        count(p, "PRAGMA page_count"),
+        count(p, "PRAGMA freelist_count"),
+        count(p, "PRAGMA page_size"),
+    );
+    let (b_rows, found) = (
+        count(p, "SELECT count(*) FROM files WHERE root_id = 'b'"),
+        count(p, marmalade),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(text.contains("store: compacted public"), "{text}");
+    assert!(alive, "coordinator exited: {text}");
+    assert_eq!(b_rows, 0);
+    assert_eq!(found, 1);
+    assert!(pages < baseline, "{pages} !< {baseline}");
+    assert_eq!(free, 0);
+    assert!(
+        pages * size >= 8 << 20,
+        "{} bytes is too small to spill",
+        pages * size
+    );
+    let _ = fs::remove_dir_all(&base);
+}

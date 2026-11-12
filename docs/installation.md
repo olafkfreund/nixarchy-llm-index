@@ -260,6 +260,10 @@ excludes. If you sync your home folder (Syncthing, Dropbox, Nextcloud), set
 `stateDir` outside the synced tree; excluding it in the client is not enough.
 The state directory is never indexed.
 
+SQLite temp files go in the state directory (the service sets `SQLITE_TMPDIR`).
+After a root is removed, a database is compacted when over a quarter of it is
+free; that needs free space of up to twice the database size in `stateDir`.
+
 ## Landlock
 
 The service needs Landlock in the running kernel. NixOS enables it by default.

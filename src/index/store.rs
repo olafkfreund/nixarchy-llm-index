@@ -5,6 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{ExtractedFile, ScanResult, Sink};
@@ -233,6 +234,7 @@ impl DbSink {
         }
         s.sync_roots()?;
         s.purge()?;
+        s.compact();
         Ok(s)
     }
 
@@ -242,7 +244,50 @@ impl DbSink {
         self.store.set_config(a);
         self.config = b;
         self.sync_roots()?;
-        self.purge()
+        self.purge()?;
+        self.compact();
+        Ok(())
+    }
+
+    /// Give freed pages back to the filesystem when over a quarter of a tier is free.
+    /// Errors are logged, never returned: a database that stays large is not an outage.
+    pub fn compact(&self) {
+        for t in TIERS {
+            let c = self.conn(t);
+            let l = label(t);
+            let pragma = |p: &str| c.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0));
+            let (pages, free) = match (pragma("page_count"), pragma("freelist_count")) {
+                (Ok(p), Ok(f)) => (p, f),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("store: compact {l}: {e}");
+                    continue;
+                }
+            };
+            if free * 4 <= pages {
+                continue;
+            }
+            // VACUUM attaches a temp database internally; the connection normally forbids ATTACH.
+            let _ = c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 1);
+            let r = c.execute_batch("VACUUM");
+            let _ = c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0);
+            if let Err(e) = r {
+                eprintln!("store: compact {l}: {e}");
+                continue;
+            }
+            match c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                Ok((1, _, _)) => eprintln!("store: compact {l}: WAL truncation deferred"),
+                Ok(_) => {}
+                Err(e) => eprintln!("store: compact {l}: {e}"),
+            }
+            let after = pragma("page_count").unwrap_or(-1);
+            eprintln!("store: compacted {l}: {pages} -> {after} pages");
+        }
     }
 
     fn conn(&self, t: Tier) -> &Connection {
@@ -778,6 +823,78 @@ mod tests {
             size: 5,
             mtime_ns: 7,
         }
+    }
+
+    fn big(i: usize) -> String {
+        (0..80)
+            .map(|l| {
+                format!(
+                    "word{i}x{l} lorem ipsum dolor sit amet {}",
+                    i * 7919 + l * 104729
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cfg_with(f: &Fx, roots: &[(&str, &str)]) {
+        let mut t = format!("state_dir = \"{}\"\n", f.dir.join("state").display());
+        for (n, p) in roots {
+            t += &format!("[[root]]\nname = \"{n}\"\npath = \"{p}\"\ntier = \"public\"\n");
+        }
+        fs::write(&f.cfg, t).unwrap();
+    }
+
+    fn pages(f: &Fx) -> (i64, i64) {
+        let c = f.sink.conn(Tier::Public);
+        (
+            count(c, "PRAGMA page_count"),
+            count(c, "PRAGMA freelist_count"),
+        )
+    }
+
+    #[test]
+    fn removing_a_root_compacts_and_keeps_attach_forbidden() {
+        let mut f = fx("compact");
+        cfg_with(&f, &[("pub", "/data/pub"), ("keep", "/data/keep")]);
+        f.sink.reload(&f.cfg).unwrap();
+        for i in 0..300 {
+            f.sink
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+        }
+        let before = pages(&f).0;
+        cfg_with(&f, &[("keep", "/data/keep")]);
+        f.sink.reload(&f.cfg).unwrap();
+        let (after, free) = pages(&f);
+        assert_eq!(free, 0);
+        assert!(after < before, "{after} !< {before}");
+        assert!(
+            f.sink
+                .conn(Tier::Public)
+                .execute_batch("ATTACH ':memory:' AS x")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn small_free_space_is_not_compacted() {
+        let mut f = fx("nocompact");
+        cfg_with(&f, &[("pub", "/data/pub"), ("pub2", "/data/pub2")]);
+        f.sink.reload(&f.cfg).unwrap();
+        for i in 0..100 {
+            f.sink
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+        }
+        for i in 0..5 {
+            f.sink
+                .extracted("pub2", extracted(&format!("s{i}.txt"), "tiny"));
+        }
+        cfg_with(&f, &[("pub", "/data/pub")]);
+        f.sink.reload(&f.cfg).unwrap();
+        let (_, free) = pages(&f);
+        assert!(free > 0);
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(pages(&f).1, free);
     }
 
     fn count(c: &Connection, sql: &str) -> i64 {

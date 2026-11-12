@@ -26,6 +26,10 @@ Messages below are quoted from the program.
   enables it by default; a custom `security.lsm` or kernel may not. There is no
   override.
 
+**`unable to open database file`** at start
+: Fixed in this version. On older versions, set `SQLITE_TMPDIR=<state_dir>` for
+  the service (SQLite's temp files need a writable place).
+
 **`state dir … is on a network or FUSE filesystem`**
 : `stateDir` is on NFS, CIFS or FUSE. Move it to a local disk.
 
@@ -89,7 +93,7 @@ Run `llm-index status` and read the state and reason.
 | `config_error`, `root path is not a directory` | The path is a file or does not resolve to a directory. | Fix `path`. |
 | `config_error`, `landlock unavailable` | See "Landlock" above. | |
 | `offline`, an OS error or a stall reason | The path is missing or the share stopped answering. | Mount the share; check the path. Retried after 60 s, then at doubling intervals up to `limits.backoffMax`. |
-| `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted). | Mount the right share, or fix `share`. |
+| `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted). | Mount the right share, or fix `share`. If the path changed, rename the root or set `share`; the message can still mean the wrong mount. |
 | `degraded`, `ENOSPC` | The inotify watch limit is reached. The root is polled every two minutes instead. | Raise `fs.inotify.max_user_watches`. |
 | `degraded`, `IN_Q_OVERFLOW` | The inotify event queue overflowed. Polled every two minutes. | Raise `fs.inotify.max_queued_events`. |
 | `degraded`, `watcher exited`, `watch setup stalled`, `watch degraded` or another OS error text | The watcher failed or stalled. Polled every two minutes. | Read the log. |
@@ -157,7 +161,7 @@ path.
 - After a remount, the root comes back at the next retry (up to
   `limits.backoffMax`; lower it for faster recovery).
 - If a mount shows `identity mismatch`, the share at that path changed. Check
-  `share` and the mount.
+  `share` and the mount. See the `identity mismatch` row above for a changed path.
 - llm-index does not mount anything. Mounting is yours.
 
 ## The client shows no tools

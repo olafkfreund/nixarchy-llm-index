@@ -53,6 +53,7 @@ fn open(path: &Path, mode: Mode, private: bool) -> Res<Connection> {
             .open(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::default())?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "journal_size_limit", 67_108_864)?; // WAL shrinks back after big writes
         conn.execute_batch(SCHEMA)?;
         if private {
             conn.execute_batch(PRIVATE_ONLY)?;

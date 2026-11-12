@@ -200,3 +200,19 @@ reviewers:
 
 Revert the merge commit. No schema or data format change. A database that
 was already compacted stays valid.
+
+## Implementation notes
+
+- Steps 1–5 were done by the `coder` agent; step 6 by the session.
+- Step 3: `Connection::set_limit` returns a `Result`, so it is called as
+  `let _ = c.set_limit(...)` (clippy `-D warnings`).
+- Step 4: the plan's counts were kept: `a` = `alpha.md` + 400 files, `b` = 400
+  files, each about 10 KB. Run 1 took 6.3 s without a model and 53 s with the
+  model (`nix develop`). The readiness check for "marmalade" queries
+  `chunks_fts` directly instead of `rank::search`, which needs the config gate.
+- Step 5: the `unable to open database file` entry is a bullet in "The
+  service does not start", not a table row.
+- Step 6 negative control: with the `sqlite_tmpdir` call in `run` commented
+  out, the new e2e test failed with `unable to open database file`, the same
+  error as the p620 trial. The call was then restored. Full `cargo test
+  --all-features`: 141 passed. `cargo clippy -D warnings`: clean.
