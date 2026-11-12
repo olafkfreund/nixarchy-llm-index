@@ -67,7 +67,9 @@ unknown argument name, on all four tools (`status` takes none, and `{}` or no
 `arguments` is fine). The reply is a tool error (`isError: true`), not a
 JSON-RPC error, for example ``failed to deserialize parameters: unknown field
 `foler`, expected one of `query`, `mode`, `field`, `folder`, `type`, `after`,
-`before`, `limit` ``.
+`before`, `limit` ``. The text repeats the unknown name exactly as the caller
+sent it (rmcp builds it before this program's code runs). It is the caller's
+own input, not file data.
 
 Paths with a control character (newline, tab, ESC, DEL, C1) or an invisible
 or bidirectional Unicode character (see [security](security.md)), or that are

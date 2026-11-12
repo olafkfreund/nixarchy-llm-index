@@ -27,6 +27,19 @@ pub fn unsafe_name(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_none_or(|s| s.chars().any(unsafe_char))
 }
 
+/// Replaces each unsafe character with its `\u{XXXX}` escape, for text that quotes untrusted input.
+pub fn escape_unsafe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if unsafe_char(c) {
+                format!("\\u{{{:04x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// `true` if an already-stored path has a stripped or control character.
 pub fn unsafe_path(path: &str) -> bool {
     path.chars().any(unsafe_char)
@@ -66,6 +79,11 @@ pub fn sanitize_chunks(chunks: &mut Vec<Chunk>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_unsafe_replaces_only_unsafe_chars() {
+        assert_eq!(escape_unsafe("a\u{202e}b\nc é"), "a\\u{202e}b\\u{000a}c é");
+    }
 
     #[test]
     fn unsafe_names() {

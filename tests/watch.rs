@@ -10,9 +10,9 @@ fn watcher_ignores_unsafe_names_but_reports_safe_ones() {
     let base = std::env::temp_dir().join(format!("llm-index-watch-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     let root = base.join("root");
-    // directories exist before the worker starts, so `good` is watched
+    // `good` exists before the worker starts, so it is watched; the unsafe directory is
+    // created after WatchReady, as a live event
     fs::create_dir_all(root.join("good")).unwrap();
-    fs::create_dir_all(root.join("bad\u{202e}dir")).unwrap();
     let cfg = base.join("config.toml");
     fs::write(
         &cfg,
@@ -59,11 +59,19 @@ fn watcher_ignores_unsafe_names_but_reports_safe_ones() {
         wait_for("WatchReady", &mut lines),
         "no WatchReady: {lines:?}"
     );
+    fs::create_dir_all(root.join("bad\u{202e}dir")).unwrap();
     fs::write(root.join("bad\u{202e}name.md"), "x").unwrap();
     fs::write(root.join("bad\u{202e}dir/ok.md"), "x").unwrap();
     fs::write(root.join("good/ok.md"), "x").unwrap();
     // the positive control proves the watcher ran past the debounce
     let seen = wait_for("good/ok.md", &mut lines);
+    // keep reading for a window after the safe event, so a late unsafe event would show
+    let window = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < window {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            lines.push(line);
+        }
+    }
     drop(stdin);
     let _ = child.wait();
     let _ = fs::remove_dir_all(&base);

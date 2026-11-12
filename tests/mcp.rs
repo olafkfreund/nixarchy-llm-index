@@ -1018,3 +1018,25 @@ fn unknown_arguments_are_rejected_and_status_takes_none_or_empty() {
         }
     }
 }
+
+#[test]
+fn private_status_omits_legacy_unsafe_config_error_paths() {
+    let fx = Fixture::new("status-unsafe");
+    fx.writer
+        .private
+        .as_ref()
+        .unwrap()
+        .execute(
+            "INSERT INTO config_errors VALUES('/home/x/vault/b\u{202e}ad', 'symlink')",
+            [],
+        )
+        .unwrap();
+    let mut s = fx.session("private");
+    let st = s.ok("status", json!({}));
+    let errs = st["config_errors"].as_array().unwrap();
+    assert!(
+        errs.iter().any(|e| e["path"] == "/home/x/vault/loop"),
+        "{errs:?}"
+    );
+    assert!(!st.to_string().contains('\u{202e}'), "{st}");
+}

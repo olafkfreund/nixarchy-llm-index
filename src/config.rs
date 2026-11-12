@@ -124,7 +124,9 @@ pub fn default_path() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
-    let config: Config = toml::from_str(&fs::read_to_string(path)?)?;
+    // A parse error quotes the offending source line: escape unsafe characters in it.
+    let config: Config = toml::from_str(&fs::read_to_string(path)?)
+        .map_err(|e| crate::sanitize::escape_unsafe(&e.to_string()))?;
     config.validate()?;
     Ok(config)
 }
@@ -242,6 +244,16 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_unsafe_characters() {
+        let p = std::env::temp_dir().join(format!("llm-index-badtoml-{}.toml", std::process::id()));
+        fs::write(&p, "state_dir = \"/s\"\nbad\u{202e}key = = 1\n").unwrap();
+        let e = load(&p).unwrap_err().to_string();
+        fs::remove_file(&p).unwrap();
+        assert!(!e.contains('\u{202e}'), "{e}");
+        assert!(e.contains("\\u{202e}"), "{e}");
     }
 
     #[test]

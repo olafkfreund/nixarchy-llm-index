@@ -21,6 +21,44 @@ fn query(text: &str) -> Query<'_> {
     }
 }
 
+/// One MCP tool call against `llm-index mcp --tier public`; returns the result text.
+fn mcp_call(cfg: &std::path::Path, tool: &str, args: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_llm-index"))
+        .args(["mcp", "--tier", "public", "--config"])
+        .arg(cfg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-03-26","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{args}}}}}"#).unwrap();
+    stdin.flush().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let text = loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "server closed");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if v["id"] == 2 {
+            break v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    text
+}
+
 fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
 }
@@ -113,6 +151,13 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
             "SELECT count(*) FROM files WHERE relpath LIKE '%' || char(8238) || '%'"
         ),
         0
+    );
+
+    let recent = mcp_call(&cfg, "recent", r#"{"days":1}"#);
+    assert!(recent.contains("quokka-sibling.md"), "{recent}");
+    assert!(
+        !recent.contains('\u{202e}') && !recent.contains("rlo"),
+        "{recent}"
     );
 
     let both = Store::open(&state, Mode::Both).unwrap();
