@@ -206,8 +206,9 @@ obey.
   becomes `&quot;` in the attribute), so the text cannot close the tag.
 - **Escaped only.** `title`, `symbol`, `heading` and `sheet` get the same
   `&`/`<` escaping but no wrapper.
-- **Not escaped.** `path` fields are returned as stored. Paths are file
-  names: treat them as data too.
+- **Not escaped.** `path` fields are returned as stored. Paths with
+  control or invisible characters are never indexed or returned (see
+  above). Paths are file names: treat them as data too.
 - **Stripped.** Before encoding, Unicode tag characters, bidi controls,
   zero-width characters and variation selectors are removed from document
   text, titles and headings.
