@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 8
 author: olafkfreund
 ---
@@ -76,4 +76,4 @@ p620 is running; nothing deployed yet.
 
 ## Open questions
 
-None. The owner pre-approved all changes needed (session, 2026-11-12).
+None. Approved under the owner's pre-approval of all needed changes ("continue and fix everything … preapproved all changes needed", 2026-11-12).
