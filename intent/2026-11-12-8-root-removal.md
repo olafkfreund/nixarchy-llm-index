@@ -46,7 +46,7 @@ Found in the real-life trial on p620 (2026-11-12):
   readers release their snapshots and the WAL is checkpointed, the database
   files are smaller. Compacting is best effort. If it fails (for example,
   not enough free disk), the deletions stay committed, the error is logged
-  and indexing goes on. It is tried again at the next config change.
+  and indexing goes on. It is tried again at the next start or config change.
 - The troubleshooting page explains `identity mismatch` after a path change
   and how to fix it.
 - A regression test runs the real coordinator, with its Landlock rule, as a
@@ -66,9 +66,10 @@ p620 is running; nothing deployed yet.
 - No new dependencies and no schema change.
 - Keep the path-change protection. The docs say to rename the root or set
   `share`, and still warn that the mismatch can also mean the wrong mount.
-- `VACUUM` must not run on every start, or after the purge that follows
-  each complete scan. It runs only after a config change (at start or
-  reload) actually deleted rows.
+- `VACUUM` must not run on every normal start, or after the purge that
+  follows each complete scan. It runs only at start or reload, and only
+  when a database is mostly free pages: after a large deletion such as a
+  removed root, or a compaction that failed earlier.
 - Do not keep temp files in memory: the 1 GB memory cap is smaller than the
   databases.
 - MCP reads keep working while it compacts, with no journal-mode change.
