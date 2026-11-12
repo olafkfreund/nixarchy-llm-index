@@ -28,8 +28,9 @@ Self-contained: a coder can execute this without the intent or spec.
   unchanged and are linked.
 - Facts come from the code, never from the current README. Known corrections:
   `MemoryHigh` is 75% of `memoryMaxMb`, rounded down (`nix/config.nix:194`);
-  only passages are wrapped in `<untrusted-document>`, titles/symbols/
-  headings/sheet names are escaped only (`src/mcp.rs:151-161`).
+  `search` passages and `get`'s `text` are wrapped in `<untrusted-document>`
+  (`src/mcp.rs:151-161`, `:474`); titles, symbols, headings and sheet names
+  are escaped only.
 - Facts the docs must state (verified in code):
   - Neither module puts `llm-index` on `PATH`. HM: add
     `config.services.llm-index.package` to `home.packages`. NixOS: add
@@ -72,10 +73,12 @@ Self-contained: a coder can execute this without the intent or spec.
    the repo): `llm-index --help` and each subcommand's `--help`; the MCP
    `tools/list` JSON via a small client modelled on `tests/mcp_client.py`
    (`initialize`, `notifications/initialized`, `tools/list`) against
-   `llm-index mcp --tier public --config <scratch>`; the option list
-   (`nix eval` of the HM and NixOS module option names). Hand the file path
+   `llm-index mcp --tier public --config <scratch>` (reuse `Session.rpc("tools/list", {})`
+   from `tests/mcp_client.py`); the option list (`nix eval` of the HM and
+   NixOS module option names, descending into the `instances.<owner>` and
+   `roots.<name>` submodules, with defaults). Hand the file path
    to the coder.
-   → verify: files non-empty; four tools listed.
+   → verify: files non-empty; four tools listed; submodule options present.
    Traps: `tools/list` needs no running indexer; do not touch real config.
 
 2. **`docs/reference.md` + `share/AGENTS.snippet.md` (coder).** CLI section
@@ -83,8 +86,8 @@ Self-contained: a coder can execute this without the intent or spec.
    limit (from `src/mcp.rs`), result fields, stale/offline marks, `get`
    continuation via `next`/`offset`, the fail-closed message "index
    configuration is being checked", what is wrapped vs escaped; supported
-   file types and limits (from `src/extract/` and `src/config.rs`). Snippet:
-   add `offset` to `get` and widen the untrusted warning to every
+   file types and limits (from `src/extract/` and `src/config.rs`). Exit codes as defined in
+   `src/main.rs` (around line 116). Snippet: add `offset` to `get` and widen the untrusted warning to every
    document-derived field (paths, titles, headings, symbols, sheet names),
    matching `src/mcp.rs:555`.
    → verify: every param in `tools/list` appears in both files.
@@ -110,13 +113,40 @@ Self-contained: a coder can execute this without the intent or spec.
    Traps: never show the private tier registered with a cloud client.
 
 5. **`docs/architecture.md`, `docs/security.md`, `docs/troubleshooting.md`,
-   `docs/development.md` (coder).** Per the spec table: one mermaid diagram
-   in architecture; threat model and what is not protected in security;
-   symptom → cause → fix with a diagnose command in troubleshooting (from
-   real error strings — grep `src/` for them); dev shell, tests, clippy,
-   `nix flake check` with each check's purpose (from `flake.nix` and
-   `nix/checks/`), one VM test, benchmark, layout, artifact workflow and the
-   "update reference/installation in the same PR" rule in development.
+   `docs/development.md` (coder).**
+   - Architecture: one mermaid diagram with coordinator (`index`), sandboxed
+     workers (scan, extract, watch, validate), `public.db` and `private.db`,
+     the two MCP servers and the clients. Then: indexing flow scan → extract
+     → chunk → embed → store; watching (inotify for local roots, polling at
+     `interval` for network/degraded); share scheduling (one live worker per
+     network share, backoff up to `backoffMax`, hung share fails closed);
+     ranking (SQLite FTS5 unicode61 + int8 512-dim vectors, hybrid); the
+     static offline embedding model and why; crash containment (a parser
+     crash fails only that file, one solo retry). Short; link #1's
+     intent/spec/plan for depth.
+   - Security: the two tiers and their isolation (public MCP never opens
+     `private.db`); public-root content reaches clients and model
+     providers; worker sandbox (Landlock read-only beneath the root and
+     `/nix/store`, no TCP, RLIMIT_AS/CORE, `oom_score_adj`, systemd
+     hardening); built-in denylist and `liftBuiltin` (private roots only);
+     no symlink following, no crossing mounts; untrusted-content handling
+     (wrap/escape, control/bidi stripping); not protected: residual parser
+     aborts are contained not prevented, anyone with the user account can
+     read the DBs.
+   - Troubleshooting, symptom → cause → fix with a diagnose command, from
+     real error strings (grep `src/`): refuses to start (no Landlock, state
+     dir on network/FUSE or in a synced folder, config assertion at
+     rebuild), self-test failure, root `config_error` / `offline` /
+     `degraded`, "index configuration is being checked", a file not found
+     (denylist, size/text/cell limit, unsupported type, `failed`), network
+     share hangs, MCP client shows no tools (wrong `--config`, not on
+     `PATH`).
+   - Development: dev shell (`nix develop` and its env vars), `cargo test
+     --all-features`, clippy, `nix flake check` with each check's purpose
+     (from `flake.nix` and `nix/checks/`), running one VM test, the
+     benchmark (link `docs/benchmark.md`), repo layout, the artifact
+     workflow, and the rule that option/flag/tool changes update
+     `docs/reference.md` / `docs/installation.md` in the same PR.
    → verify: every quoted error string greps in `src/`.
    Traps: link the intent/spec/plan of #1 for depth rather than copying.
 
@@ -126,20 +156,31 @@ Self-contained: a coder can execute this without the intent or spec.
    → verify: ≤ ~150 lines; every link resolves.
 
 7. **Verification (me).**
-   - Option-name diff script: names in facts file vs `docs/installation.md`.
-   - CLI and `tools/list` vs `docs/reference.md` and the snippet.
-   - Scratch CLI run on p620: scratch config with temp roots holding
-     `tests/fixtures/tree`, temp state dir; `index` until `status` shows done,
-     then an MCP `search` for a known fixture term returns its file. No real
-     services touched.
+   - Option names: diff facts file vs `docs/installation.md`; then
+     hand-check every documented default against `nix/config.nix` and the
+     modules.
+   - CLI help and `tools/list` vs `docs/reference.md` and the snippet; then
+     hand-check MCP defaults and clamps not in the schema against
+     `src/mcp.rs` (e.g. the search `limit` clamp near line 281).
+   - Every command in `README.md` and `docs/installation.md` is either run
+     below or listed in the PR as not executed, with the reason.
+   - Scratch CLI run on p620: scratch config with one root `tier = "public"`
+     (tiers default to private) over a copy of `tests/fixtures/tree`, temp
+     state dir. Start `index` in the background, poll `status` with a
+     timeout until queued is 0, run an MCP `search` for a known fixture
+     term and expect its file, then stop `index` and delete the scratch
+     dirs. No real services touched.
    - Throwaway NixOS VM test (scratch file under the scratchpad, `nix build`,
-     not added to `checks`): the documented NixOS example; unit
-     `llm-index-<owner>` starts; documented `systemctl`, `journalctl`,
-     `llm-index --config /etc/llm-index/<owner>.toml status` and the `PATH`
-     example work as the owner.
+     not added to `checks`): the documented NixOS example, plus creating
+     the owner account (`users.users.<owner>`; the module only sets
+     `User=`); unit `llm-index-<owner>` starts; documented `systemctl`,
+     `journalctl`, `llm-index --config /etc/llm-index/<owner>.toml status`
+     and the `PATH` example work as the owner.
    - HM example: build its `activationPackage` with the pinned home-manager;
-     inspect generated unit and config; not activated.
-   - Link check over `README.md` and `docs/`.
+     inspect generated unit and config; not activated. HM `systemctl --user`
+     commands are checked for unit name only, and the PR says activation
+     was not tested.
+   - Link and anchor check over `README.md` and `docs/`.
    - `nix flake check --no-build`.
    Announce on the agent bus before the VM run.
    → verify: all pass; fix docs for any mismatch.
