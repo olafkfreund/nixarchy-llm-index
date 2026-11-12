@@ -329,6 +329,12 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(n * mult))
 }
 
+/// SQLite's temp files (large deletes, VACUUM) must land where Landlock lets us write.
+fn sqlite_tmpdir(state_dir: &Path) {
+    // SAFETY: called before any thread, worker or SQLite connection exists.
+    unsafe { std::env::set_var("SQLITE_TMPDIR", state_dir) };
+}
+
 /// Write-only Landlock: the coordinator may write beneath the state dir and /proc, nothing else.
 /// Read access is left alone (the coordinator reads config, mountinfo and its databases).
 pub fn restrict_coordinator(state_dir: &Path) -> Result<(), Box<dyn Error>> {
@@ -404,6 +410,7 @@ pub fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = config::load(config_path)?;
     let (params, specs) = specs_of(&config)?;
     statedir::prepare(&config.state_dir)?;
+    sqlite_tmpdir(&config.state_dir);
     restrict_coordinator(&config.state_dir)?;
     let mut mountinfo = File::open("/proc/self/mountinfo")?;
     // The config decides what is excluded: it must not sit on a share that can hang or lie.
@@ -486,6 +493,7 @@ fn self_test_in(config: &Config, dir: &Path) -> Result<(), Box<dyn Error>> {
             root.display().to_string()
         ),
     )?;
+    sqlite_tmpdir(&config.state_dir);
     restrict_coordinator(&config.state_dir)?;
     let outside = std::env::temp_dir().join(format!("llm-index-selftest-{}", std::process::id()));
     match File::create(&outside) {
