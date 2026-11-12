@@ -131,7 +131,10 @@ pub fn build(store: &Store, public: bool) -> Res<Value> {
             .query_map([], |r| {
                 Ok(json!({"path": r.get::<_, String>(0)?, "reason": r.get::<_, Option<String>>(1)?}))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|e| !crate::sanitize::unsafe_path(e["path"].as_str().unwrap_or_default()))
+            .collect::<Vec<_>>();
         result["config_errors"] = errs.into();
     }
     result["databases"] = dbs.into();

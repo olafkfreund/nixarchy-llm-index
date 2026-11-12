@@ -262,6 +262,9 @@ impl<'a> Walker<'a> {
         let i = self.ready.root?;
         let root = &self.ready.config.roots[i];
         let name = path.file_name().unwrap_or(OsStr::new(""));
+        if crate::sanitize::unsafe_name(name) {
+            return Some("unsafe_name");
+        }
         if self
             .ready
             .config
@@ -689,6 +692,53 @@ mod tests {
         std::os::unix::fs::symlink(&base, base.join("root/child")).unwrap();
         let name = c"child";
         assert!(open_dir(&root, name).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn unsafe_names_are_skipped_first() {
+        let base = std::env::temp_dir().join(format!("llm-index-unsafe-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        let cfg = base.join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"r\"\npath = \"{}\"\n",
+                base.join("state").display(),
+                base.join("root").display()
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(&cfg).unwrap();
+        let root_fd = openat2(
+            CWD,
+            &config.roots[0].path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        let ready = Ready {
+            root: Some(0),
+            root_fd: Some(root_fd),
+            mountinfo: File::open("/proc/self/mountinfo").unwrap(),
+            global_ignore: Gitignore::empty(),
+            oom_score_adj: String::new(),
+            config,
+        };
+        let walker = Walker::new(&ready).unwrap();
+        let root = &ready.config.roots[0].path;
+        for is_dir in [false, true] {
+            assert_eq!(
+                walker.reason(&root.join("a\u{202e}b"), is_dir),
+                Some("unsafe_name")
+            );
+            assert_eq!(
+                walker.reason(&root.join("a\nb"), is_dir),
+                Some("unsafe_name")
+            );
+            assert_eq!(walker.reason(&root.join("notes"), is_dir), None);
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 }

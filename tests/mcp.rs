@@ -266,6 +266,11 @@ impl Session {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        self.raw(method, params)["result"].clone()
+    }
+
+    /// The whole JSON-RPC response, so `error.code` and `error.message` stay visible.
+    fn raw(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
         let id = self.id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -275,7 +280,7 @@ impl Session {
             let v: Value = serde_json::from_str(&line).unwrap();
             if v["id"] == id {
                 self.seen.push_str(&line);
-                return v["result"].clone();
+                return v;
             }
         }
     }
@@ -905,4 +910,133 @@ fn public_store_refuses_symlinked_db_and_config_errors_table() {
         .execute("CREATE TABLE config_errors(path TEXT)", [])
         .unwrap();
     assert!(Store::open(&state, Mode::PublicOnly).is_err());
+}
+
+#[test]
+fn unsafe_paths_are_never_returned_and_unsafe_config_names_no_path() {
+    let fx = Fixture::new("unsafe");
+    let bad = "/home/x/docs/a\u{202e}b.md";
+    let good = "/home/x/docs/ab.md";
+    for p in [bad, good] {
+        fx.add(
+            false,
+            "docs",
+            p,
+            "note",
+            "text",
+            "text",
+            1,
+            2,
+            None,
+            "narwhalquux",
+        );
+    }
+    let mut s = fx.session("public");
+    let hits = paths(&s.ok("search", json!({"query": "narwhalquux", "mode": "words"})));
+    assert_eq!(hits, [good], "positive control and filter");
+    let recent = s.ok("recent", json!({"days": 1}));
+    let listed: Vec<_> = recent["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(listed.contains(&good), "{listed:?}");
+    assert!(listed.iter().all(|p| !p.contains('\u{202e}')), "{listed:?}");
+    assert!(!s.call("get", json!({"path": good})).0);
+    assert_eq!(
+        s.call("get", json!({"path": bad})),
+        (true, "not found".into())
+    );
+    // an unsafe config closes the private server with a message that holds no path
+    let cfg = std::fs::read_to_string(&fx.cfg).unwrap();
+    std::fs::write(
+        &fx.cfg,
+        format!(
+            "{cfg}[[root]]\nname = \"bad\"\npath = \"/home/x/b\u{202e}\"\ntier = \"private\"\n"
+        ),
+    )
+    .unwrap();
+    let mut p = fx.session("private");
+    let (err, text) = p.call("status", json!({}));
+    assert!(err);
+    assert!(
+        text.contains("path contains control or invisible characters"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("/home/x") && !text.contains('\u{202e}'),
+        "{text}"
+    );
+}
+
+#[test]
+fn unknown_arguments_are_rejected_and_status_takes_none_or_empty() {
+    let fx = Fixture::new("unknown-args");
+    for tier in ["public", "private"] {
+        let mut s = fx.session(tier);
+        for (tool, args, key) in [
+            ("search", json!({"query": "x", "foler": "/"}), "foler"),
+            (
+                "get",
+                json!({"path": "/home/x/docs/cats.md", "strat": 1}),
+                "strat",
+            ),
+            ("recent", json!({"days": 1, "dyas": 2}), "dyas"),
+            ("status", json!({"x": 1}), "x"),
+        ] {
+            let r = s.raw("tools/call", json!({"name": tool, "arguments": args}));
+            // rmcp reports invalid params as a tool result, not as a JSON-RPC error
+            assert!(
+                r["error"].is_null() && r["result"]["isError"] == true,
+                "{tier} {tool}: {r}"
+            );
+            let m = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                m.contains(&format!("unknown field `{key}`")),
+                "{tier} {tool}: {m}"
+            );
+        }
+        // empty and omitted arguments still work for status; `_meta` is not an argument
+        for params in [
+            json!({"name": "status", "arguments": {}}),
+            json!({"name": "status"}),
+            json!({"name": "status", "arguments": {}, "_meta": {"progressToken": 1}}),
+            json!({"name": "search", "arguments": {"query": "kittens"}, "_meta": {"progressToken": 2}}),
+        ] {
+            let r = s.raw("tools/call", params.clone());
+            assert!(
+                r["error"].is_null() && r["result"]["isError"] != true,
+                "{params}: {r}"
+            );
+        }
+        let tools = s.request("tools/list", json!({}));
+        let tools = tools["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        for t in tools {
+            assert_eq!(t["inputSchema"]["additionalProperties"], false, "{t}");
+        }
+    }
+}
+
+#[test]
+fn private_status_omits_legacy_unsafe_config_error_paths() {
+    let fx = Fixture::new("status-unsafe");
+    fx.writer
+        .private
+        .as_ref()
+        .unwrap()
+        .execute(
+            "INSERT INTO config_errors VALUES('/home/x/vault/b\u{202e}ad', 'symlink')",
+            [],
+        )
+        .unwrap();
+    let mut s = fx.session("private");
+    let st = s.ok("status", json!({}));
+    let errs = st["config_errors"].as_array().unwrap();
+    assert!(
+        errs.iter().any(|e| e["path"] == "/home/x/vault/loop"),
+        "{errs:?}"
+    );
+    assert!(!st.to_string().contains('\u{202e}'), "{st}");
 }

@@ -331,12 +331,21 @@ impl DbSink {
         for t in TIERS {
             let c = self.conn(t);
             let orphans: Vec<i64> = c
-                .prepare("SELECT id, root_id FROM files")?
-                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .prepare("SELECT id, root_id, abspath FROM files")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .filter(|(_, root)| self.root(root).is_none())
-                .map(|(id, _)| id)
+                // rows of unconfigured roots, and legacy rows with an unsafe path
+                .filter(|(_, root, abs)| {
+                    self.root(root).is_none() || crate::sanitize::unsafe_path(abs)
+                })
+                .map(|(id, _, _)| id)
                 .collect();
             let stale: Vec<Vec<u8>> = c
                 .prepare("SELECT path_blake3 FROM validated")?
@@ -925,6 +934,20 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_name_row_is_deleted_by_a_complete_scan() {
+        let mut f = fx("unsafe-row");
+        let bad = "d\u{202e}x/a.txt";
+        f.sink.extracted("pub", extracted("keep.txt", "k"));
+        f.sink.extracted("pub", extracted(bad, "b"));
+        assert_eq!(files(&f.sink, Tier::Public), 2);
+        f.sink.scan_done(
+            "pub",
+            scan(true, &["keep.txt"], &[("d\u{202e}x", "unsafe_name")]),
+        );
+        assert_eq!(files(&f.sink, Tier::Public), 1);
+    }
+
+    #[test]
     fn deletion_needs_a_complete_scan() {
         let mut f = fx("del");
         f.sink.extracted("pub", extracted("keep.txt", "k"));
@@ -1095,6 +1118,20 @@ mod tests {
         assert_eq!(files(&f.sink, Tier::Public), 1);
         assert_eq!(
             count(f.sink.conn(Tier::Public), "SELECT count(*) FROM chunks_fts"),
+            1
+        );
+    }
+
+    #[test]
+    fn prune_drops_legacy_rows_with_an_unsafe_path() {
+        let mut f = fx("prune-unsafe");
+        f.sink.extracted("pub", extracted("a\u{202e}b.txt", "bad"));
+        f.sink.extracted("pub", extracted("ok.txt", "good"));
+        assert_eq!(files(&f.sink, Tier::Public), 2);
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(files(&f.sink, Tier::Public), 1);
+        assert_eq!(
+            count(f.sink.conn(Tier::Public), "SELECT count(*) FROM chunks"),
             1
         );
     }

@@ -124,13 +124,23 @@ pub fn default_path() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
-    let config: Config = toml::from_str(&fs::read_to_string(path)?)?;
+    // A parse error quotes the offending source line: escape unsafe characters in it.
+    let config: Config = toml::from_str(&fs::read_to_string(path)?)
+        .map_err(|e| crate::sanitize::escape_unsafe(&e.to_string()))?;
     config.validate()?;
     Ok(config)
 }
 
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        // First: later messages interpolate paths, which must not carry control characters.
+        let unsafe_path = |p: &Path| p.to_str().is_none_or(crate::sanitize::unsafe_path);
+        if unsafe_path(&self.state_dir)
+            || self.roots.iter().any(|r| unsafe_path(&r.path))
+            || self.exclude.paths.iter().any(|p| unsafe_path(p))
+        {
+            return Err("path contains control or invisible characters".into());
+        }
         if !normal_absolute(&self.state_dir) {
             return Err("state_dir must be an absolute, normalized path".into());
         }
@@ -234,5 +244,40 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_unsafe_characters() {
+        let p = std::env::temp_dir().join(format!("llm-index-badtoml-{}.toml", std::process::id()));
+        fs::write(&p, "state_dir = \"/s\"\nbad\u{202e}key = = 1\n").unwrap();
+        let e = load(&p).unwrap_err().to_string();
+        fs::remove_file(&p).unwrap();
+        assert!(!e.contains('\u{202e}'), "{e}");
+        assert!(e.contains("\\u{202e}"), "{e}");
+    }
+
+    #[test]
+    fn unsafe_paths_are_refused_first_without_naming_them() {
+        let msg = "path contains control or invisible characters";
+        let base = |extra: &str| -> Config {
+            toml::from_str(&format!(
+                "state_dir = \"/state\"\n[[root]]\nname = \"a\"\npath = \"/home/x\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let cases = [
+            "[[root]]\nname = \"b\"\npath = \"/home/y\u{202e}\"\n",
+            "[exclude]\npaths = [\"/home/x/a\u{202e}\"]\n",
+            // duplicate unsafe roots: the unsafe message wins and the path is not echoed
+            "[[root]]\nname = \"b\"\npath = \"/home/x\u{202e}\"\n[[root]]\nname = \"c\"\npath = \"/home/x\u{202e}\"\n",
+        ];
+        for extra in cases {
+            let e = base(extra).validate().unwrap_err().to_string();
+            assert_eq!(e, msg);
+        }
+        let mut c = base("");
+        c.state_dir = "/sta\u{202e}te".into();
+        assert_eq!(c.validate().unwrap_err().to_string(), msg);
+        assert!(base("").validate().is_ok());
     }
 }

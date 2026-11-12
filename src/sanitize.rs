@@ -18,6 +18,33 @@ pub fn is_stripped(c: char) -> bool {
     )
 }
 
+fn unsafe_char(c: char) -> bool {
+    is_stripped(c) || c.is_control()
+}
+
+/// `true` if a file name has a stripped or control character, or is not valid UTF-8.
+pub fn unsafe_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_none_or(|s| s.chars().any(unsafe_char))
+}
+
+/// Replaces each unsafe character with its `\u{XXXX}` escape, for text that quotes untrusted input.
+pub fn escape_unsafe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if unsafe_char(c) {
+                format!("\\u{{{:04x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `true` if an already-stored path has a stripped or control character.
+pub fn unsafe_path(path: &str) -> bool {
+    path.chars().any(unsafe_char)
+}
+
 /// Strips Unicode tag characters (`U+E0000..=U+E007F`), bidi marks/overrides/isolates
 /// (`U+061C`, `U+200E..=U+200F`, `U+202A..=U+202E`, `U+2066..=U+2069`), invisible operators
 /// and zero-width characters (`U+180E`, `U+200B..=U+200D`, `U+2060..=U+2064`, `U+FEFF`), and
@@ -52,6 +79,34 @@ pub fn sanitize_chunks(chunks: &mut Vec<Chunk>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_unsafe_replaces_only_unsafe_chars() {
+        assert_eq!(escape_unsafe("a\u{202e}b\nc é"), "a\\u{202e}b\\u{000a}c é");
+    }
+
+    #[test]
+    fn unsafe_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        for bad in [
+            "a\u{202e}b",
+            "a\u{e0041}",
+            "a\u{200b}",
+            "a\nb",
+            "a\x1bb",
+            "a\x7f",
+            "a\u{85}",
+        ] {
+            assert!(unsafe_name(OsStr::new(bad)), "{bad:?}");
+            assert!(unsafe_path(bad), "{bad:?}");
+        }
+        assert!(unsafe_name(OsStr::from_bytes(b"a\xffb")));
+        for ok in ["notes.md", "Ünïcödé.md", "日本語.txt"] {
+            assert!(!unsafe_name(OsStr::new(ok)), "{ok}");
+            assert!(!unsafe_path(ok), "{ok}");
+        }
+    }
 
     #[test]
     fn strips_tag_bidi_invisible_operators_and_variation_selectors() {

@@ -21,6 +21,44 @@ fn query(text: &str) -> Query<'_> {
     }
 }
 
+/// One MCP tool call against `llm-index mcp --tier public`; returns the result text.
+fn mcp_call(cfg: &std::path::Path, tool: &str, args: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_llm-index"))
+        .args(["mcp", "--tier", "public", "--config"])
+        .arg(cfg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-03-26","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{args}}}}}"#).unwrap();
+    stdin.flush().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let text = loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "server closed");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if v["id"] == 2 {
+            break v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    text
+}
+
 fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
 }
@@ -43,6 +81,11 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
     )
     .unwrap();
     fs::write(pubr.join(".env"), "TOKEN=zeppelin\n").unwrap();
+    // unsafe names: a file and a directory (with a safe file inside) are never indexed
+    fs::write(pubr.join("rlo\u{202e}file.md"), "quokka in a file\n").unwrap();
+    fs::create_dir_all(pubr.join("rlo\u{202e}dir")).unwrap();
+    fs::write(pubr.join("rlo\u{202e}dir/inner.md"), "quokka in a dir\n").unwrap();
+    fs::write(pubr.join("quokka-sibling.md"), "quokka sibling\n").unwrap();
     // the state dir sits inside a root: it must never be indexed
     let state = pubr.join("idx-state");
     let cfg = base.join("config.toml");
@@ -68,7 +111,7 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
     let ready = loop {
         if let Ok(s) = Store::open(&state, Mode::Both) {
             let (p, q) = (&s.public, s.private.as_ref().unwrap());
-            if count(p, "SELECT count(*) FROM files") >= 1
+            if count(p, "SELECT count(*) FROM files") >= 2
                 && count(q, "SELECT count(*) FROM files") >= 1
                 && count(p, "SELECT count(*) FROM validated") >= 1
             {
@@ -99,6 +142,23 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
             .is_empty()
     );
     assert!(search(&public, &query("diary"), None).unwrap().is_empty());
+    let hits = search(&public, &query("quokka"), None).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].abspath.ends_with("pub/quokka-sibling.md"));
+    assert_eq!(
+        count(
+            &public.public,
+            "SELECT count(*) FROM files WHERE relpath LIKE '%' || char(8238) || '%'"
+        ),
+        0
+    );
+
+    let recent = mcp_call(&cfg, "recent", r#"{"days":1}"#);
+    assert!(recent.contains("quokka-sibling.md"), "{recent}");
+    assert!(
+        !recent.contains('\u{202e}') && !recent.contains("rlo"),
+        "{recent}"
+    );
 
     let both = Store::open(&state, Mode::Both).unwrap();
     both.set_config(config::load(&cfg).unwrap());

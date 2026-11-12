@@ -40,6 +40,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../Cargo.lock
       ../src
       ../share
+      ../tests/fixtures/sheets # include_bytes! in src/extract/sheet.rs tests
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
@@ -48,7 +49,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   # tokenizers' onig feature: link nixpkgs' oniguruma (BSD-2) instead of building a vendored copy.
   nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ oniguruma sqlite ];
+  buildInputs = [
+    oniguruma
+    sqlite
+  ];
   RUSTONIG_SYSTEM_LIBONIG = true;
 
   # Read with option_env! so both paths land in the binary and hence the closure.

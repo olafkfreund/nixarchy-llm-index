@@ -182,7 +182,7 @@ Defaults are those of the modules. Home Manager options sit directly under
 | --- | --- | --- | --- |
 | `limits.maxFileMb` | positive integer | `50` | Larger files are skipped. |
 | `limits.maxTextBytes` | positive integer | `33554432` | Extracted text above this fails the file. |
-| `limits.maxCells` | positive integer | `2000000` | Cell budget per `.xlsx` workbook. Not checked for `.ods` and `.xls`. |
+| `limits.maxCells` | positive integer | `2000000` | Cell budget per workbook (`.xlsx`, `.ods`, `.xls`). For `.ods` and `.xls` it is checked after the file is opened, so it bounds the work, not the first load. |
 | `limits.memoryMaxMb` | positive integer | `1024` | `MemoryMax` of the unit, in MiB. `MemoryHigh` is 75% of it, rounded down. |
 | `limits.workers` | integer | `2` | Worker processes. At least 2. |
 | `limits.backoffMax` | string | `"60m"` | Longest wait before retrying an offline network share. `[0-9]+[smhd]`, nonzero. |
@@ -199,7 +199,12 @@ reject:
 - an exclusion not at or under a root;
 - an `interval` or `backoffMax` that does not match `[0-9]+[smhd]`, or is zero;
 - `limits.workers` below 2;
+- a root, exclusion or `stateDir` containing a control character (C0 or DEL);
 - NixOS only: a `stateDir` outside `/var/lib/`.
+
+The program is stricter than the modules: when it loads the config it also
+refuses invisible and bidirectional Unicode characters in those paths, and
+paths that are not valid UTF-8.
 
 ## Permissions
 

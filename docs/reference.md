@@ -62,8 +62,19 @@ the same four tools. Every tool is read-only.
   `"tier": "public"` or `"private"`.
 
 Arguments marked "required" must be present; everything else is optional.
-An argument of the wrong type is rejected before the tool runs. An unknown
-argument name is ignored, so a typo such as `foler` silently drops that filter.
+An argument of the wrong type is rejected before the tool runs. So is an
+unknown argument name, on all four tools (`status` takes none, and `{}` or no
+`arguments` is fine). The reply is a tool error (`isError: true`), not a
+JSON-RPC error, for example ``failed to deserialize parameters: unknown field
+`foler`, expected one of `query`, `mode`, `field`, `folder`, `type`, `after`,
+`before`, `limit` ``. The text repeats the unknown name exactly as the caller
+sent it (rmcp builds it before this program's code runs). It is the caller's
+own input, not file data.
+
+Paths with a control character (newline, tab, ESC, DEL, C1) or an invisible
+or bidirectional Unicode character (see [security](security.md)), or that are
+not valid UTF-8, are never indexed, so `search`, `recent` and `get` never
+return them. `get` on such a path answers `not found`.
 
 ### `search`
 
@@ -197,8 +208,9 @@ obey.
   becomes `&quot;` in the attribute), so the text cannot close the tag.
 - **Escaped only.** `title`, `symbol`, `heading` and `sheet` get the same
   `&`/`<` escaping but no wrapper.
-- **Not escaped.** `path` fields are returned as stored. Paths are file
-  names: treat them as data too.
+- **Not escaped.** `path` fields are returned as stored. Paths with
+  control or invisible characters are never indexed or returned (see
+  above). Paths are file names: treat them as data too.
 - **Stripped.** Before encoding, Unicode tag characters, bidi controls,
   zero-width characters and variation selectors are removed from document
   text, titles and headings.
@@ -249,7 +261,7 @@ see [installation](installation.md)).
 | --- | --- | --- |
 | `maxFileMb` | 50 | Larger files are skipped. |
 | `maxTextBytes` | 33554432 (32 MiB) | Extracted text above this fails the file. |
-| `maxCells` | 2000000 | `.xlsx` workbooks above this many cells, counted across the workbook, fail. Not checked for `.ods` and `.xls`. |
+| `maxCells` | 2000000 | `.xlsx`, `.ods` and `.xls` workbooks above this many cells, counted across the workbook, fail. For `.ods` and `.xls`, calamine loads every sheet when it opens the file, so that allocation happens before the check; it is bounded by the 20 MiB file cap and the worker's 4 GiB address-space limit. |
 
 Fixed limits in the extractors, which `maxFileMb` does not lift: PDFs over 5000
 pages are rejected; `.xls` and `.ods` files over 20 MiB are rejected; zip-based formats (`.docx`, `.odt`,

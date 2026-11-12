@@ -42,7 +42,13 @@ enum FieldArg {
     Path,
 }
 
+/// `status` takes no arguments; the empty struct makes unknown keys an error.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     /// Words (whole tokens, case and accent insensitive; "quoted phrases") or a description.
     query: String,
@@ -64,6 +70,7 @@ struct SearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetArgs {
     /// Absolute path of an indexed file, as returned by search.
     path: String,
@@ -78,6 +85,7 @@ struct GetArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RecentArgs {
     /// Files modified within this many days (1 to 3650).
     days: u32,
@@ -303,6 +311,9 @@ impl Core {
 
     /// Details of one hit, read in the search's snapshot and re-checked for visibility.
     fn hit(&self, h: &Hit) -> Result<Option<Value>, Fail> {
+        if crate::sanitize::unsafe_path(&h.abspath) {
+            return Ok(None);
+        }
         let vis = rank::visible_sql(self.store().mode);
         let sql = format!(
             "SELECT f.title, f.type, f.mtime_ns, visible(f.abspath), r.state,
@@ -368,6 +379,9 @@ impl Core {
         self.check()?;
         if !a.path.starts_with('/') {
             return Err(Fail::Arg("path must be absolute".into()));
+        }
+        if crate::sanitize::unsafe_path(&a.path) {
+            return Err(Fail::Arg("not found".into()));
         }
         let (lo, hi) = (a.start.unwrap_or(1), a.end.unwrap_or(u64::MAX));
         let store = self.store();
@@ -519,7 +533,10 @@ impl Core {
                 },
             )?;
             for row in it {
-                rows.push(row?);
+                let row = row?;
+                if !crate::sanitize::unsafe_path(row.1["path"].as_str().unwrap_or_default()) {
+                    rows.push(row);
+                }
             }
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.0));
@@ -577,7 +594,7 @@ impl Server {
 
     /// Index status: roots, their state and counts, sandbox state and database sizes.
     #[tool(annotations(read_only_hint = true))]
-    async fn status(&self) -> Result<String, String> {
+    async fn status(&self, Parameters(_): Parameters<StatusArgs>) -> Result<String, String> {
         self.run(|c| c.status())
     }
 }
