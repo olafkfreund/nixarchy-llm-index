@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 4
 intent: intent/2026-11-11-4-documentation.md
 ---
