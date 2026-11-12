@@ -18,14 +18,14 @@ and path is read from `src/` and `nix/` while writing.
 | File | Answers | Main content |
 | --- | --- | --- |
 | `README.md` (rewrite, ~150 lines) | What is it, and how do I get a first search? | One-paragraph pitch; what it is not (no GPU, no network, no API key); requirements; quick start for Home Manager and for NixOS; connect one agent; verify it works; links to `docs/`; licence. |
-| `docs/installation.md` | How do I install and configure it? | Choosing a route: HM user unit `llm-index.service` or NixOS system unit `llm-index-<owner>.service` (one route per index); flake input; HM and NixOS examples; putting the binary on `PATH` (`config.services.llm-index.package`); config file locations (HM `$XDG_CONFIG_HOME/llm-index/config.toml`, NixOS `/etc/llm-index/<owner>.toml` and `--config`); full option reference (moved from the README, corrected: `MemoryHigh` = 75% of `memoryMaxMb`, rounded down); permissions (NixOS runs as the owner, `stateDir` under `/var/lib/`); network roots (the user mounts the share; `kind`, `share`, `interval`, offline behaviour); state-dir and sync restrictions; Landlock requirement; service and log commands (`systemctl --user` / `systemctl`, `journalctl`); upgrading and uninstalling (what to delete). |
+| `docs/installation.md` | How do I install and configure it? | Choosing a route: HM user unit `llm-index.service` or NixOS system unit `llm-index-<owner>.service` (one route per index); flake input; HM and NixOS examples; putting the binary on `PATH`, per route (HM `config.services.llm-index.package`, NixOS `config.services.llm-index.instances.<owner>.package`); config file locations (HM `$XDG_CONFIG_HOME/llm-index/config.toml`, NixOS `/etc/llm-index/<owner>.toml` and `--config`); full option reference (moved from the README, corrected: `MemoryHigh` = 75% of `memoryMaxMb`, rounded down); permissions (NixOS runs as the owner, `stateDir` under `/var/lib/`); network roots (the user mounts the share; `kind`, `share`, `interval`, offline behaviour); state-dir and sync restrictions; Landlock requirement; service and log commands (`systemctl --user` / `systemctl`, `journalctl`); upgrading and uninstalling (what to delete). |
 | `docs/agents.md` | How do I use it from my LLM client? | The model behind the client does not matter; the client must speak stdio MCP. What HM `programs.mcp.servers` registration does and does not do. Per-client setup: Claude Code, Codex, Gemini CLI (also used by agy), each with the client's documented config format and a check command; a generic stdio section (command, args, no env needed); local models: the client front-end must support MCP. Adding the agent snippet (`agentInstructions`) to `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`. Private tier: local clients only, with the reason. |
 | `docs/reference.md` | What exactly can I run and call? | CLI: global `--config`, `index`, `index --self-test`, `mcp --tier public\|private`, `status`; `worker` named as internal; exit codes where the code defines them. MCP tools `search`, `get`, `recent`, `status`: every parameter with type, default and limits from `src/mcp.rs`; search modes; filters; result fields; stale/offline marks; `get` continuation via `next` / `offset`; the fail-closed "index configuration is being checked" message; what is wrapped (passages) and what is only escaped (titles, symbols, headings, sheet names). Supported file types and limits. |
 | `docs/architecture.md` | How does it work? | One mermaid diagram (coordinator, sandboxed workers, two SQLite DBs, two MCP servers, clients). Indexing flow (scan → extract → chunk → embed → store), watching (inotify for local, polling for network), share scheduling, ranking (FTS5 + int8 vectors, hybrid), the embedding model and why it is static and offline, crash containment. Short; links to the spec and plan for detail. |
 | `docs/security.md` | What can leak, and what stops it? | Threat model in plain terms: the two tiers and their isolation; a `public` root's paths, titles and passages reach every registered client and its model provider; worker sandbox (Landlock read-only, no TCP, rlimits, systemd hardening); built-in denylist and `liftBuiltin`; symlink and mount-boundary rules; untrusted-content handling; what is not protected (residual parser aborts are contained, not prevented; anyone with your user account can read the DBs). |
 | `docs/troubleshooting.md` | It does not work — now what? | Symptom → cause → fix, from real failure modes in the code: refuses to start (no Landlock, state dir on network/FUSE or in a synced folder, config assertion), self-test failure, root `config_error` / `offline` / `degraded`, "index configuration is being checked", a file not found by search (denylist, size or cell limit, unsupported type, `failed`), network share hangs (fail-closed), MCP client shows no tools. Each with the command to diagnose. |
 | `docs/development.md` | How do I work on it? | Dev shell (`nix develop`, the env vars it sets), `cargo test --all-features`, clippy, `nix flake check` and what each check covers, running one VM test, the benchmark (link `docs/benchmark.md`), repo layout, the artifact workflow (intent → spec → plan) for changes. |
-| `share/AGENTS.snippet.md` | (shipped to agents) | Add `offset` to `get`'s signature and say when to use it; no other change unless a signature is wrong. |
+| `share/AGENTS.snippet.md` | (shipped to agents) | Add `offset` to `get`'s signature and say when to use it; widen the untrusted-content warning from "passages and file text" to every document-derived field (titles, headings, symbols, sheet names, paths), matching `src/mcp.rs:555`. No other change unless a signature is wrong. |
 
 `docs/feasibility.md` and `docs/benchmark.md` stay unchanged and are
 linked. Performance figures in the README and architecture page are quoted
@@ -83,12 +83,26 @@ block with a language tag, NixOS-module commands shown with the
    checked by hand against the same files.
 2. CLI: `llm-index --help` and each subcommand's `--help` from the built
    package match `docs/reference.md`.
-3. MCP tools: the tool list and input schemas printed by
-   `tests/mcp_client.py` (or an MCP `tools/list` call) match
-   `docs/reference.md` and `share/AGENTS.snippet.md`.
-4. Commands: the quick-start and verification commands run on p620 against
-   a scratch config (`--config`, temp roots, temp state dir) and give the
-   documented output; no system or user service is changed.
+3. MCP tools: an MCP `initialize` + `tools/list` exchange over stdio with
+   `llm-index mcp --tier public` (needs no running indexer; config and
+   DBs load lazily) prints the four tools and their schemas, which must
+   match `docs/reference.md` and `share/AGENTS.snippet.md`. Defaults and
+   clamps not in the schema are checked in `src/mcp.rs`.
+4. Commands, in two parts:
+   - **CLI on p620 (scratch):** `index`, `status` and an MCP `search` run
+     from the built package against a scratch config (`--config`, temp
+     roots holding `tests/fixtures/`, temp state dir); a known fixture
+     query returns its expected file. No user or system service changes.
+   - **Install routes (disposable):** the README/installation NixOS
+     example runs in a throwaway NixOS VM test (scratch file, built with
+     `nix build`, not added to `checks`): the unit `llm-index-<owner>`
+     starts, and the documented `systemctl`, `journalctl`,
+     `llm-index --config /etc/llm-index/<owner>.toml status` and the
+     `PATH` example work as the owner. The HM example is built (its
+     `activationPackage`, via the pinned home-manager) but not activated;
+     the generated unit and config file are inspected. `systemctl --user`
+     commands are therefore checked for unit name only, and the page says
+     nothing it has not shown.
 5. Links: every relative link and anchor in `README.md` and `docs/`
    resolves.
 6. `nix flake check --no-build` still evaluates (the snippet is part of the
