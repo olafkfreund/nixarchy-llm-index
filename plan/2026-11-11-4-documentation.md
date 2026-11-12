@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 4
 spec: spec/2026-11-11-4-documentation.md
 coders:
