@@ -65,6 +65,13 @@ least 2`**, **`duplicate root path`**, **`invalid root path`**,
 **`invalid exclusion`**
 : The same rules, seen when a hand-written config is loaded.
 
+**`path contains control or invisible characters`**
+: A root, exclusion or `state_dir` holds a control character or an invisible
+  or bidirectional Unicode character. The message does not repeat the path.
+  Fix the path. The NixOS and Home Manager modules catch control characters
+  (`roots, exclusions and stateDir must not contain control characters`) at
+  build time; the program also refuses invisible ones when it loads the config.
+
 **`roots or limits changed: restarting to apply`**
 : Not a fault. The service exits when its roots or limits change so that
   systemd restarts it with the new config.
@@ -114,9 +121,12 @@ Check, in order:
    `exclude.liftBuiltin`.
 4. **Is the type supported?** See [reference](reference.md#what-is-indexed).
    Unsupported extensions (for example `.pptx`) are not indexed.
-5. **Is it over a limit?** Larger than `maxFileMb`, extracted text above
+5. **Is the name safe?** A file or directory with a control or invisible
+   character (for example a right-to-left override) in its name is never
+   indexed, nor is anything under it. Rename it.
+6. **Is it over a limit?** Larger than `maxFileMb`, extracted text above
    `maxTextBytes`, or a spreadsheet above `maxCells`.
-6. **Did extraction fail?** Failed files are recorded with a reason. The owner
+7. **Did extraction fail?** Failed files are recorded with a reason. The owner
    can list them:
 
    ```sh
@@ -128,7 +138,7 @@ Check, in order:
    Reasons include `too_large`, `timeout`, `zip_bomb` and `worker died`; a parse
    error gives its own message. Skip labels are `mismatch`, `binary`,
    `minified`, `generated`, `too_large` and `unsupported`.
-7. **Is it new?** Local roots update in seconds; network roots wait for their
+8. **Is it new?** Local roots update in seconds; network roots wait for their
    `interval`. Check `queued/done` in `status`.
 
 `meaning search unavailable` means `mode: "meaning"` was used but the embedding

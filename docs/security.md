@@ -101,8 +101,18 @@ risk but cannot remove it.
   file and one sandboxed process, not prevented.
 - **Anyone with your account.** The databases are readable by the user the
   service runs as, and by root. File permissions are the only barrier.
-- **Paths are returned as stored.** They are not escaped or sanitized, so a
-  hostile file name can reach the model.
+- **Paths are returned as stored, but unsafe names are never indexed.** A
+  file or directory whose name has a control character, an invisible or
+  bidirectional Unicode character (the set stripped from content), or bytes
+  that are not valid UTF-8 is skipped (reason `unsafe_name`), and so is
+  everything under it. It is skipped, not cleaned: a cleaned name would no
+  longer open the file, and two names could collapse into one. Rows of this
+  kind are removed by the next complete scan, and the MCP tools drop any such
+  path they find. Other odd names (long, misleading but printable) still
+  reach the model.
+- **Configured paths follow the same rule.** The program refuses a root,
+  exclusion or `state_dir` with such characters
+  (`path contains control or invisible characters`).
 - **Content you mark public** is sent to the model providers of the clients
   you connect.
 - **A cloud client with the private server.** See above.
