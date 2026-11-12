@@ -101,8 +101,11 @@ reviewers:
        database has many pages. Then reload with a config that drops
        `pub` but keeps another root. Assert `freelist_count == 0` and that
        `ATTACH ':memory:' AS x` fails on `f.sink.conn(Tier::Public)`.
-     - (b) A fresh fixture with one small file: call `compact()` and
-       assert `page_count` is unchanged.
+     - Test (a) also asserts that `page_count` dropped.
+     - (b) Insert about 100 files into `pub` and 5 small files into a
+       second root `pub2`. Reload without `pub2`, which leaves a few free
+       pages, below the threshold. Assert `freelist_count > 0` and that it
+       is unchanged after reload, which proves compaction was skipped.
 
    → verify by `cargo test --lib store`.
 
@@ -113,26 +116,41 @@ reviewers:
 4. `tests/e2e.rs`: new `#[test] fn removing_a_root_restarts_cleanly_and_compacts()`.
    Use the existing harness style (temp base dir with `process::id()`,
    `Store::open` polling, `count`, `query`/`search`).
-   - Root `a` holds `alpha.md` containing "marmalade".
-   - Root `b` holds 400 files `b/n{i}.md`, each about 10 KB of varied
-     words. Use `format!` with `i` in every line, so the files are not
-     identical.
-   - Run 1: `llm-index index` with both roots. Poll until `files` holds at
-     least 401 rows and `validated` has at least 1 row (time limit 180 s).
-     Record `page_count` of `public.db` (read-only `Store`), then kill and
-     wait.
+   - **Both roots must be large.** `VACUUM` rebuilds the surviving data, so
+     the surviving root `a` must hold more than SQLite's 2 MB temp page
+     cache, and the removed root `b` must be large enough to push free
+     pages over a quarter of the file.
+   - Generate:
+     - `a`: `alpha.md`, containing "marmalade", plus about 400 files
+       `a/n{i}.md`;
+     - `b`: about 400 files `b/n{i}.md`.
+     Each file is about 10 KB of varied text, with `format!` using `i` and
+     the line number in every line.
+   - **Measure first.** Time run 1 locally with the model enabled. If it is
+     over about 60 s, lower both counts, keeping `a` large enough that
+     `public.db` holds at least 8 MB after `b` is removed (check with
+     `page_count * page_size`). Record the counts and timing in this plan.
+     Time limits: 300 s per wait.
+   - Run 1: `llm-index index` with both roots. **Readiness:** poll until
+     each root has the expected number of files with at least one chunk
+     (`SELECT count(DISTINCT f.id) FROM files f JOIN chunks c ON c.file_id = f.id WHERE f.root_id = ?`;
+     check the real column names in `src/db.rs` SCHEMA) and "marmalade"
+     finds `alpha.md`. Then record `page_count`, `page_size` and the
+     `public.db` size, and kill and wait.
    - Rewrite the config with only `a`.
    - Run 2: same binary, `.env_remove("SQLITE_TMPDIR")`, stderr to
      `base/run2.log` (`Stdio::from(File::create(..))`).
-   - Poll the log (time limit 180 s) until it contains
-     `store: compacted public` or `store: compact public:`.
+   - Poll the log until it contains `store: compacted public` or
+     `store: compact public:`.
    - Then assert:
      - the log contains `store: compacted public`;
      - `child.try_wait()` is `Ok(None)`;
-     - no `files` row has `root_id = 'b'`;
-     - `search` for "marmalade" returns `alpha.md`;
+     - no `files` row has root `b`;
+     - "marmalade" still finds `alpha.md`;
      - `page_count` is below the baseline;
-     - `freelist_count` is 0.
+     - `freelist_count` is 0;
+     - `page_count * page_size` is at least 8 MB, so the surviving data was
+       big enough to spill.
    - Kill the child and remove the base dir.
 
    → verify by `cargo test --test e2e removing_a_root`.
@@ -165,10 +183,10 @@ reviewers:
 7. Mine: the real check on the p620 trial.
    - Build the merged package.
    - Restart `llm-index-trial` without `--setenv=SQLITE_TMPDIR`.
-   - Remove a root from the trial config. The private `docs` root is a
-     good candidate; add it back afterwards.
-   - Confirm the unit stays active, `store: compacted` is in the journal,
-     and the database shrinks.
+   - Remove the private `docs` root from the trial config, which frees all
+     of `private.db`, and add it back afterwards.
+   - Confirm the unit stays active, `store: compacted private` is in the
+     journal, and `private.db` shrinks.
 
 ## Tests
 

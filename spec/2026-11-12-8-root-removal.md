@@ -128,10 +128,11 @@ temp space as large as the database (1.4 GB in the trial), more than the
 
 1. New subprocess test in `tests/e2e.rs`,
    `removing_a_root_restarts_cleanly_and_compacts`:
-   - Two public roots, `a` (a few files) and `b` (about 400 generated
-     text files of about 10 KB each). That makes `public.db` several MB, well
-     above SQLite's default 2 MB page cache, so `VACUUM` has to spill its
-     temp database to disk.
+   - Two public roots, `a` and `b`, each with about 400 generated text
+     files of about 10 KB. `VACUUM` rebuilds what survives, so `a` keeps
+     `public.db` well above SQLite's 2 MB temp page cache, and `VACUUM`
+     has to spill to disk. `b` pushes free pages past a quarter of the
+     file.
    - Run `llm-index index` (the real coordinator with its Landlock rule)
      until both are indexed, record `page_count` of `public.db`, and kill
      it.
@@ -162,5 +163,5 @@ temp space as large as the database (1.4 GB in the trial), more than the
    the Nix build sandbox, where `TMPDIR=/build` is outside `state_dir`).
 4. Real check on the p620 trial: remove a root from the trial config,
    restart without the `SQLITE_TMPDIR` workaround, and confirm the service
-   stays up and `public.db` shrinks.
+   stays up and that database shrinks (the private `docs` root, so `private.db`).
 5. Codex review of the diff, read-only.
