@@ -266,6 +266,11 @@ impl Session {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        self.raw(method, params)["result"].clone()
+    }
+
+    /// The whole JSON-RPC response, so `error.code` and `error.message` stay visible.
+    fn raw(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
         let id = self.id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -275,7 +280,7 @@ impl Session {
             let v: Value = serde_json::from_str(&line).unwrap();
             if v["id"] == id {
                 self.seen.push_str(&line);
-                return v["result"].clone();
+                return v;
             }
         }
     }
@@ -963,4 +968,53 @@ fn unsafe_paths_are_never_returned_and_unsafe_config_names_no_path() {
         !text.contains("/home/x") && !text.contains('\u{202e}'),
         "{text}"
     );
+}
+
+#[test]
+fn unknown_arguments_are_rejected_and_status_takes_none_or_empty() {
+    let fx = Fixture::new("unknown-args");
+    for tier in ["public", "private"] {
+        let mut s = fx.session(tier);
+        for (tool, args, key) in [
+            ("search", json!({"query": "x", "foler": "/"}), "foler"),
+            (
+                "get",
+                json!({"path": "/home/x/docs/cats.md", "strat": 1}),
+                "strat",
+            ),
+            ("recent", json!({"days": 1, "dyas": 2}), "dyas"),
+            ("status", json!({"x": 1}), "x"),
+        ] {
+            let r = s.raw("tools/call", json!({"name": tool, "arguments": args}));
+            // rmcp reports invalid params as a tool result, not as a JSON-RPC error
+            assert!(
+                r["error"].is_null() && r["result"]["isError"] == true,
+                "{tier} {tool}: {r}"
+            );
+            let m = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                m.contains(&format!("unknown field `{key}`")),
+                "{tier} {tool}: {m}"
+            );
+        }
+        // empty and omitted arguments still work for status; `_meta` is not an argument
+        for params in [
+            json!({"name": "status", "arguments": {}}),
+            json!({"name": "status"}),
+            json!({"name": "status", "arguments": {}, "_meta": {"progressToken": 1}}),
+            json!({"name": "search", "arguments": {"query": "kittens"}, "_meta": {"progressToken": 2}}),
+        ] {
+            let r = s.raw("tools/call", params.clone());
+            assert!(
+                r["error"].is_null() && r["result"]["isError"] != true,
+                "{params}: {r}"
+            );
+        }
+        let tools = s.request("tools/list", json!({}));
+        let tools = tools["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        for t in tools {
+            assert_eq!(t["inputSchema"]["additionalProperties"], false, "{t}");
+        }
+    }
 }

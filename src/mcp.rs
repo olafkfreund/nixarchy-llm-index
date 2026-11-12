@@ -42,7 +42,13 @@ enum FieldArg {
     Path,
 }
 
+/// `status` takes no arguments; the empty struct makes unknown keys an error.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     /// Words (whole tokens, case and accent insensitive; "quoted phrases") or a description.
     query: String,
@@ -64,6 +70,7 @@ struct SearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetArgs {
     /// Absolute path of an indexed file, as returned by search.
     path: String,
@@ -78,6 +85,7 @@ struct GetArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RecentArgs {
     /// Files modified within this many days (1 to 3650).
     days: u32,
@@ -586,7 +594,7 @@ impl Server {
 
     /// Index status: roots, their state and counts, sandbox state and database sizes.
     #[tool(annotations(read_only_hint = true))]
-    async fn status(&self) -> Result<String, String> {
+    async fn status(&self, Parameters(_): Parameters<StatusArgs>) -> Result<String, String> {
         self.run(|c| c.status())
     }
 }
