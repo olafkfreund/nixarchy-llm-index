@@ -925,6 +925,20 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_name_row_is_deleted_by_a_complete_scan() {
+        let mut f = fx("unsafe-row");
+        let bad = "d\u{202e}x/a.txt";
+        f.sink.extracted("pub", extracted("keep.txt", "k"));
+        f.sink.extracted("pub", extracted(bad, "b"));
+        assert_eq!(files(&f.sink, Tier::Public), 2);
+        f.sink.scan_done(
+            "pub",
+            scan(true, &["keep.txt"], &[("d\u{202e}x", "unsafe_name")]),
+        );
+        assert_eq!(files(&f.sink, Tier::Public), 1);
+    }
+
+    #[test]
     fn deletion_needs_a_complete_scan() {
         let mut f = fx("del");
         f.sink.extracted("pub", extracted("keep.txt", "k"));

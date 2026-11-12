@@ -43,6 +43,11 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
     )
     .unwrap();
     fs::write(pubr.join(".env"), "TOKEN=zeppelin\n").unwrap();
+    // unsafe names: a file and a directory (with a safe file inside) are never indexed
+    fs::write(pubr.join("rlo\u{202e}file.md"), "quokka in a file\n").unwrap();
+    fs::create_dir_all(pubr.join("rlo\u{202e}dir")).unwrap();
+    fs::write(pubr.join("rlo\u{202e}dir/inner.md"), "quokka in a dir\n").unwrap();
+    fs::write(pubr.join("quokka-sibling.md"), "quokka sibling\n").unwrap();
     // the state dir sits inside a root: it must never be indexed
     let state = pubr.join("idx-state");
     let cfg = base.join("config.toml");
@@ -68,7 +73,7 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
     let ready = loop {
         if let Ok(s) = Store::open(&state, Mode::Both) {
             let (p, q) = (&s.public, s.private.as_ref().unwrap());
-            if count(p, "SELECT count(*) FROM files") >= 1
+            if count(p, "SELECT count(*) FROM files") >= 2
                 && count(q, "SELECT count(*) FROM files") >= 1
                 && count(p, "SELECT count(*) FROM validated") >= 1
             {
@@ -99,6 +104,16 @@ fn index_makes_searchable_rows_and_keeps_tiers_apart() {
             .is_empty()
     );
     assert!(search(&public, &query("diary"), None).unwrap().is_empty());
+    let hits = search(&public, &query("quokka"), None).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].abspath.ends_with("pub/quokka-sibling.md"));
+    assert_eq!(
+        count(
+            &public.public,
+            "SELECT count(*) FROM files WHERE relpath LIKE '%' || char(8238) || '%'"
+        ),
+        0
+    );
 
     let both = Store::open(&state, Mode::Both).unwrap();
     both.set_config(config::load(&cfg).unwrap());
