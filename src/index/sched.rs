@@ -1015,13 +1015,7 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
 fn transient(reason: &str) -> bool {
     matches!(
         reason,
-        "EIO"
-            | "ESTALE"
-            | "ENOTCONN"
-            | "ETIMEDOUT"
-            | "EHOSTDOWN"
-            | "ENETDOWN"
-            | "ENETUNREACH"
+        "EIO" | "ESTALE" | "ENOTCONN" | "ETIMEDOUT" | "EHOSTDOWN" | "ENETDOWN" | "ENETUNREACH"
     )
 }
 

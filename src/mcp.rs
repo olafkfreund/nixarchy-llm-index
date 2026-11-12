@@ -303,6 +303,9 @@ impl Core {
 
     /// Details of one hit, read in the search's snapshot and re-checked for visibility.
     fn hit(&self, h: &Hit) -> Result<Option<Value>, Fail> {
+        if crate::sanitize::unsafe_path(&h.abspath) {
+            return Ok(None);
+        }
         let vis = rank::visible_sql(self.store().mode);
         let sql = format!(
             "SELECT f.title, f.type, f.mtime_ns, visible(f.abspath), r.state,
@@ -368,6 +371,9 @@ impl Core {
         self.check()?;
         if !a.path.starts_with('/') {
             return Err(Fail::Arg("path must be absolute".into()));
+        }
+        if crate::sanitize::unsafe_path(&a.path) {
+            return Err(Fail::Arg("not found".into()));
         }
         let (lo, hi) = (a.start.unwrap_or(1), a.end.unwrap_or(u64::MAX));
         let store = self.store();
@@ -519,7 +525,10 @@ impl Core {
                 },
             )?;
             for row in it {
-                rows.push(row?);
+                let row = row?;
+                if !crate::sanitize::unsafe_path(row.1["path"].as_str().unwrap_or_default()) {
+                    rows.push(row);
+                }
             }
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.0));

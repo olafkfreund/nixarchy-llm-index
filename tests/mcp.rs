@@ -906,3 +906,61 @@ fn public_store_refuses_symlinked_db_and_config_errors_table() {
         .unwrap();
     assert!(Store::open(&state, Mode::PublicOnly).is_err());
 }
+
+#[test]
+fn unsafe_paths_are_never_returned_and_unsafe_config_names_no_path() {
+    let fx = Fixture::new("unsafe");
+    let bad = "/home/x/docs/a\u{202e}b.md";
+    let good = "/home/x/docs/ab.md";
+    for p in [bad, good] {
+        fx.add(
+            false,
+            "docs",
+            p,
+            "note",
+            "text",
+            "text",
+            1,
+            2,
+            None,
+            "narwhalquux",
+        );
+    }
+    let mut s = fx.session("public");
+    let hits = paths(&s.ok("search", json!({"query": "narwhalquux", "mode": "words"})));
+    assert_eq!(hits, [good], "positive control and filter");
+    let recent = s.ok("recent", json!({"days": 1}));
+    let listed: Vec<_> = recent["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(listed.contains(&good), "{listed:?}");
+    assert!(listed.iter().all(|p| !p.contains('\u{202e}')), "{listed:?}");
+    assert!(!s.call("get", json!({"path": good})).0);
+    assert_eq!(
+        s.call("get", json!({"path": bad})),
+        (true, "not found".into())
+    );
+    // an unsafe config closes the private server with a message that holds no path
+    let cfg = std::fs::read_to_string(&fx.cfg).unwrap();
+    std::fs::write(
+        &fx.cfg,
+        format!(
+            "{cfg}[[root]]\nname = \"bad\"\npath = \"/home/x/b\u{202e}\"\ntier = \"private\"\n"
+        ),
+    )
+    .unwrap();
+    let mut p = fx.session("private");
+    let (err, text) = p.call("status", json!({}));
+    assert!(err);
+    assert!(
+        text.contains("path contains control or invisible characters"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("/home/x") && !text.contains('\u{202e}'),
+        "{text}"
+    );
+}
