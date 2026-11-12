@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 8
 intent: intent/2026-11-12-8-root-removal.md
 ---
