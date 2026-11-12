@@ -84,6 +84,8 @@ let
         }).config.c;
     in
     map (a: a.message) (lib.filter (a: !a.assertion) (shared.assertions "p" cfg));
+  esc = builtins.fromJSON ''"\u001b"'';
+  del = builtins.fromJSON ''"\u007f"'';
   only = sub: msgs: lib.length msgs == 1 && lib.hasInfix sub (lib.head msgs);
 
   builds = drv: (builtins.tryEval drv.drvPath).success;
@@ -155,6 +157,13 @@ let
       only "names must be nonempty" (fired { roots = roots // { "".path = "/home/alice/e"; }; });
     "non-normal exclusion fires the exclusion normalization assertion" =
       only "absolute and normalized" (fired { exclude.paths = [ "/home/alice/Docs/./tmp" ]; });
+    "control character in a root fires the control-character assertion only" = lib.all (
+      c: only "control characters" (fired { roots = roots // { x.path = "/a${c}b"; }; })
+    ) [ "\n" "\t" esc del ];
+    "control character in an exclusion fires the control-character assertion only" =
+      only "control characters" (fired { exclude.paths = [ "/home/alice/Docs/t\nmp" ]; });
+    "control character in stateDir fires the control-character assertion only" =
+      only "control characters" (fired { stateDir = "/state\n"; });
     "bad interval fires the interval assertion only" = lib.all (
       i: only "interval must match" (fired { roots = roots // { docs = roots.docs // { interval = i; }; }; })
     ) [ "15" "5x" "m" "0m" "1.5h" ];

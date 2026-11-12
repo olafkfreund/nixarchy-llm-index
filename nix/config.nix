@@ -158,6 +158,13 @@ rec {
         message = "${prefix}.roots: root names must be nonempty";
       }
       {
+        # C0 controls and DEL only; the Rust validation also refuses invisible Unicode characters.
+        assertion = lib.all (p: builtins.match ".*[[:cntrl:]].*" p == null) (
+          paths ++ cfg.exclude.paths ++ [ cfg.stateDir ]
+        );
+        message = "${prefix}: roots, exclusions and stateDir must not contain control characters";
+      }
+      {
         assertion = lib.all normal cfg.exclude.paths;
         message = "${prefix}.exclude.paths: every exclusion must be absolute and normalized";
       }
