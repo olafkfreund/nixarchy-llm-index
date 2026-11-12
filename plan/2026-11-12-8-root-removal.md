@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 8
 spec: spec/2026-11-12-8-root-removal.md
 coders:
