@@ -33,12 +33,14 @@ Scan, extract and watch workers run under Landlock before they touch your files:
 
 - read-only access beneath their own root and `/nix/store`, nothing else;
   the `validate` worker can read the filesystem but cannot write;
-- no TCP (on kernels whose Landlock can restrict it);
+- no TCP, where the kernel's Landlock can restrict it (ABI 4 or later);
 - address-space limit of 4 GiB, no core dumps, `oom_score_adj` of 1000.
 
-The coordinator may write only beneath the state directory and `/proc`, and
-cannot open TCP. Neither the coordinator nor the MCP servers listen on a
-socket.
+The coordinator may write only beneath the state directory and `/proc`. Its
+Landlock rules are best effort: on a kernel that cannot restrict TCP, only the
+systemd units' `RestrictAddressFamilies=AF_UNIX` keeps it off the network, so an
+indexer started by hand on such a kernel lacks that layer. The coordinator and
+the MCP servers open no listening socket.
 
 The systemd unit adds `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX`, a
 syscall filter (`@system-service @sandbox`), `MemoryMax`, `MemoryHigh` (75% of
@@ -46,8 +48,9 @@ it), `TasksMax`, low CPU and idle I/O priority. The NixOS unit also sets
 `PrivateNetwork`. The state directory has mode `0700`, the databases `0600`.
 
 Before each start the unit runs `llm-index index --self-test`, which checks
-that a worker cannot write in its root, cannot open TCP, can read its root,
-cannot read outside it, and has the right `oom_score_adj`. If Landlock is
+that a worker cannot write in its root, can read its root, cannot read one file
+outside it (the config file), has the right `oom_score_adj`, and, where the
+kernel can restrict TCP, cannot open TCP (the TCP probe is skipped otherwise). If Landlock is
 missing, the service refuses to start.
 
 ## Which files are read

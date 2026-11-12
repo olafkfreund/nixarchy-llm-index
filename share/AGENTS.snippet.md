@@ -16,8 +16,8 @@ Tools (all read-only):
   time; `limit` defaults to 10, at most 50. Words are whole tokens; use
   `"quotes"` for a phrase.
 - `get(path, start?, end?, sheet?, offset?)`: read an indexed file by page (PDF),
-  row (sheets) or line, up to 20,000 characters per call; when `next` is set,
-  pass its `start`, `sheet` and `offset` back to continue.
+  row (sheets) or line, up to 20,000 characters of file text per call; when
+  `next` is set, pass its `start`, `sheet` and `offset` back to continue.
 - `recent(days, folder?, type?)`: files modified in the last `days` days,
   newest first.
 - `status()`: indexed roots, their state and counts.

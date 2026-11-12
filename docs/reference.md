@@ -62,8 +62,8 @@ the same four tools. Every tool is read-only.
   `"tier": "public"` or `"private"`.
 
 Arguments marked "required" must be present; everything else is optional.
-Unknown or mistyped arguments are rejected by the client library before the
-tool runs.
+An argument of the wrong type is rejected before the tool runs. An unknown
+argument name is ignored, so a typo such as `foler` silently drops that filter.
 
 ### `search`
 
@@ -121,7 +121,8 @@ else).
 | `sheet` | string | all sheets | Sheet name. Spreadsheets only. |
 | `offset` | integer | 0 | Character offset inside the first unit. Pass the `offset` of a previous `next`. |
 
-A call returns at most 20,000 characters. Result:
+A call returns at most 20,000 characters of file text. The `text` field can be
+longer, because escaping and the wrapper are added after the cap. Result:
 
 ```json
 { "path": "/home/me/docs/a.md", "unit": "lines", "truncated": false,
@@ -175,7 +176,7 @@ state word, `mount`, or an errno name such as `EACCES`. No free text.
 
 | Message | Cause |
 | --- | --- |
-| `index configuration is being checked` | The index is not ready: the config is missing or invalid, the database cannot be opened, or validation has not passed. The public server returns this one text for every such problem. Try again later. The private server returns the real reason instead. |
+| `index configuration is being checked` | The index is not ready: the config is missing or invalid, the database cannot be opened, or validation has not passed. The public server returns this one text for every such problem. Try again later. The private server skips the validation check, so a pending validation gives normal results, not this error; it returns the real reason for config-load and database-open failures. Use the private `status` for root states and config errors. |
 | `internal error` | Public server only: an unexpected failure. The private server returns the underlying message. |
 | `not found` | `get`: no such indexed file visible to this tier. |
 | `path must be absolute`, `folder must be an absolute path` | A relative `path` or `folder`. |
@@ -248,12 +249,13 @@ see [installation](installation.md)).
 | --- | --- | --- |
 | `maxFileMb` | 50 | Larger files are skipped. |
 | `maxTextBytes` | 33554432 (32 MiB) | Extracted text above this fails the file. |
-| `maxCells` | 2000000 | Spreadsheets above this many cells, counted across the workbook, fail. |
+| `maxCells` | 2000000 | `.xlsx` workbooks above this many cells, counted across the workbook, fail. Not checked for `.ods` and `.xls`. |
 
-Fixed limits in the extractors: PDFs over 5000 pages are rejected; legacy
-`.xls` files over 20 MiB are rejected; zip-based formats (`.docx`, `.odt`,
+Fixed limits in the extractors, which `maxFileMb` does not lift: PDFs over 5000
+pages are rejected; `.xls` and `.ods` files over 20 MiB are rejected; zip-based formats (`.docx`, `.odt`,
 `.xlsx`, `.ods`) are rejected when they decompress to more than 500 MiB or
 more than 100 times their size, and any XML member over 64 MiB fails.
 
-A parser crash or timeout fails only that file; it is retried once on its
-own.
+A parser failure or timeout fails only that file, with no retry. If an extract
+worker dies (crash or out of memory) while other work ran beside it, the file is
+retried once on its own; otherwise it fails with reason `worker died`.

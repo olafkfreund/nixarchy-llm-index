@@ -166,7 +166,7 @@ Defaults are those of the modules. Home Manager options sit directly under
 | `path` | string | none (required) | Absolute, normalized path with no symlink component. |
 | `tier` | `"public"` \| `"private"` | `"private"` | Only public roots are visible to the public MCP server. |
 | `kind` | `"auto"` \| `"local"` \| `"network"` | `"auto"` | Storage kind. `auto` is detected at run time and counts as network when sizing `TasksMax`. |
-| `interval` | string | `"15m"` | Rescan interval for network and degraded roots. `[0-9]+[smhd]`, nonzero. |
+| `interval` | string | `"15m"` | Rescan interval for network roots, including `auto` roots detected as network. Local roots are watched; while their watcher is degraded they are polled every 120 s, whatever `interval` says. `[0-9]+[smhd]`, nonzero. |
 | `share` | null or string | `null` | Share identity for a root on a network mount, for example `"nas:/export"`. |
 
 ### `exclude`
@@ -182,7 +182,7 @@ Defaults are those of the modules. Home Manager options sit directly under
 | --- | --- | --- | --- |
 | `limits.maxFileMb` | positive integer | `50` | Larger files are skipped. |
 | `limits.maxTextBytes` | positive integer | `33554432` | Extracted text above this fails the file. |
-| `limits.maxCells` | positive integer | `2000000` | Spreadsheet cell budget per workbook. |
+| `limits.maxCells` | positive integer | `2000000` | Cell budget per `.xlsx` workbook. Not checked for `.ods` and `.xls`. |
 | `limits.memoryMaxMb` | positive integer | `1024` | `MemoryMax` of the unit, in MiB. `MemoryHigh` is 75% of it, rounded down. |
 | `limits.workers` | integer | `2` | Worker processes. At least 2. |
 | `limits.backoffMax` | string | `"60m"` | Longest wait before retrying an offline network share. `[0-9]+[smhd]`, nonzero. |
@@ -250,9 +250,10 @@ roots.nas = {
 - inside a folder that holds a sync-client marker: `.stfolder`, `.sync`,
   `.dropbox`, `.nextcloudsync.log` or `.sync_*.db`.
 
-If you sync your home folder (Syncthing, Dropbox, Nextcloud), exclude
-`~/.local/state/llm-index` from the sync or set `stateDir` elsewhere. The state
-directory is never indexed.
+Startup rejects a sync marker in **any** parent folder, whatever the sync client
+excludes. If you sync your home folder (Syncthing, Dropbox, Nextcloud), set
+`stateDir` outside the synced tree; excluding it in the client is not enough.
+The state directory is never indexed.
 
 ## Landlock
 

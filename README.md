@@ -8,7 +8,7 @@ words, by meaning, or both.
 - **Local.** No network listener, no remote embedding service, no GPU. Search
   by meaning uses a small static model that ships in the package.
 - **Sandboxed.** Parsers run in Landlock-confined worker processes that can
-  only read their own root.
+  read only their own root and `/nix/store`.
 - **Two tiers.** Folders are `public` or `private` (default). The public MCP
   server opens a separate database and never sees private files.
 - **Read-only.** The agent gets four tools: `search`, `get`, `recent`, `status`.

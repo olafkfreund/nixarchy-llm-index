@@ -31,8 +31,9 @@ Messages below are quoted from the program.
 
 **`state dir … is inside a synced folder (… has ".stfolder")`**
 : A parent folder holds a sync-client marker (`.stfolder`, `.sync`, `.dropbox`,
-  `.nextcloudsync.log` or `.sync_*.db`). Set `stateDir` outside the synced tree
-  or stop syncing it.
+  `.nextcloudsync.log` or `.sync_*.db`). Set `stateDir` outside the synced tree.
+  Excluding it in the sync client does not help: the marker in any parent
+  is enough to refuse.
 
 **`config.toml is on a network or FUSE filesystem: refusing to start`**
 : The config file itself sits on a share. Keep it on a local disk.
@@ -82,7 +83,9 @@ Run `llm-index status` and read the state and reason.
 | `config_error`, `landlock unavailable` | See "Landlock" above. | |
 | `offline`, an OS error or a stall reason | The path is missing or the share stopped answering. | Mount the share; check the path. Retried after 60 s, then at doubling intervals up to `limits.backoffMax`. |
 | `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted). | Mount the right share, or fix `share`. |
-| `degraded`, `watch degraded` (also `watcher exited`, `watch setup stalled`) | The watcher failed, for example the inotify limit or event queue was exceeded. The root is polled every two minutes instead. | Raise `fs.inotify.max_user_watches` or `max_queued_events`. |
+| `degraded`, `ENOSPC` | The inotify watch limit is reached. The root is polled every two minutes instead. | Raise `fs.inotify.max_user_watches`. |
+| `degraded`, `IN_Q_OVERFLOW` | The inotify event queue overflowed. Polled every two minutes. | Raise `fs.inotify.max_queued_events`. |
+| `degraded`, `watcher exited`, `watch setup stalled`, `watch degraded` or another OS error text | The watcher failed or stalled. Polled every two minutes. | Read the log. |
 
 A `config_error` root hides its files from search until fixed. `offline` and
 `degraded` roots keep their files searchable, marked `stale: true`.
@@ -92,9 +95,10 @@ A `config_error` root hides its files from search until fixed. `offline` and
 Public server only. It is its one answer for any config or validation problem:
 the config is missing or invalid, a root is in `config_error`, or a root or
 exclusion path has not yet been validated.
-If it persists, run `llm-index status` as the owner: the private view shows the
-real reason, including `config error:` lines. The private MCP server returns the
-real message directly.
+If it persists, run `llm-index status` as the owner: the private view shows root states and
+reasons, including `config error:` lines. The private MCP server has no
+validation gate, so a pending validation gives normal results there; it returns
+the real message only for config-load and database-open failures.
 
 ## A file is not found
 
