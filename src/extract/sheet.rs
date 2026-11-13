@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Cursor;
 
 use calamine::{Data, DataRef, Ods, Range, Reader, Xls, Xlsx};
@@ -35,6 +36,7 @@ pub fn extract(
     let mut budget = TextBudget::new(limits.max_text_bytes);
     let mut segments = Vec::new();
     let mut global_line: u32 = 0;
+    let mut used_names = HashSet::new();
 
     match file_type {
         FileType::Xlsx => {
@@ -45,6 +47,7 @@ pub fn extract(
             let mut total_workbook_cells: u64 = 0;
 
             for sheet_name in wb.sheet_names() {
+                let stored_name = unique_sheet_name(&sheet_name, &mut used_names);
                 let sheet_cells = precheck_xlsx_sheet(
                     &mut wb,
                     &sheet_name,
@@ -59,7 +62,7 @@ pub fn extract(
                     ExtractError::Parse(format!("xlsx sheet '{sheet_name}' error: {e}"))
                 })?;
                 append_range_segments(
-                    &sheet_name,
+                    &stored_name,
                     &range,
                     &mut budget,
                     &mut global_line,
@@ -77,12 +80,13 @@ pub fn extract(
                 .map_err(|e| ExtractError::Parse(format!("ods error: {e}")))?;
             let mut total_cells: u64 = 0;
             for sheet_name in wb.sheet_names() {
+                let stored_name = unique_sheet_name(&sheet_name, &mut used_names);
                 let range = wb.worksheet_range(&sheet_name).map_err(|e| {
                     ExtractError::Parse(format!("ods sheet '{sheet_name}' error: {e}"))
                 })?;
                 add_range_cells(&mut total_cells, &range, limits.max_cells)?;
                 append_range_segments(
-                    &sheet_name,
+                    &stored_name,
                     &range,
                     &mut budget,
                     &mut global_line,
@@ -101,12 +105,13 @@ pub fn extract(
                 .map_err(|e| ExtractError::Parse(format!("xls error: {e}")))?;
             let mut total_cells: u64 = 0;
             for sheet_name in wb.sheet_names() {
+                let stored_name = unique_sheet_name(&sheet_name, &mut used_names);
                 let range = wb.worksheet_range(&sheet_name).map_err(|e| {
                     ExtractError::Parse(format!("xls sheet '{sheet_name}' error: {e}"))
                 })?;
                 add_range_cells(&mut total_cells, &range, limits.max_cells)?;
                 append_range_segments(
-                    &sheet_name,
+                    &stored_name,
                     &range,
                     &mut budget,
                     &mut global_line,
@@ -122,6 +127,18 @@ pub fn extract(
         file_type,
         segments,
     })
+}
+
+/// Sheet names are an identity (`get` pages by them): sanitized, cut, and kept unique.
+fn unique_sheet_name(name: &str, used: &mut HashSet<String>) -> String {
+    let base: String = crate::sanitize::sanitize(name).chars().take(1000).collect();
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{base}#{suffix}");
+        suffix += 1;
+    }
+    candidate
 }
 
 /// Adds the full rectangle of `range` to the workbook total; `TooLarge` once it passes `max`.
@@ -360,6 +377,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn long_sheet_names_stay_distinct() {
+        let prefix = "é".repeat(1000);
+        let first = prefix.clone() + &"a".repeat(200);
+        let second = prefix.clone() + &"b".repeat(200);
+        let bytes = ods_named(&[(first, 1, 1), (second, 1, 1)]);
+        let extracted = run(FileType::Ods, &bytes, 2).unwrap();
+        let names: Vec<&str> = extracted
+            .segments
+            .iter()
+            .map(|s| match &s.kind {
+                SegmentKind::Sheet { name, .. } => name.as_str(),
+                _ => panic!("expected sheet"),
+            })
+            .collect();
+        assert_eq!(names, [prefix.as_str(), format!("{prefix}#2").as_str()]);
+    }
+
+    #[test]
+    fn sheet_names_are_sanitized_before_dedup() {
+        let mut used = HashSet::new();
+        assert_eq!(unique_sheet_name("A\u{200B}B", &mut used), "AB");
+        assert_eq!(unique_sheet_name("AB", &mut used), "AB#2");
+    }
+
     fn limits(max_cells: u64) -> Limits {
         Limits {
             max_cells,
@@ -385,12 +427,21 @@ mod tests {
     }
 
     fn ods(sheets: &[(u32, u32)]) -> Vec<u8> {
+        let named: Vec<_> = sheets
+            .iter()
+            .enumerate()
+            .map(|(n, &(rows, cols))| (format!("S{n}"), rows, cols))
+            .collect();
+        ods_named(&named)
+    }
+
+    fn ods_named(sheets: &[(String, u32, u32)]) -> Vec<u8> {
         let mut tables = String::new();
-        for (n, &(rows, cols)) in sheets.iter().enumerate() {
-            tables += &format!(r#"<table:table table:name="S{n}">"#);
-            for _ in 0..rows {
+        for (name, rows, cols) in sheets {
+            tables += &format!(r#"<table:table table:name="{name}">"#);
+            for _ in 0..*rows {
                 tables += "<table:table-row>";
-                for _ in 0..cols {
+                for _ in 0..*cols {
                     tables += r#"<table:table-cell office:value-type="string"><text:p>x</text:p></table:table-cell>"#;
                 }
                 tables += "</table:table-row>";

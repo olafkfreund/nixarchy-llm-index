@@ -7,6 +7,17 @@ pub fn is_stripped(c: char) -> bool {
         c,
         '\u{061C}'
             | '\u{180E}'
+            | '\u{0000}'..='\u{0008}'
+            | '\u{000B}'..='\u{001F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{206A}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
@@ -56,18 +67,37 @@ pub fn sanitize(s: &str) -> String {
     s.chars().filter(|&c| !is_stripped(c)).collect()
 }
 
-/// Sanitizes each chunk's `text` and `heading_or_symbol`, drops chunks whose `text` is empty
-/// after sanitizing, and renumbers `ord` contiguously from `0`.
+/// Makes an untrusted title or heading a single bounded display line.
+pub fn label(s: &str, max: usize) -> String {
+    let spaced: String = s
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' | '\u{0085}' | '\u{2028}' | '\u{2029}' => ' ',
+            other => other,
+        })
+        .collect();
+    sanitize(&spaced)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect()
+}
+
+/// Sanitizes chunk text and non-sheet labels, drops empty text, and renumbers `ord`.
+/// Sheet names are sanitized once in `extract::sheet`, where they are made unique.
 pub fn sanitize_chunks(chunks: &mut Vec<Chunk>) {
     for c in chunks.iter_mut() {
         c.text = sanitize(&c.text);
-        if let Some(sym) = &c.heading_or_symbol {
-            let cleaned = sanitize(sym);
-            c.heading_or_symbol = if cleaned.trim().is_empty() {
-                None
-            } else {
-                Some(cleaned)
-            };
+        if c.kind != "sheet" {
+            c.heading_or_symbol = c.heading_or_symbol.as_deref().and_then(|sym| {
+                let cleaned = label(sym, 200);
+                (!cleaned.is_empty()).then_some(cleaned)
+            });
         }
     }
     chunks.retain(|c| !c.text.trim().is_empty());
@@ -128,6 +158,31 @@ mod tests {
     }
 
     #[test]
+    fn strips_controls_and_invisible_code_points_but_keeps_lines_and_tabs() {
+        let removed = [
+            '\x1b', '\x00', '\x08', '\x0b', '\x1f', '\x7f', '\u{80}', '\u{85}', '\u{9f}', '\u{ad}',
+            '\u{34f}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}', '\u{2028}', '\u{2029}',
+            '\u{206a}', '\u{206f}', '\u{fff9}', '\u{fffa}', '\u{fffb}',
+        ];
+        for c in removed {
+            assert_eq!(sanitize(&format!("a{c}b")), "ab", "{c:?}");
+        }
+        assert_eq!(sanitize("a\r\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn labels_are_single_line_and_bounded() {
+        let long = format!(
+            "  a\r\n\tb\u{85}c\u{2028}d\u{2029}e\x1bf{}",
+            "x".repeat(10_000)
+        );
+        let cleaned = label(&long, 200);
+        assert!(cleaned.starts_with("a b c d ef"));
+        assert_eq!(cleaned.chars().count(), 200);
+        assert!(!cleaned.chars().any(char::is_control));
+    }
+
+    #[test]
     fn sanitize_chunks_drops_empty_after_sanitizing_and_renumbers() {
         let mut chunks = vec![
             Chunk {
@@ -156,5 +211,34 @@ mod tests {
         assert_eq!(chunks[0].ord, 0);
         assert_eq!(chunks[0].heading_or_symbol.as_deref(), Some("Heading"));
         assert_eq!(chunks[0].text, "Kept text");
+    }
+
+    #[test]
+    fn generated_symbols_are_bounded_and_sheet_names_keep_identity() {
+        let mut chunks = vec![
+            Chunk {
+                ord: 0,
+                kind: "code".into(),
+                start: 1,
+                end: 1,
+                decl_start: None,
+                decl_end: None,
+                heading_or_symbol: Some("x".repeat(100_000)),
+                text: "body".into(),
+            },
+            Chunk {
+                ord: 1,
+                kind: "sheet".into(),
+                start: 1,
+                end: 1,
+                decl_start: None,
+                decl_end: None,
+                heading_or_symbol: Some("A\u{2028}B".into()),
+                text: "cell".into(),
+            },
+        ];
+        sanitize_chunks(&mut chunks);
+        assert_eq!(chunks[0].heading_or_symbol.as_deref().unwrap().len(), 200);
+        assert_eq!(chunks[1].heading_or_symbol.as_deref(), Some("A\u{2028}B"));
     }
 }
