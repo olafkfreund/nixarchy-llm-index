@@ -16,11 +16,19 @@ change; the plan gives the order and the tests.
 **1. Identity adoption and recovery** (`src/index/sched.rs` `scan_done`,
 `try_root`, `identity_allows`; `src/index/shares.rs` `verdict`).
 
-- Adopt on any scan whose mount identity did not change during the scan:
-  `before.is_some() && before == after`, whether or not the scan was
-  complete. Completeness still decides whether missing rows are deleted.
-  Adoption only needs a stable mount, so the `complete` condition was the
-  bug.
+- Adopt on any scan whose mount identity did not change during the scan
+  and whose root fd lives on that mount: `before.is_some() && before ==
+  after`, whether or not the scan was complete. Today the fd check
+  (`mount_id == fd_id`, `src/worker/scan.rs` around line 551) is folded only
+  into `complete`. It moves to the identities themselves: `scan.rs` sends
+  `identity_before`/`identity_after` as `None` when the mount id does not
+  match the root fd's, and `scan_done` discards a scan with no identity
+  (today it falls through to `queue_extracts`). Completeness still decides
+  whether missing rows are deleted.
+- `try_root` picks `Extract` only when the identity allows extraction, so
+  a root whose verdict is `Probe` (autofs) falls through to `Scan` instead
+  of choosing `Extract`, being refused, and never scanning. Watchers start
+  only for `Ok` or `Adopt`.
 - Recovery for a root already stuck (`expected` NULL, no `share`, indexed
   files > 0) stays manual, and this deviates from the intent's "recovers
   on its own": without a recorded identity nothing on disk tells a real
@@ -58,15 +66,19 @@ slicing remains in that function.
 `src/worker/scan.rs` `walk_subtree`). When opening the subtree root itself
 fails with `ENOENT`, `ENOTDIR` or `EACCES` (the first and last are what
 `scan.rs` `recoverable` already accepts; `ENOTDIR` covers a directory
-replaced by a file), `add_watches` skips that path and the watcher carries
-on. Other errors still degrade, as today.
+replaced by a file; `ELOOP` and `EXDEV` cover a directory swapped for a
+symlink or a mount, which `descend` already skips), `add_watches` skips
+that path and the watcher carries on. The same errors from
+`inotify.watches().add` on that path are skipped too. Other errors still
+degrade, as today.
 
 **6. Durations** (`src/index/mod.rs` `parse_duration`, `src/config.rs`
 `validate`). Split the unit with `strip_suffix`/`char_indices` so a
 multi-byte last character is an error, use `checked_mul`, and reject 0.
 Move `parse_duration` to `config.rs` (the indexer calls it from there) and
-call it from `Config::validate` for `interval` and `backoff_max` of every
-root, so `check-config`, the self-test and `mcp` reject what the indexer
+call it from `Config::validate` for every root's `interval` and for
+`limits.backoff_max`; the error message escapes the value as other config
+errors do, so `check-config`, the self-test and `mcp` reject what the indexer
 would reject.
 
 **7. "changed" keeps the good row** (`sched.rs` `Message::Failed`). A
@@ -77,10 +89,14 @@ with fresh metadata. On a watched root the watcher usually queues it first.
 This works for network roots, which have no watcher, and never retries a
 request whose metadata is known to be stale.
 
-**8. Solo retry** (`sched.rs` `send_next`, dispatch). Factor the
-`held` expression in dispatch into `fn solo_held(&self, i, now) -> bool`.
-`send_next` stops for solo only when the solo front is not held, i.e. it is
-really waiting for the pool to drain.
+**8. Solo retry** (`sched.rs` `send_next`, dispatch). New
+`fn solo_held(&self, i, now) -> bool`: the root's `hold`, `root_blocked`,
+its identity refusing extraction, or the share's backoff (`now <
+not_before`). It does not use `shares.free`, which is also false while a
+healthy worker is live on the share, so a worker would never drain for the
+retry. `send_next` stops for solo only when the solo front is not held,
+i.e. the retry is really waiting for the pool. Dispatch keeps its own
+`shares.free` check before starting the solo worker.
 
 **9. Smaller gaps.**
 
@@ -88,34 +104,44 @@ really waiting for the pool to drain.
   needs a positive integer). Scan and extract then agree.
 - mtime: `scan.rs` and `watch.rs` use the same saturating conversion as
   `worker/extract.rs` (one shared helper in `src/worker/mod.rs`).
-- Model revision: at store open (`store.rs` `open_with`), if
-  `meta.model_rev` is set and differs from `embed::MODEL_REV`, set every
-  `chunks.vec` to NULL and every `files.mtime_ns` to -1 in both databases,
-  then write the new revision. `known()` no longer matches, so every file is
+- Model revision: at store open (`store.rs` `open_with`), per database
+  and in one transaction each: if `meta.model_rev` is set and differs from
+  `embed::MODEL_REV`, set every `chunks.vec` to NULL and `files.size` to
+  -1 where `state = 'ok'`, then write the new revision. `size` is never
+  returned by the MCP tools, so `recent` and the date filters keep working
+  during the re-index; `mtime_ns` is untouched. `known()` no longer
+  matches, so every file is
   re-extracted and re-embedded by the normal scan. A model change is rare;
   a full re-index is the simple correct answer.
 
 ### Hardening
 
 **10. Worker sandbox** (`src/worker/sandbox.rs` `restrict`). Raise the ABI
-to `ABI::V9` (landlock 0.4.7 supports it) and add
-`.scope(Scope::from_all(abi))`. With V9, `AccessFs::from_all` includes
+to `ABI::V9` (landlock 0.4.7 has `ABI::V9`, `AccessFs::ResolveUnix` and
+`Scope`; checked in the crate source) and add
+`.scope(Scope::from_all(abi))?`. With V9, `AccessFs::from_all` includes
 `ResolveUnix`, which is not in `from_read`, so connecting to any pathname
 UNIX socket is denied; the scopes deny abstract sockets and signals to
 processes outside the worker's domain. Compatibility stays `BestEffort` for
 these newer rights: on an older kernel the worker keeps today's protection.
 Minimum ABI is unchanged; the socket rule is enforced from ABI 9 and the
-scopes from ABI 6, and the worker logs which ones the kernel enforced.
+scopes from ABI 6. The self-test (`src/worker/mod.rs`) probes all three
+(pathname socket outside the root, abstract socket, `kill(ppid, 0)`) and
+prints whether each is denied, so a weaker kernel is visible rather than
+silent. p620's kernel reports Landlock ABI 11.
 The existing hard checks (filesystem enforced, TCP bind/connect) are
 unchanged. The coordinator and `mcp` are not changed.
 
 **11. Labels** (`src/worker/extract.rs`, `src/extract/sheet.rs`, new
 `sanitize::label`).
 
-- Before chunking, every title, heading and symbol passes through
-  `sanitize::label(s, 200)`: `sanitize`, then every control character
-  (including `\n`, `\r`, `\t`) becomes a space, runs of spaces collapse, and
-  the result is cut to 200 characters. Applied before `chunk::chunk`, so a
+- Before chunking, every title (including the file-name fallback), heading
+  and symbol passes through `sanitize::label(s, 200)`: first `\n`, `\r`,
+  `\t`, U+0085, U+2028 and U+2029 become spaces, then `sanitize`, then any
+  remaining control character becomes a space, runs of spaces collapse,
+  outer spaces are trimmed, and the result is cut to 200 characters. An
+  empty label becomes `None` where the field is optional. Applied before
+  `chunk::chunk`, so a
   huge heading is never copied into every chunk.
 - Sheet names are an identity (item 3 uses them as the paging position), so
   they are not normalised. `sheet.rs` cuts a name longer than 1000
@@ -142,13 +168,13 @@ embed_cache` on the writer at open; the next compaction (#8) returns the
 space. This deletes the stale vectors and stops the duplicate storage.
 
 **14. Denylist** (`src/deny.rs` `BUILTIN`). Add `nix.conf`,
-`.config/nix/nix.conf`, `keys.txt` under `.config/age/` (as
-`.config/age/*`), `.config/sops/age/*`, `rclone.conf`,
-`.config/containers/auth.json`, `credentials.tfrc.json`,
-`.config/gh/hosts.yml`, `.config/glab-cli/config.yml`,
-`.config/github-copilot/*`, `secrets.yaml`, `secrets.yml`,
-`secrets.json`, `credentials.json`, `service-account*.json`. Matching rules
-are the existing ones. `docs/reference.md` lists them.
+`.config/age/`, `rclone.conf`, `.config/containers/auth.json`,
+`credentials.tfrc.json`, `.config/glab-cli/`, `.config/github-copilot/`,
+`secrets.yaml`, `secrets.yml`, `secrets.json`, `credentials.json` and
+`service-account*.json`, following the existing convention (a directory
+pattern ends in `/`). `.config/gh/` and `.config/sops/` are already there.
+Matching rules are the existing ones. `docs/security.md`, which lists the
+built-in patterns, is updated.
 
 ### Scale and robustness
 
@@ -159,29 +185,42 @@ is re-indexed, and never leaves a copy in both. Peak memory is the id list
 (8 bytes a file) plus one batch of rows.
 
 **16. Existence, not count** (`store.rs` `indexed_files`). Query
-`SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND state = 'ok')`
-per database and return 0 or 1. The verdict only tests zero.
+`SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND state = 'ok')`,
+stopping at the first database that has one, and return 0 or 1. A database
+error still answers non-zero (conservative), as today. The verdict only
+tests zero.
 
 **17. Store errors** (`Sink::extracted`, `Sink::failed`, `sched.rs`). Both
 return `Result<(), String>`. Every failure path already goes through
 `fail()` (extract failure, worker death, timeout); `fail()` now calls
 `sink.failed` first and records `r.failed` only when that write succeeded.
 On any store error the scheduler requeues the file, sets the root's `hold`
-(item 2 makes the worker stop) and logs once per hold. The writer
-connection sets `busy_timeout = 5000`.
+(item 2 makes the worker stop) and logs once per hold; `DbSink` stops
+logging these itself. `extract_died` gets `now` so it can set the hold.
+The writer connection sets `busy_timeout = 5000` first, before the WAL
+pragma and the `DROP TABLE` of item 13. Every requeue site (`reload`,
+`RootError`, `abandon`, transient failure, store error) goes through one
+helper that does not overwrite a newer entry a watch event already queued.
 
 **18. Quadratic paths.**
 
 - `queue_one`: `queued` becomes `HashMap<String, (u64, i64)>`, holding the
-  latest size and mtime. A duplicate updates the map entry; `next_allowed`
-  takes size and mtime from the map when it pops. No linear search.
-- `get`: the chunk query skips chunks that end before `start` (lines
-  mode) and the units are produced lazily from the row iterator; building
-  stops as soon as the output budget is used and `next` is known. Overlap
+  latest size and mtime, and `queue` holds only the relpath. A duplicate
+  updates the map entry; `next_allowed` takes size and mtime from the map
+  when it pops. No linear search. The requeue helper above uses
+  `entry().or_insert`, so `queue` and `queued` stay one-to-one.
+- `get`: the unit kind is read first (`SELECT kind … ORDER BY ord LIMIT
+  1`). In lines and pages mode the chunk query skips chunks that end before
+  `start` (bound as `i64`; a `start` above `i64::MAX` is an argument
+  error). Units are produced lazily from the row iterator and building
+  stops as soon as the output budget is used and `next` is known. Rows
+  mode keeps sheet order (item 3) and streams the same way. Overlap
   de-duplication (`last_line`) and the intra-unit `offset` keep working.
   Each page then costs about one page of work.
-- Coordinator pipe (`src/index/mod.rs` reader): remember how far the buffer
-  has been searched for a newline and search only the new bytes.
+- Coordinator pipe (`src/index/mod.rs` `Proc::parse`): remember how far
+  the buffer has been searched for a newline and search only the new bytes.
+  The cursor resets whenever the buffer is cleared (including the
+  `MAX_LINE` overflow path), and consumed lines are drained once per read.
 
 **19. Docs.** `docs/reference.md` "A file is skipped when" lists the
 skipped directory names, the `result*` prefix, lockfiles and `CACHEDIR.TAG`.
@@ -254,6 +293,12 @@ skipped directory names, the `result*` prefix, lockfiles and `CACHEDIR.TAG`.
     workbook page correctly; paging a large text file does work
     proportional to the page.
   - sheet: two names equal after the 1000-character cut get unique names.
+  - mcp: `get` on a large text file pages through it with each call's
+    work bounded; `start` above `i64::MAX` is an argument error.
+  - index: `Proc::parse` with a line split across many reads, and with an
+    over-long line followed by a good one.
+  - sched: an autofs root (`Probe`) with queued files still scans; a scan
+    whose root fd is not on the reported mount adopts nothing.
   - sandbox: under the worker rules, connecting to a pathname socket
     outside the root, connecting to an abstract socket and `kill(ppid, 0)`
     are denied when the kernel's ABI supports them (the test reports and
