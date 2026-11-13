@@ -861,6 +861,111 @@ fn get_on_sheets_returns_exactly_the_requested_rows() {
 }
 
 #[test]
+fn get_pages_across_sheets_and_uses_escaped_sheet_cursors() {
+    let fx = Fixture::new("sheet-cursors");
+    let path = "/home/x/docs/three.xlsx";
+    let mut expected = String::new();
+    for sheet in ["<x", "&lt;x", "Z"] {
+        let rows: String = (1..=250)
+            .map(|i| format!("{sheet}-{i:03}-{}\n", "a".repeat(80)))
+            .collect();
+        expected.push_str(&rows);
+        fx.add(
+            false,
+            "docs",
+            path,
+            "three",
+            "xlsx",
+            "sheet",
+            1,
+            250,
+            Some(sheet),
+            rows.trim_end(),
+        );
+    }
+    let mut s = fx.session("public");
+    let (all, nexts) = drain(&mut s, json!({"path": path}));
+    assert_eq!(all, expected);
+    assert!(nexts.iter().any(|n| n["sheet"] == "&lt;x"));
+    assert!(nexts.iter().any(|n| n["sheet"] == "&amp;lt;x"));
+    let bounded = s.ok(
+        "get",
+        json!({"path": path, "sheet": "&lt;x", "start": 249, "end": 250}),
+    );
+    assert_eq!(
+        body(bounded["text"].as_str().unwrap()),
+        expected
+            .lines()
+            .skip(248)
+            .take(2)
+            .map(|s| format!("{s}\n"))
+            .collect::<String>()
+    );
+    assert!(bounded["next"].is_null());
+}
+
+#[test]
+fn get_merges_split_pdf_pages_and_rejects_oversized_start() {
+    let fx = Fixture::new("split-page");
+    let path = "/home/x/docs/split.pdf";
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 1, 1, None, "first",
+    );
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 1, 1, None, "second",
+    );
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 2, 2, None, "third",
+    );
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path, "start": 1, "end": 1}));
+    assert_eq!(body(g["text"].as_str().unwrap()), "first\n\nsecond\n");
+    assert!(
+        s.call("get", json!({"path": path, "start": i64::MAX as u64 + 1}))
+            .0
+    );
+}
+
+#[test]
+fn search_and_recent_bound_stored_titles() {
+    let fx = Fixture::new("long-title");
+    let title = format!("needle {}", "z".repeat(10_000));
+    fx.add(
+        false,
+        "docs",
+        "/home/x/docs/title.md",
+        &title,
+        "markdown",
+        "section",
+        1,
+        1,
+        None,
+        "needle body",
+    );
+    let mut s = fx.session("public");
+    let hit = s.ok("search", json!({"query": "needle", "mode": "words"}));
+    let title = hit["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == "/home/x/docs/title.md")
+        .unwrap()["title"]
+        .as_str()
+        .unwrap();
+    assert_eq!(title.chars().count(), 200);
+    let recent = s.ok("recent", json!({"days": 1}));
+    let title = recent["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == "/home/x/docs/title.md")
+        .unwrap()["title"]
+        .as_str()
+        .unwrap();
+    assert_eq!(title.chars().count(), 200);
+}
+
+#[test]
 #[ignore = "needs the embedding model: set LLM_INDEX_MODEL_DIR at build time (the nix build does)"]
 fn meaning_and_hybrid_search() {
     assert_ne!(
