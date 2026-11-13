@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use super::{ExtractedFile, ScanResult, Sink};
 use crate::auth::{self, RootStates, Validated, path_hash};
@@ -58,7 +58,14 @@ pub struct DbSink {
     config: Config,
     #[cfg(test)]
     abort_after_first_commit: bool,
+    #[cfg(test)]
+    embed_calls: std::cell::Cell<usize>,
+    #[cfg(test)]
+    move_batches: std::cell::RefCell<Vec<usize>>,
 }
+
+/// Files moved between tiers per transaction pair.
+const MOVE_BATCH: usize = 256;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -225,12 +232,29 @@ impl DbSink {
             config: config::load(config_path)?,
             #[cfg(test)]
             abort_after_first_commit: false,
+            #[cfg(test)]
+            embed_calls: Default::default(),
+            #[cfg(test)]
+            move_batches: Default::default(),
         };
         for t in TIERS {
-            s.conn(t).execute(
+            let tx = s.conn(t).unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO meta SELECT ?1, 1 WHERE NOT EXISTS (SELECT 1 FROM meta)",
                 [embed::MODEL_REV],
             )?;
+            // A new model makes every stored vector wrong: drop them and re-extract files.
+            let stale: bool = tx.query_row(
+                "SELECT coalesce(model_rev <> ?1, 0) FROM meta",
+                [embed::MODEL_REV],
+                |r| r.get(0),
+            )?;
+            if stale {
+                tx.execute("UPDATE chunks SET vec = NULL", [])?;
+                tx.execute("UPDATE files SET size = -1 WHERE state = 'ok'", [])?;
+                tx.execute("UPDATE meta SET model_rev = ?1", [embed::MODEL_REV])?;
+            }
+            tx.commit()?;
         }
         s.sync_roots()?;
         s.purge()?;
@@ -456,47 +480,35 @@ impl DbSink {
     /// One transaction per database; the source delete commits before the destination insert,
     /// so a crash in between loses a row (re-indexed later) and never leaves a copy behind.
     fn move_tier(&self, from: Tier, to: Tier, ids: &[i64]) -> Res<()> {
-        let rows = ids
-            .iter()
-            .map(|id| read_file(self.conn(from), *id))
-            .collect::<Res<Vec<_>>>()?;
-        let tx = self.conn(from).unchecked_transaction()?;
-        delete_files(&tx, ids)?;
-        tx.commit()?;
-        #[cfg(test)]
-        if self.abort_after_first_commit {
-            return Err("simulated crash after the first commit".into());
+        for batch in ids.chunks(MOVE_BATCH) {
+            #[cfg(test)]
+            self.move_batches.borrow_mut().push(batch.len());
+            let rows = batch
+                .iter()
+                .map(|id| read_file(self.conn(from), *id))
+                .collect::<Res<Vec<_>>>()?;
+            let tx = self.conn(from).unchecked_transaction()?;
+            delete_files(&tx, batch)?;
+            tx.commit()?;
+            #[cfg(test)]
+            if self.abort_after_first_commit {
+                return Err("simulated crash after the first commit".into());
+            }
+            let tx = self.conn(to).unchecked_transaction()?;
+            for (f, chunks) in &rows {
+                delete_files(&tx, &existing(&tx, &f.root_id, &f.relpath)?)?;
+                insert_file(&tx, f, chunks)?;
+            }
+            tx.commit()?;
         }
-        let tx = self.conn(to).unchecked_transaction()?;
-        for (f, chunks) in &rows {
-            delete_files(&tx, &existing(&tx, &f.root_id, &f.relpath)?)?;
-            insert_file(&tx, f, chunks)?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
-    fn vector(&self, c: &Connection, input: &str) -> Option<Vec<u8>> {
-        let key = embed::cache_key(input);
-        let hit = c
-            .query_row(
-                "SELECT vector FROM embed_cache WHERE input_blake3 = ?1",
-                [key.as_bytes().as_slice()],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if hit.is_some() {
-            return hit;
-        }
+    fn vector(&self, input: &str) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        self.embed_calls.set(self.embed_calls.get() + 1);
         let v = self.embedder.as_ref()?.embed(input).ok()??;
-        let bytes: Vec<u8> = v.iter().map(|x| *x as u8).collect();
-        let _ = c.execute(
-            "INSERT OR IGNORE INTO embed_cache VALUES(?1, ?2)",
-            params![key.as_bytes().as_slice(), bytes],
-        );
-        Some(bytes)
+        Some(v.iter().map(|x| *x as u8).collect())
     }
 
     fn store_file(
@@ -528,13 +540,33 @@ impl DbSink {
         };
         let c = self.conn(t);
         let tx = c.unchecked_transaction()?;
-        delete_files(&tx, &existing(&tx, root, rel)?)?;
+        let old = existing(&tx, root, rel)?;
+        // vectors of unchanged chunks survive an edit; only new text is embedded
+        let mut kept: std::collections::HashMap<(Option<String>, String), Vec<u8>> =
+            Default::default();
+        for id in &old {
+            let mut stmt = tx.prepare(
+                "SELECT heading_or_symbol, text, vec FROM chunks WHERE file_id = ?1 AND vec IS NOT NULL",
+            )?;
+            for r in stmt.query_map([id], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))? {
+                let (k, v) = r?;
+                kept.insert(k, v);
+            }
+        }
+        delete_files(&tx, &old)?;
         let rows: Vec<ChunkRow> = chunks
             .into_iter()
             .map(|ch| {
-                let input = embed::input(rel, ch.heading_or_symbol.as_deref(), &ch.text);
+                let key = (ch.heading_or_symbol.clone(), ch.text.clone());
+                let vec = kept.get(&key).cloned().or_else(|| {
+                    self.vector(&embed::input(
+                        rel,
+                        ch.heading_or_symbol.as_deref(),
+                        &ch.text,
+                    ))
+                });
                 ChunkRow {
-                    vec: self.vector(&tx, &input),
+                    vec,
                     ord: ch.ord as i64,
                     kind: ch.kind,
                     start: ch.start as i64,
@@ -618,19 +650,17 @@ impl DbSink {
 
 impl Sink for DbSink {
     fn indexed_files(&self, root: &str) -> usize {
-        // on a database error answer "many": adoption and mismatch then stay conservative
-        TIERS
-            .iter()
-            .map(|t| {
-                self.conn(*t)
-                    .query_row(
-                        "SELECT count(*) FROM files WHERE root_id = ?1 AND state = 'ok'",
-                        [root],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_or(usize::MAX / 4, |n| n as usize)
-            })
-            .sum()
+        // 0 or 1 is enough for the verdict; a database error answers 1 so adoption stays conservative
+        let any = |t: &Tier| {
+            self.conn(*t)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND state = 'ok')",
+                    [root],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(true)
+        };
+        usize::from(TIERS.iter().any(any))
     }
 
     fn expected_identity(&self, root: &str) -> Option<Share> {
@@ -676,7 +706,7 @@ impl Sink for DbSink {
         log(r);
     }
 
-    fn extracted(&mut self, root: &str, f: ExtractedFile) {
+    fn extracted(&mut self, root: &str, f: ExtractedFile) -> Result<(), String> {
         let rel = f.relpath.clone();
         let r = self.store_file(root, &rel, |abs| {
             let title = if f.title.is_empty() {
@@ -700,10 +730,17 @@ impl Sink for DbSink {
             };
             Some((row, f.chunks.clone()))
         });
-        log(r);
+        r.map_err(|e| e.to_string())
     }
 
-    fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str) {
+    fn failed(
+        &mut self,
+        root: &str,
+        relpath: &str,
+        size: u64,
+        mtime_ns: i64,
+        reason: &str,
+    ) -> Result<(), String> {
         let r = self.store_file(root, relpath, |abs| {
             let row = FileRow {
                 root_id: root.into(),
@@ -719,7 +756,7 @@ impl Sink for DbSink {
             };
             Some((row, Vec::new()))
         });
-        log(r);
+        r.map_err(|e| e.to_string())
     }
 
     fn root_state(&mut self, root: &str, state: &str, reason: &str) {
@@ -860,7 +897,8 @@ mod tests {
         f.sink.reload(&f.cfg).unwrap();
         for i in 0..300 {
             f.sink
-                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)))
+                .unwrap();
         }
         let before = pages(&f).0;
         cfg_with(&f, &[("keep", "/data/keep")]);
@@ -883,11 +921,13 @@ mod tests {
         f.sink.reload(&f.cfg).unwrap();
         for i in 0..100 {
             f.sink
-                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)))
+                .unwrap();
         }
         for i in 0..5 {
             f.sink
-                .extracted("pub2", extracted(&format!("s{i}.txt"), "tiny"));
+                .extracted("pub2", extracted(&format!("s{i}.txt"), "tiny"))
+                .unwrap();
         }
         cfg_with(&f, &[("pub", "/data/pub")]);
         f.sink.reload(&f.cfg).unwrap();
@@ -929,9 +969,11 @@ mod tests {
     fn tier_routing_and_search_rows() {
         let mut f = fx("route");
         f.sink
-            .extracted("pub", extracted("a.txt", "alpha public words"));
+            .extracted("pub", extracted("a.txt", "alpha public words"))
+            .unwrap();
         f.sink
-            .extracted("secret", extracted("b.txt", "beta private words"));
+            .extracted("secret", extracted("b.txt", "beta private words"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         assert_eq!(files(&f.sink, Tier::Private), 1);
         assert_eq!(f.sink.known("pub", "a.txt"), Some((5, 7)));
@@ -951,7 +993,9 @@ mod tests {
             1
         );
         // re-extract replaces, not duplicates
-        f.sink.extracted("pub", extracted("a.txt", "alpha again"));
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha again"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         assert_eq!(
             count(f.sink.conn(Tier::Public), "SELECT count(*) FROM chunks"),
@@ -962,7 +1006,9 @@ mod tests {
             1
         );
         // a denied file is never stored
-        f.sink.extracted("pub", extracted(".env", "SECRET=1"));
+        f.sink
+            .extracted("pub", extracted(".env", "SECRET=1"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
     }
 
@@ -970,8 +1016,11 @@ mod tests {
     fn public_db_has_no_private_name_or_path() {
         let mut f = fx("leak");
         f.sink
-            .extracted("secret", extracted("b.txt", "beta private words"));
-        f.sink.extracted("pub", extracted("a.txt", "alpha"));
+            .extracted("secret", extracted("b.txt", "beta private words"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
         f.sink.root_state("secret", "offline", "x");
         f.sink.set_expected_identity(
             "secret",
@@ -1054,8 +1103,8 @@ mod tests {
     fn unsafe_name_row_is_deleted_by_a_complete_scan() {
         let mut f = fx("unsafe-row");
         let bad = "d\u{202e}x/a.txt";
-        f.sink.extracted("pub", extracted("keep.txt", "k"));
-        f.sink.extracted("pub", extracted(bad, "b"));
+        f.sink.extracted("pub", extracted("keep.txt", "k")).unwrap();
+        f.sink.extracted("pub", extracted(bad, "b")).unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 2);
         f.sink.scan_done(
             "pub",
@@ -1067,8 +1116,8 @@ mod tests {
     #[test]
     fn deletion_needs_a_complete_scan() {
         let mut f = fx("del");
-        f.sink.extracted("pub", extracted("keep.txt", "k"));
-        f.sink.extracted("pub", extracted("gone.txt", "g"));
+        f.sink.extracted("pub", extracted("keep.txt", "k")).unwrap();
+        f.sink.extracted("pub", extracted("gone.txt", "g")).unwrap();
         f.sink.scan_done("pub", scan(false, &["keep.txt"], &[]));
         assert_eq!(
             files(&f.sink, Tier::Public),
@@ -1107,7 +1156,7 @@ mod tests {
             "io/d.txt",
             "plain.txt",
         ] {
-            f.sink.extracted("pub", extracted(rel, "x"));
+            f.sink.extracted("pub", extracted(rel, "x")).unwrap();
         }
         f.sink.scan_done(
             "pub",
@@ -1149,10 +1198,50 @@ mod tests {
         assert_eq!(f.sink.indexed_files("pub"), 0);
     }
 
+    #[test]
+    fn indexed_files_is_zero_or_one_and_stops_at_the_first_database() {
+        use rusqlite::functions::FunctionFlags;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut f = fx("indexed-exists");
+        assert_eq!(f.sink.indexed_files("pub"), 0);
+        f.sink.extracted("pub", extracted("a.txt", "a")).unwrap();
+        f.sink.extracted("pub", extracted("b.txt", "b")).unwrap();
+        assert_eq!(f.sink.indexed_files("pub"), 1); // a count, not 2
+        // Querying this view calls observe(); the first database must short-circuit it.
+        let queries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&queries);
+        f.sink
+            .conn(Tier::Private)
+            .create_scalar_function("observe", 0, FunctionFlags::SQLITE_UTF8, move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok("pub")
+            })
+            .unwrap();
+        f.sink
+            .conn(Tier::Private)
+            .execute_batch(
+                "DROP TABLE files; CREATE VIEW files AS SELECT observe() AS root_id, 'ok' AS state",
+            )
+            .unwrap();
+        assert_eq!(f.sink.indexed_files("pub"), 1);
+        assert_eq!(queries.load(Ordering::Relaxed), 0);
+        assert_eq!(f.sink.indexed_files("other"), 0);
+        assert!(queries.load(Ordering::Relaxed) > 0);
+        // an error answers "some", so adoption stays conservative
+        f.sink
+            .conn(Tier::Private)
+            .execute_batch("DROP VIEW files")
+            .unwrap();
+        assert_eq!(f.sink.indexed_files("other"), 1);
+    }
+
     fn move_fixture(name: &str) -> Fx {
         let mut f = fx(name);
         f.sink
-            .extracted("moving", extracted("m.txt", "movable words"));
+            .extracted("moving", extracted("m.txt", "movable words"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         // config now makes the nested root private
         fs::write(
@@ -1220,8 +1309,12 @@ mod tests {
     #[test]
     fn purge_removes_rows_a_new_exclusion_rejects() {
         let mut f = fx("purge");
-        f.sink.extracted("pub", extracted("docs/a.txt", "a"));
-        f.sink.extracted("pub", extracted("keep/b.txt", "b"));
+        f.sink
+            .extracted("pub", extracted("docs/a.txt", "a"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("keep/b.txt", "b"))
+            .unwrap();
         fs::write(
             &f.cfg,
             format!(
@@ -1242,8 +1335,12 @@ mod tests {
     #[test]
     fn prune_drops_legacy_rows_with_an_unsafe_path() {
         let mut f = fx("prune-unsafe");
-        f.sink.extracted("pub", extracted("a\u{202e}b.txt", "bad"));
-        f.sink.extracted("pub", extracted("ok.txt", "good"));
+        f.sink
+            .extracted("pub", extracted("a\u{202e}b.txt", "bad"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("ok.txt", "good"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 2);
         f.sink.reload(&f.cfg).unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
@@ -1295,8 +1392,12 @@ mod tests {
     #[test]
     fn rows_and_validation_of_removed_roots_are_purged() {
         let mut f = fx("orphans");
-        f.sink.extracted("pub", extracted("a.txt", "alpha"));
-        f.sink.extracted("secret", extracted("b.txt", "beta"));
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
+        f.sink
+            .extracted("secret", extracted("b.txt", "beta"))
+            .unwrap();
         f.sink
             .validated("/data/secret-things", ValidationResult::Eloop);
         f.sink.validated("/data/pub", ValidationResult::Ok);
@@ -1325,5 +1426,126 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn model_revision_change_resets_vectors_and_sizes_not_mtime() {
+        let mut f = fx("modelrev");
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
+        for t in TIERS {
+            f.sink
+                .conn(t)
+                .execute("UPDATE meta SET model_rev = 'old'", [])
+                .unwrap();
+        }
+        f.sink
+            .conn(Tier::Public)
+            .execute("UPDATE chunks SET vec = zeroblob(512)", [])
+            .unwrap();
+        let dir = f.dir.join("state");
+        f.sink = DbSink::open_with(&dir, &f.cfg, None).unwrap();
+        let c = f.sink.conn(Tier::Public);
+        assert_eq!(
+            count(c, "SELECT count(*) FROM chunks WHERE vec IS NOT NULL"),
+            0
+        );
+        assert_eq!(count(c, "SELECT size FROM files"), -1);
+        assert_eq!(count(c, "SELECT mtime_ns FROM files"), 7);
+        let rev: String = c
+            .query_row("SELECT model_rev FROM meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rev, embed::MODEL_REV);
+    }
+
+    #[test]
+    fn embed_cache_table_is_gone_after_open() {
+        let mut f = fx("nocache");
+        let c = f.sink.conn(Tier::Public);
+        c.execute(
+            "CREATE TABLE embed_cache(input_blake3 BLOB PRIMARY KEY, vector BLOB)",
+            [],
+        )
+        .unwrap();
+        let dir = f.dir.join("state");
+        f.sink = DbSink::open_with(&dir, &f.cfg, None).unwrap();
+        for t in TIERS {
+            let q = "SELECT count(*) FROM sqlite_master WHERE name = 'embed_cache'";
+            assert_eq!(count(f.sink.conn(t), q), 0);
+        }
+    }
+
+    #[test]
+    fn unchanged_chunks_keep_their_vector_and_are_not_embedded() {
+        let mut f = fx("reuse");
+        let two = |second: &str| {
+            let mut ef = extracted("a.txt", "keep me");
+            ef.chunks.push(Chunk {
+                ord: 1,
+                text: second.into(),
+                ..ef.chunks[0].clone()
+            });
+            ef
+        };
+        f.sink.extracted("pub", two("second")).unwrap();
+        f.sink
+            .conn(Tier::Public)
+            .execute("UPDATE chunks SET vec = zeroblob(512)", [])
+            .unwrap();
+        f.sink.embed_calls.set(0);
+        f.sink.extracted("pub", two("changed")).unwrap();
+        assert_eq!(
+            f.sink.embed_calls.get(),
+            1,
+            "only the changed chunk is embedded"
+        );
+        let c = f.sink.conn(Tier::Public);
+        assert_eq!(
+            count(
+                c,
+                "SELECT count(*) FROM chunks WHERE text = 'keep me' AND length(vec) = 512"
+            ),
+            1
+        );
+    }
+
+    fn many(name: &str, n: usize) -> Fx {
+        let mut f = fx(name);
+        for i in 0..n {
+            f.sink
+                .extracted("moving", extracted(&format!("m{i}.txt"), "w"))
+                .unwrap();
+        }
+        assert_eq!(files(&f.sink, Tier::Public), n as i64);
+        fs::write(
+            &f.cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"pub\"\npath = \"/data/pub\"\ntier = \"public\"\n\
+                 [[root]]\nname = \"moving\"\npath = \"/data/pub/moving\"\ntier = \"private\"\n",
+                f.dir.join("state").display()
+            ),
+        )
+        .unwrap();
+        f.sink.embed_calls.set(0);
+        f
+    }
+
+    #[test]
+    fn tier_move_works_in_batches_of_256() {
+        let mut f = many("batches", 1000);
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(*f.sink.move_batches.borrow(), vec![256, 256, 256, 232]);
+        assert_eq!(files(&f.sink, Tier::Public), 0);
+        assert_eq!(files(&f.sink, Tier::Private), 1000);
+    }
+
+    #[test]
+    fn tier_move_crash_after_first_batch_keeps_the_rest_in_the_source() {
+        let mut f = many("batchcrash", 1000);
+        f.sink.abort_after_first_commit = true;
+        assert!(f.sink.reload(&f.cfg).is_err());
+        assert_eq!(files(&f.sink, Tier::Public), 744);
+        assert_eq!(files(&f.sink, Tier::Private), 0);
     }
 }

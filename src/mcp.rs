@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServiceExt, tool, tool_handler, tool_router};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -19,12 +19,17 @@ use crate::config::{self, Config};
 use crate::db::{Mode, Snapshot, Store};
 use crate::embed::{self, DIM, Embedder};
 use crate::rank::{self, Field, Hit, Query, SearchMode};
-use crate::sanitize::sanitize;
+use crate::sanitize::{self, sanitize};
 
 const GET_MAX_CHARS: usize = 20_000;
 const PASSAGE_MAX_CHARS: usize = 800;
 const QUERY_MAX_CHARS: usize = 2000;
 const RECENT_MAX: usize = 50;
+
+#[cfg(test)]
+thread_local! {
+    static GET_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -167,6 +172,14 @@ fn wrap(path: &str, text: &str) -> String {
 /// Titles, symbols, headings and sheet names are document content too: same encoding.
 fn untrusted(s: &str) -> String {
     esc(&sanitize(s))
+}
+
+/// A stored sheet name as `get` cursors spell it: escaped, and "" for an unnamed sheet.
+fn sheet_key(stored: Option<&str>) -> String {
+    stored
+        .filter(|s| !s.is_empty())
+        .map(untrusted)
+        .unwrap_or_default()
 }
 
 fn head(s: &str, max: usize) -> &str {
@@ -330,7 +343,10 @@ impl Core {
                 let stale = matches!(s(4)?.as_deref(), Some("offline" | "degraded"));
                 let mut m = Map::new();
                 m.insert("path".into(), h.abspath.clone().into());
-                m.insert("title".into(), untrusted(&s(0)?.unwrap_or_default()).into());
+                m.insert(
+                    "title".into(),
+                    untrusted(&sanitize::label(&s(0)?.unwrap_or_default(), 200)).into(),
+                );
                 m.insert("mtime".into(), (n(2)?.unwrap_or(0) / 1_000_000_000).into());
                 m.insert("type".into(), s(1)?.into());
                 if !self.public() {
@@ -338,7 +354,10 @@ impl Core {
                 }
                 m.insert("stale".into(), stale.into());
                 let (start, end) = (n(6)?, n(7)?);
-                let sym = s(10)?.map(|x| Value::from(untrusted(&x)));
+                let sym = s(10)?
+                    .map(|x| sanitize::label(&x, 200))
+                    .filter(|x| !x.is_empty())
+                    .map(|x| Value::from(untrusted(&x)));
                 match s(5)?.as_deref() {
                     Some("code") => {
                         m.insert("lines".into(), json!([n(8)?.or(start), n(9)?.or(end)]));
@@ -353,7 +372,12 @@ impl Core {
                     }
                     Some("sheet") => {
                         m.insert("rows".into(), json!([start, end]));
-                        m.extend(sym.map(|v| ("sheet".to_string(), v)));
+                        let sheet = s(10)?.map(|x| sanitize::label(&x, 200));
+                        m.extend(
+                            sheet
+                                .filter(|x| !x.is_empty())
+                                .map(|x| ("sheet".to_string(), Value::from(untrusted(&x)))),
+                        );
                     }
                     _ => {}
                 }
@@ -384,6 +408,7 @@ impl Core {
             return Err(Fail::Arg("not found".into()));
         }
         let (lo, hi) = (a.start.unwrap_or(1), a.end.unwrap_or(u64::MAX));
+        let lo_i64 = i64::try_from(lo).map_err(|_| Fail::Arg("start is too large".into()))?;
         let store = self.store();
         let _snapshot = self.snapshot()?;
         let vis = rank::visible_sql(store.mode);
@@ -404,59 +429,63 @@ impl Core {
         let Some((conn, id)) = found else {
             return Err(Fail::Arg("not found".into()));
         };
-        let mut stmt = conn.prepare(
-            "SELECT kind, start, end, heading_or_symbol, text FROM chunks WHERE file_id = ?1 ORDER BY ord",
-        )?;
-        let chunks = stmt
-            .query_map([id], |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        // Units are single lines, whole pages or single sheet rows: (position, sheet, text).
-        let kind = match chunks.first().map(|c| c.0.as_str()) {
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM chunks WHERE file_id = ?1 ORDER BY ord LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let kind = match kind.as_deref() {
             Some("page") => "pages",
             Some("sheet") => "rows",
             _ => "lines",
         };
-        let mut units: Vec<(u64, Option<String>, String)> = Vec::new();
-        let mut last_line = 0;
-        for (_, start, name, text) in chunks {
-            match kind {
-                "pages" => match units.last_mut() {
-                    Some(u) if u.0 == start => {
-                        u.2.push_str("\n\n");
-                        u.2.push_str(&text);
-                    }
-                    _ => units.push((start, None, text)),
-                },
-                "rows" => {
-                    if a.sheet.as_ref().is_none_or(|s| Some(s) == name.as_ref()) {
-                        for (i, line) in text.lines().enumerate() {
-                            units.push((start + i as u64, name.clone(), line.to_string()));
-                        }
-                    }
+        let lower_ord = if kind == "rows" {
+            if let Some(wanted) = a.sheet.as_deref() {
+                let mut names = conn.prepare("SELECT heading_or_symbol, MIN(ord) FROM chunks WHERE file_id = ?1 GROUP BY heading_or_symbol ORDER BY MIN(ord)")?;
+                let groups: Vec<(Option<String>, i64)> = names
+                    .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                if let Some((idx, (name, _))) = groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (name, _))| sheet_key(name.as_deref()) == wanted)
+                {
+                    let ord: Option<i64> = conn.query_row("SELECT MIN(ord) FROM chunks WHERE file_id = ?1 AND heading_or_symbol IS ?2 AND end >= ?3", rusqlite::params![id, name, lo_i64], |r| r.get(0))?;
+                    ord.or_else(|| groups.get(idx + 1).map(|g| g.1))
+                        .unwrap_or(i64::MAX)
+                } else {
+                    i64::MAX
                 }
-                _ => {
-                    for (i, line) in text.lines().enumerate() {
-                        let n = start + i as u64;
-                        if n > last_line {
-                            last_line = n;
-                            units.push((n, None, line.to_string()));
-                        }
-                    }
-                }
+            } else {
+                0
             }
-        }
-        units.retain(|u| u.0 >= lo && u.0 <= hi);
+        } else {
+            0
+        };
+        let sql = if kind == "rows" {
+            "SELECT start, heading_or_symbol, text FROM chunks WHERE file_id = ?1 AND ord >= ?2 ORDER BY ord"
+        } else {
+            "SELECT start, heading_or_symbol, text FROM chunks WHERE file_id = ?1 AND end >= ?2 ORDER BY ord"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = if kind == "rows" {
+            stmt.query(rusqlite::params![id, lower_ord])?
+        } else {
+            stmt.query(rusqlite::params![id, lo_i64])?
+        };
         let skip = usize::try_from(a.offset.unwrap_or(0)).unwrap_or(usize::MAX);
         let (mut text, mut used, mut truncated, mut next) = (String::new(), 0, false, None);
-        for (idx, (pos, sheet, t)) in units.iter().enumerate() {
-            let skipped = if idx == 0 { skip } else { 0 };
+        let mut first = true;
+        let mut emit = |pos: u64, sheet: Option<&str>, t: &str| {
+            #[cfg(test)]
+            GET_WORK.with(|work| {
+                let (rows, units) = work.get();
+                work.set((rows, units + 1));
+            });
+            let skipped = if first { skip } else { 0 };
+            first = false;
             let body = t.char_indices().nth(skipped).map_or("", |(i, _)| &t[i..]);
             let n = body.chars().count();
             let room = GET_MAX_CHARS - used;
@@ -464,7 +493,7 @@ impl Core {
                 text.push_str(body);
                 text.push('\n');
                 used += n + 1;
-                continue;
+                return false;
             }
             // Does not fit: split it only when it would otherwise never fit in one call.
             let offset = if used == 0 {
@@ -477,13 +506,106 @@ impl Core {
             };
             let mut m = json!({"start": pos});
             if let Some(sh) = sheet {
-                m["sheet"] = sh.clone().into();
+                m["sheet"] = sh.into();
             }
             if offset > 0 {
                 m["offset"] = offset.into();
             }
             next = Some(m);
-            break;
+            true
+        };
+        let mut last_line = 0;
+        // an unnamed sheet (NULL or empty name, from older rows) is addressed as "" in a cursor
+        let mut first_sheet: Option<Option<String>> =
+            a.sheet.clone().map(|s| (!s.is_empty()).then_some(s));
+        let mut page: Option<(u64, String)> = None;
+        let mut sheet_row: Option<(u64, Option<String>, String)> = None;
+        'chunks: while let Some(row) = rows.next()? {
+            #[cfg(test)]
+            GET_WORK.with(|work| {
+                let (rows, units) = work.get();
+                work.set((rows + 1, units));
+            });
+            let start = row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64;
+            let name = row
+                .get::<_, Option<String>>(1)?
+                .filter(|s| !s.is_empty())
+                .map(|s| untrusted(&s));
+            let chunk = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            match kind {
+                "pages" => {
+                    if start > hi {
+                        break;
+                    }
+                    if let Some((pos, body)) = page.as_mut()
+                        && *pos == start
+                    {
+                        body.push_str("\n\n");
+                        body.push_str(&chunk);
+                        continue;
+                    }
+                    if let Some((pos, body)) = page.take()
+                        && emit(pos, None, &body)
+                    {
+                        break;
+                    }
+                    page = Some((start, chunk));
+                }
+                "rows" => {
+                    if first_sheet.is_none() {
+                        first_sheet = Some(name.clone());
+                    } else if a.end.is_some() && Some(&name) != first_sheet.as_ref() {
+                        break;
+                    }
+                    let initial = Some(&name) == first_sheet.as_ref();
+                    for (i, line) in chunk.lines().enumerate() {
+                        let pos = start + i as u64;
+                        if initial && pos < lo {
+                            continue;
+                        }
+                        if initial && pos > hi {
+                            break 'chunks;
+                        }
+                        if let Some((old_pos, old_name, body)) = sheet_row.as_mut()
+                            && *old_pos == pos
+                            && *old_name == name
+                        {
+                            body.push_str(line);
+                            continue;
+                        }
+                        if let Some((old_pos, old_name, body)) = sheet_row.take()
+                            && emit(old_pos, Some(old_name.as_deref().unwrap_or("")), &body)
+                        {
+                            break 'chunks;
+                        }
+                        sheet_row = Some((pos, name.clone(), line.to_string()));
+                    }
+                }
+                _ => {
+                    for (i, line) in chunk.lines().enumerate() {
+                        let pos = start + i as u64;
+                        if pos <= last_line {
+                            continue;
+                        }
+                        last_line = pos;
+                        if pos < lo {
+                            continue;
+                        }
+                        if pos > hi {
+                            break 'chunks;
+                        }
+                        if emit(pos, None, line) {
+                            break 'chunks;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((pos, body)) = page {
+            emit(pos, None, &body);
+        }
+        if let Some((pos, name, body)) = sheet_row {
+            emit(pos, Some(name.as_deref().unwrap_or("")), &body);
         }
         Ok(json!({
             "path": a.path, "unit": kind, "truncated": truncated, "next": next,
@@ -522,7 +644,10 @@ impl Core {
                     let mtime: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
                     let mut m = Map::new();
                     m.insert("path".into(), r.get::<_, String>(0)?.into());
-                    m.insert("title".into(), untrusted(&s(1)?.unwrap_or_default()).into());
+                    m.insert(
+                        "title".into(),
+                        untrusted(&sanitize::label(&s(1)?.unwrap_or_default(), 200)).into(),
+                    );
                     m.insert("mtime".into(), (mtime / 1_000_000_000).into());
                     m.insert("type".into(), s(3)?.into());
                     if !self.public {
@@ -627,4 +752,122 @@ pub fn run(config_path: &Path, public: bool) -> Result<(), Box<dyn Error>> {
             service.waiting().await?;
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_get_fetches_and_builds_only_one_page() {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-index-get-work-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, format!("state_dir = {:?}\n[[root]]\nname = \"docs\"\npath = \"/home/x/docs\"\ntier = \"public\"\n", dir.display().to_string())).unwrap();
+        let mut writer = Store::open(&dir, Mode::Writer).unwrap();
+        let hash = crate::auth::path_hash(Path::new("/home/x/docs")).unwrap();
+        writer
+            .public
+            .execute(
+                "INSERT INTO validated VALUES(?1, 0)",
+                [hash.as_bytes().as_slice()],
+            )
+            .unwrap();
+        writer
+            .public
+            .execute(
+                "INSERT INTO roots(name, path, state) VALUES('docs', '/home/x/docs', 'ok')",
+                [],
+            )
+            .unwrap();
+        writer.public.execute("INSERT INTO files(root_id, relpath, abspath, title, type, state) VALUES('docs', 'late.txt', '/home/x/docs/late.txt', 'late', 'text', 'ok')", []).unwrap();
+        let id = writer.public.last_insert_rowid();
+        let tx = writer.public.transaction().unwrap();
+        {
+            let mut stmt = tx.prepare("INSERT INTO chunks(file_id, ord, kind, start, end, text) VALUES(?1, ?2, 'section', ?2, ?2, ?3)").unwrap();
+            for n in 1..=10_000i64 {
+                stmt.execute(rusqlite::params![
+                    id,
+                    n,
+                    format!("line {n} {}", "x".repeat(190))
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let mut core = Core {
+            public: true,
+            path: cfg,
+            seen: false,
+            stamp: None,
+            cfg_err: None,
+            state_dir: None,
+            pending: None,
+            store: None,
+            embedder: None,
+        };
+        GET_WORK.with(|work| work.set((0, 0)));
+        let result = core
+            .get(GetArgs {
+                path: "/home/x/docs/late.txt".into(),
+                start: Some(9_001),
+                end: None,
+                sheet: None,
+                offset: None,
+            })
+            .map_err(|e| e.text(true))
+            .unwrap();
+        assert!(result.contains("line 9001"));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(!parsed["next"].is_null());
+        GET_WORK.with(|work| {
+            let (rows, units) = work.get();
+            assert!(rows <= 110, "fetched {rows} chunks");
+            assert!(units <= 110, "built {units} units");
+        });
+        writer.public.execute("INSERT INTO files(root_id, relpath, abspath, title, type, state) VALUES('docs', 'late.xlsx', '/home/x/docs/late.xlsx', 'late', 'xlsx', 'ok')", []).unwrap();
+        let sheet_id = writer.public.last_insert_rowid();
+        let tx = writer.public.transaction().unwrap();
+        {
+            let mut stmt = tx.prepare("INSERT INTO chunks(file_id, ord, kind, start, end, heading_or_symbol, text) VALUES(?1, ?2, 'sheet', ?2, ?2, 'S', ?3)").unwrap();
+            for n in 1..=5_000i64 {
+                stmt.execute(rusqlite::params![
+                    sheet_id,
+                    n,
+                    format!("row {n} {}", "x".repeat(190))
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        GET_WORK.with(|work| work.set((0, 0)));
+        let result = core
+            .get(GetArgs {
+                path: "/home/x/docs/late.xlsx".into(),
+                start: Some(4_001),
+                end: None,
+                sheet: Some("S".into()),
+                offset: None,
+            })
+            .map_err(|e| e.text(true))
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(result.contains("row 4001"));
+        assert!(!parsed["next"].is_null());
+        GET_WORK.with(|work| {
+            let (rows, units) = work.get();
+            assert!(rows <= 110, "fetched {rows} row chunks");
+            assert!(units <= 110, "built {units} row units");
+        });
+        drop(core);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

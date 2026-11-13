@@ -18,6 +18,15 @@ pub const BUILTIN: &[&str] = &[
     ".pypirc",
     ".docker/config.json",
     ".cargo/credentials*",
+    "nix.conf",
+    "rclone.conf",
+    ".config/containers/auth.json",
+    "credentials.tfrc.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "secrets.json",
+    "credentials.json",
+    "service-account*.json",
     ".ssh/",
     ".gnupg/",
     ".password-store/",
@@ -26,7 +35,10 @@ pub const BUILTIN: &[&str] = &[
     ".kube/",
     ".config/gcloud/",
     ".config/gh/",
+    ".config/glab-cli/",
+    ".config/github-copilot/",
     ".config/sops/",
+    ".config/age/",
     ".local/share/keyrings/",
     ".claude/",
     ".codex/",
@@ -128,5 +140,17 @@ mod tests {
         assert!(denied("/home/x/id_rsa.d/work"));
         assert!(denied("/home/x/.cargo/credentials.d/token"));
         assert!(!denied("/home/x/envs/file"));
+        assert!(denied("/home/x/.config/nix/nix.conf"));
+        assert!(denied("/home/x/.config/age/keys.txt"));
+        assert!(denied("/home/x/.config/rclone/rclone.conf"));
+        assert!(denied("/home/x/.config/containers/auth.json"));
+        assert!(denied("/home/x/.terraform.d/credentials.tfrc.json"));
+        assert!(denied("/home/x/.config/glab-cli/config.yml"));
+        assert!(denied("/home/x/.config/github-copilot/hosts.json"));
+        assert!(denied("/home/x/proj/secrets.yaml"));
+        assert!(denied("/home/x/proj/secrets.yml"));
+        assert!(denied("/home/x/proj/secrets.json"));
+        assert!(denied("/home/x/proj/credentials.json"));
+        assert!(denied("/home/x/proj/service-account-prod.json"));
     }
 }

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -131,6 +132,23 @@ pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let bad = || format!("invalid duration: {}", crate::sanitize::escape_unsafe(s));
+    let (i, unit) = s.char_indices().last().ok_or_else(bad)?;
+    let n: u64 = s[..i].parse().map_err(|_| bad())?;
+    let mult: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        _ => return Err(bad()),
+    };
+    match n.checked_mul(mult) {
+        Some(secs) if (1..=365 * 86400).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(bad()),
+    }
+}
+
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
         // First: later messages interpolate paths, which must not carry control characters.
@@ -147,12 +165,17 @@ impl Config {
         if self.limits.workers < 2 {
             return Err("workers must be at least 2".into());
         }
+        if self.limits.max_file_mb == 0 {
+            return Err("max_file_mb must be at least 1".into());
+        }
+        parse_duration(&self.limits.backoff_max)?;
         let mut names = HashSet::new();
         let mut paths = HashSet::new();
         for root in &self.roots {
             if root.name.is_empty() || !names.insert(&root.name) {
                 return Err("root names must be nonempty and unique".into());
             }
+            parse_duration(&root.interval)?;
             if !paths.insert(&root.path) {
                 return Err(format!("duplicate root path: {}", root.path.display()).into());
             }
@@ -225,6 +248,42 @@ mod tests {
         config.limits.workers = 2;
         config.roots[0].path = "/home/x/../other".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn durations_and_limits_are_validated() {
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("365d"), Ok(Duration::from_secs(365 * 86400)));
+        for bad in [
+            "5µ",
+            "0s",
+            "",
+            "s",
+            "366d",
+            "99999999999999999d",
+            "1\u{202e}",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+        assert!(
+            !parse_duration("1\u{202e}")
+                .unwrap_err()
+                .contains('\u{202e}')
+        );
+        let base = |extra: &str| -> Config {
+            toml::from_str(&format!(
+                "state_dir = \"/state\"\n{extra}[[root]]\nname = \"a\"\npath = \"/home/x\"\n"
+            ))
+            .unwrap()
+        };
+        assert!(base("").validate().is_ok());
+        assert!(base("[limits]\nmax_file_mb = 0\n").validate().is_err());
+        assert!(base("[limits]\nbackoff_max = \"0s\"\n").validate().is_err());
+        let c: Config = toml::from_str(
+            "state_dir = \"/state\"\n[[root]]\nname = \"a\"\npath = \"/home/x\"\ninterval = \"5µ\"\n",
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
     }
 
     #[test]

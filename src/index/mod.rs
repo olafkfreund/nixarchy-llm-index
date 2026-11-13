@@ -22,7 +22,7 @@ use landlock::{
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_setfl};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, parse_duration};
 use crate::proto::{Chunk, Job, Message, Share, ValidationResult};
 use crate::worker;
 use sched::{Allow, Params, RootSpec, Sched};
@@ -79,8 +79,16 @@ pub trait Sink {
     /// Stored (size, mtime_ns) of a file, if indexed.
     fn known(&self, root: &str, relpath: &str) -> Option<(u64, i64)>;
     fn scan_done(&mut self, root: &str, scan: ScanResult);
-    fn extracted(&mut self, root: &str, file: ExtractedFile);
-    fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str);
+    /// An error means nothing was stored: the caller requeues and retries.
+    fn extracted(&mut self, root: &str, file: ExtractedFile) -> Result<(), String>;
+    fn failed(
+        &mut self,
+        root: &str,
+        relpath: &str,
+        size: u64,
+        mtime_ns: i64,
+        reason: &str,
+    ) -> Result<(), String>;
     /// Result of a `validate` worker for one root or exclusion path.
     fn validated(&mut self, path: &str, result: ValidationResult);
     fn root_state(&mut self, root: &str, state: &str, reason: &str);
@@ -97,7 +105,7 @@ pub trait Spawner {
 struct Proc {
     child: Child,
     out: ChildStdout,
-    buf: Vec<u8>,
+    buf: Lines,
     /// Stdout reached EOF: no longer polled, the process is reaped via `try_wait`.
     eof: bool,
     /// Bytes for the worker's stdin that did not fit the pipe yet.
@@ -118,19 +126,49 @@ const READ_CHUNK: usize = 64 << 10;
 /// A worker whose stdin queue has not drained for this long is reported as stuck.
 const WRITE_STALL: Duration = Duration::from_secs(30);
 
+/// Pipe bytes split into lines; `scan` marks what was already searched for `\n`.
+#[derive(Default)]
+struct Lines {
+    buf: Vec<u8>,
+    scan: usize,
+    searched: usize,
+}
+
+impl Lines {
+    /// Complete lines (with their `\n`), and whether an unfinished line exceeded `max` and was dropped.
+    fn take_lines(&mut self, max: usize) -> (Vec<Vec<u8>>, bool) {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for i in self.scan..self.buf.len() {
+            self.searched += 1;
+            if self.buf[i] == b'\n' {
+                out.push(self.buf[start..=i].to_vec());
+                start = i + 1;
+            }
+        }
+        self.buf.drain(..start);
+        self.scan = self.buf.len();
+        let overflow = self.buf.len() > max;
+        if overflow {
+            self.buf.clear();
+            self.scan = 0;
+        }
+        (out, overflow)
+    }
+}
+
 impl Proc {
     fn parse(&mut self) -> Vec<Message> {
+        let (lines, overflow) = self.buf.take_lines(MAX_LINE);
+        if overflow {
+            let _ = self.child.kill();
+        }
         let mut out = Vec::new();
-        while let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=end).collect();
+        for line in lines {
             match serde_json::from_slice(&line) {
                 Ok(m) => out.push(m),
                 Err(e) => eprintln!("bad worker message: {e}"),
             }
-        }
-        if self.buf.len() > MAX_LINE {
-            self.buf.clear();
-            let _ = self.child.kill();
         }
         out
     }
@@ -140,7 +178,7 @@ impl Proc {
         let mut tmp = [0u8; READ_CHUNK];
         match self.out.read(&mut tmp) {
             Ok(0) => self.eof = true,
-            Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => self.buf.buf.extend_from_slice(&tmp[..n]),
             Err(_) => {}
         }
         self.parse()
@@ -152,7 +190,7 @@ impl Proc {
         loop {
             match self.out.read(&mut tmp) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => self.buf.buf.extend_from_slice(&tmp[..n]),
             }
         }
         self.parse()
@@ -287,7 +325,7 @@ impl Spawner for ProcSpawner {
             Proc {
                 child,
                 out,
-                buf: Vec::new(),
+                buf: Lines::default(),
                 eof: false,
                 outq: Vec::new(),
                 blocked_since: None,
@@ -310,23 +348,6 @@ impl Spawner for ProcSpawner {
             let _ = p.child.kill();
         }
     }
-}
-
-pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    let bad = || format!("invalid duration: {s}");
-    let (n, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: u64 = n.parse().map_err(|_| bad())?;
-    let mult = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => return Err(bad()),
-    };
-    if n == 0 {
-        return Err(bad());
-    }
-    Ok(Duration::from_secs(n * mult))
 }
 
 /// SQLite's temp files (large deletes, VACUUM) must land where Landlock lets us write.
@@ -524,6 +545,7 @@ fn self_test_in(config: &Config, dir: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+        print!("{stdout}");
     }
     let mut mountinfo = File::open("/proc/self/mountinfo")?;
     if derive(&mut mountinfo, &root).share.fstype == "unknown" {
@@ -543,5 +565,31 @@ mod tests {
         assert!(parse_duration("0m").is_err());
         assert!(parse_duration("15").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn split_line_is_searched_linearly() {
+        let mut l = Lines::default();
+        let mut got = Vec::new();
+        for _ in 0..1000 {
+            l.buf.extend_from_slice(&[b'x'; 64]);
+            got.extend(l.take_lines(usize::MAX).0);
+        }
+        l.buf.extend_from_slice(b"\nrest");
+        got.extend(l.take_lines(usize::MAX).0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].len(), 64_001);
+        assert_eq!(l.buf, b"rest");
+        assert!(l.searched <= 64_006, "searched {}", l.searched);
+    }
+
+    #[test]
+    fn overlong_line_resets_cursor() {
+        let mut l = Lines::default();
+        l.buf.extend_from_slice(&[b'x'; 20]);
+        let (lines, overflow) = l.take_lines(10);
+        assert!(lines.is_empty() && overflow && l.scan == 0 && l.buf.is_empty());
+        l.buf.extend_from_slice(b"ok\n");
+        assert_eq!(l.take_lines(10), (vec![b"ok\n".to_vec()], false));
     }
 }

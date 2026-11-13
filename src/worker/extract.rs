@@ -12,7 +12,7 @@ use super::scan::{LOCKFILES, RESOLVE, SKIP_DIRS, errno_reason};
 use crate::chunk;
 use crate::config::Tier;
 use crate::deny;
-use crate::extract::{self, ExtractError};
+use crate::extract::{self, ExtractError, Extracted, SegmentKind};
 use crate::proto::Message;
 use crate::sanitize;
 
@@ -122,9 +122,7 @@ fn extract_with_deadlines(
         });
     }
     let actual_size = meta.st_size as u64;
-    let actual_mtime_ns = (meta.st_mtime as i64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(meta.st_mtime_nsec as i64);
+    let actual_mtime_ns = super::mtime_ns(meta.st_mtime as i64, meta.st_mtime_nsec as i64);
     if actual_size != expected_size || actual_mtime_ns != expected_mtime_ns {
         return output.send(&Message::Failed {
             relpath,
@@ -190,7 +188,7 @@ fn extract_with_deadlines(
         }
     };
 
-    let extracted = match extract::extract_with_deadline(
+    let mut extracted = match extract::extract_with_deadline(
         &relpath,
         file_type,
         &bytes,
@@ -217,7 +215,10 @@ fn extract_with_deadlines(
         });
     }
 
-    // 7. Chunk with deadline, sanitize chunk text and title (dropping empty chunks),
+    // 7. Bound labels before chunking copies headings across chunks.
+    label_extracted(&mut extracted, &relpath);
+
+    // Chunk with deadline, sanitize chunk text (dropping empty chunks),
     // compute BLAKE3 of bytes, re-check deadline, and reply Extracted.
     let mut chunks = match chunk::chunk(&extracted.segments, extracted.file_type, chunk_deadline) {
         Ok(chunks) => chunks,
@@ -244,11 +245,6 @@ fn extract_with_deadlines(
 
     sanitize::sanitize_chunks(&mut chunks);
 
-    let mut title = sanitize::sanitize(&extracted.title);
-    if title.trim().is_empty() {
-        title = sanitize::sanitize(&extract::file_name(&relpath));
-    }
-
     let blake3 = blake3::hash(&bytes).to_hex().to_string();
 
     if Instant::now() >= chunk_deadline {
@@ -260,11 +256,26 @@ fn extract_with_deadlines(
 
     output.send(&Message::Extracted {
         relpath,
-        title,
+        title: extracted.title,
         r#type: extracted.file_type.as_str().into(),
         blake3,
         chunks,
     })
+}
+
+fn label_extracted(extracted: &mut Extracted, relpath: &str) {
+    extracted.title = sanitize::label(&extracted.title, 200);
+    if extracted.title.is_empty() {
+        extracted.title = sanitize::label(&extract::file_name(relpath), 200);
+    }
+    for segment in &mut extracted.segments {
+        if let SegmentKind::Section { heading } = &mut segment.kind {
+            *heading = heading.as_deref().and_then(|s| {
+                let cleaned = sanitize::label(s, 200);
+                (!cleaned.is_empty()).then_some(cleaned)
+            });
+        }
+    }
 }
 
 fn normal_relative(relpath: &str) -> bool {
@@ -348,6 +359,43 @@ mod tests {
 
     use crate::proto::Job;
     use crate::worker;
+
+    #[test]
+    fn bounds_heading_before_chunking() {
+        let mut extracted = Extracted {
+            title: "\x1b".into(),
+            file_type: extract::FileType::Markdown,
+            segments: vec![extract::Segment {
+                kind: SegmentKind::Section {
+                    heading: Some("H".repeat(100_000)),
+                },
+                start_line: 1,
+                end_line: 1,
+                text: "body".into(),
+            }],
+        };
+        label_extracted(&mut extracted, "fallback.md");
+        assert_eq!(extracted.title, "fallback.md");
+        let SegmentKind::Section { heading } = &extracted.segments[0].kind else {
+            panic!("expected section");
+        };
+        assert_eq!(heading.as_ref().unwrap().chars().count(), 200);
+        let chunks = chunk::chunk(
+            &extracted.segments,
+            extracted.file_type,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            chunks[0]
+                .heading_or_symbol
+                .as_deref()
+                .unwrap()
+                .chars()
+                .count(),
+            200
+        );
+    }
 
     fn stat_size_mtime(path: &Path) -> (u64, i64) {
         let meta = fs::metadata(path).unwrap();

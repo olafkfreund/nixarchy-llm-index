@@ -37,11 +37,13 @@ impl Sink for Mem {
     fn scan_done(&mut self, _: &str, _: ScanResult) {
         self.scans += 1;
     }
-    fn extracted(&mut self, _: &str, f: ExtractedFile) {
+    fn extracted(&mut self, _: &str, f: ExtractedFile) -> Result<(), String> {
         self.extracted.push(f.relpath);
+        Ok(())
     }
-    fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) {
+    fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) -> Result<(), String> {
         self.failed.push(relpath.into());
+        Ok(())
     }
     fn validated(&mut self, _: &str, _: llm_index::proto::ValidationResult) {}
     fn root_state(&mut self, _: &str, _: &str, _: &str) {}

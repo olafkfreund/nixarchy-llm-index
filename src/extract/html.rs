@@ -312,7 +312,7 @@ fn skip_rawtext_element(html: &str, mut pos: usize, tag_name: &str) -> usize {
         let lt = pos + rel;
         if lt + 2 + tag_name.len() <= bytes.len()
             && bytes[lt + 1] == b'/'
-            && html[lt + 2..lt + 2 + tag_name.len()].eq_ignore_ascii_case(tag_name)
+            && bytes[lt + 2..lt + 2 + tag_name.len()].eq_ignore_ascii_case(tag_name.as_bytes())
             && let Some(gt) = find_tag_close(bytes, lt + 2 + tag_name.len())
         {
             return gt + 1;
@@ -369,4 +369,15 @@ fn is_block(tag: &str) -> bool {
             | "dt"
             | "dd"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rawtext_close_probe_across_utf8_boundary() {
+        let html = "<script></aaaaaé</script>";
+        assert_eq!(skip_rawtext_element(html, 8, "script"), html.len());
+    }
 }

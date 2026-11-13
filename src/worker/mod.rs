@@ -3,14 +3,22 @@ pub mod sandbox;
 pub mod scan;
 pub mod watch;
 
+pub(crate) fn mtime_ns(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
 use std::cell::Cell;
 use std::error::Error;
 use std::io::{self, Write};
-use std::path::Path;
+use std::os::fd::AsRawFd;
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::proto::{Job, Message};
+use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope};
 
 pub struct Output {
     writer: Mutex<io::Stdout>,
@@ -71,7 +79,29 @@ pub fn tcp_denied(e: &io::Error) -> bool {
 }
 
 /// `index --self-test` probe: the sandbox must hold for a worker on this host.
+fn selftest_socket_path(state_dir: &Path) -> Result<(std::fs::File, PathBuf), Box<dyn Error>> {
+    let dir = std::fs::File::open(state_dir)?;
+    let path = PathBuf::from(format!(
+        "/proc/self/fd/{}/selftest-{}.sock",
+        dir.as_raw_fd(),
+        std::process::id()
+    ));
+    Ok((dir, path))
+}
+
 fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let state_dir = crate::config::load(config)?.state_dir;
+    let (_dir, socket_path) = selftest_socket_path(&state_dir)?;
+    let _pathname = UnixListener::bind(&socket_path)?;
+    let abstract_addr = SocketAddr::from_abstract_name(
+        format!("llm-index-selftest-{}", std::process::id()).as_bytes(),
+    )?;
+    let _abstract = UnixListener::bind_addr(&abstract_addr)?;
+    UnixStream::connect(&socket_path)?;
+    UnixStream::connect_addr(&abstract_addr)?;
+    let parent = rustix::process::getppid().ok_or("missing parent pid")?;
+    rustix::process::test_kill_process(parent)?;
+
     let ready = sandbox::start(config, role, root)?;
     let dir = &ready.config.roots[ready.root.ok_or("missing root")?].path;
     if std::fs::File::create(dir.join("selftest-probe")).is_ok() {
@@ -83,6 +113,49 @@ fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn
             && denied(std::net::TcpStream::connect("127.0.0.1:1").map(drop)))
     {
         return Err("worker can open TCP".into());
+    }
+    let pathname_supported = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::ResolveUnix)
+        .is_ok();
+    let scope_supported = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .scope(Scope::from_all(landlock::ABI::V6))
+        .is_ok();
+    let pathname_denied = UnixStream::connect(&socket_path)
+        .is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    let abstract_denied = UnixStream::connect_addr(&abstract_addr)
+        .is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    let signal_denied =
+        rustix::process::test_kill_process(parent).is_err_and(|e| e == rustix::io::Errno::PERM);
+    println!(
+        "pathname socket denied={pathname_denied}{}",
+        if pathname_supported {
+            ""
+        } else {
+            " (kernel ABI < 9; skipped)"
+        }
+    );
+    println!(
+        "abstract socket denied={abstract_denied}{}",
+        if scope_supported {
+            ""
+        } else {
+            " (kernel ABI < 6; skipped)"
+        }
+    );
+    println!(
+        "parent signal denied={signal_denied}{}",
+        if scope_supported {
+            ""
+        } else {
+            " (kernel ABI < 6; skipped)"
+        }
+    );
+    if (pathname_supported && !pathname_denied)
+        || (scope_supported && (!abstract_denied || !signal_denied))
+    {
+        return Err("worker sandbox isolation probe failed".into());
     }
     // The root stays readable, the config next to it (outside the root) does not.
     if std::fs::read(dir.join("fixture.txt")).is_err() {
@@ -150,6 +223,30 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn mtime_past_2262_saturates() {
+        assert_eq!(mtime_ns(10_000_000_000, 1), i64::MAX);
+    }
+
+    #[test]
+    fn selftest_socket_works_under_a_long_state_dir() {
+        let dir = std::env::temp_dir()
+            .join(format!("llm-index-long-state-{}", std::process::id()))
+            .join("a".repeat(95));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            dir.join(format!("selftest-{}.sock", std::process::id()))
+                .as_os_str()
+                .len()
+                > 107
+        );
+        let (_fd, socket) = selftest_socket_path(&dir).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        UnixStream::connect(&socket).unwrap();
+        drop(listener);
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn sandbox_child() {

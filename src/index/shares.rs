@@ -100,6 +100,10 @@ impl ShareBook {
             .get(share)
             .is_none_or(|e| e.live.is_empty() && now >= e.not_before)
     }
+    /// Inside the offline backoff, whether or not a worker is still live.
+    pub fn backing_off(&self, share: &Share, now: Time) -> bool {
+        self.map.get(share).is_some_and(|e| now < e.not_before)
+    }
     pub fn charge(&mut self, share: &Share, id: WorkerId) {
         self.map.entry(share.clone()).or_default().live.insert(id);
     }
@@ -121,9 +125,9 @@ impl ShareBook {
         e.backoff = if e.backoff.is_zero() {
             FIRST_BACKOFF.min(max)
         } else {
-            (e.backoff * 2).min(max)
+            e.backoff.saturating_mul(2).min(max)
         };
-        e.not_before = now + e.backoff;
+        e.not_before = now.saturating_add(e.backoff);
     }
     pub fn healthy(&mut self, share: &Share) {
         if let Some(e) = self.map.get_mut(share) {
@@ -189,5 +193,14 @@ mod tests {
         assert!(!book.free(&s, Duration::from_secs(10_000)));
         book.release(1);
         assert!(book.free(&s, Duration::ZERO));
+    }
+
+    #[test]
+    fn backoff_saturates_duration_arithmetic() {
+        let s = share("/m", "s");
+        let mut book = ShareBook::default();
+        book.offline(&s, Duration::MAX, Duration::MAX);
+        book.offline(&s, Duration::MAX, Duration::MAX);
+        assert!(book.free(&s, Duration::MAX));
     }
 }

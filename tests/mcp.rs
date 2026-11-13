@@ -861,6 +861,247 @@ fn get_on_sheets_returns_exactly_the_requested_rows() {
 }
 
 #[test]
+fn get_null_sheet_name_continues_to_next_chunk() {
+    let fx = Fixture::new("null-sheet");
+    let path = "/home/x/docs/old.xlsx";
+    fx.add(
+        false, "docs", path, "old", "xlsx", "sheet", 1, 1, None, "one",
+    );
+    fx.add(
+        false, "docs", path, "old", "xlsx", "sheet", 2, 2, None, "two",
+    );
+    fx.add(
+        false,
+        "docs",
+        path,
+        "old",
+        "xlsx",
+        "sheet",
+        1,
+        1,
+        Some("S"),
+        "other",
+    );
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path, "end": 2}));
+    assert_eq!(body(g["text"].as_str().unwrap()), "one\ntwo\n");
+    assert!(g["next"].is_null());
+}
+
+#[test]
+fn get_pages_into_an_unnamed_sheet_after_a_named_one() {
+    let fx = Fixture::new("null-sheet-paging");
+    let path = "/home/x/docs/mixed.xlsx";
+    let (x, y) = ("x".repeat(15_000), "y".repeat(15_000));
+    fx.add(
+        false,
+        "docs",
+        path,
+        "m",
+        "xlsx",
+        "sheet",
+        1,
+        1,
+        Some("A"),
+        "named",
+    );
+    fx.add(false, "docs", path, "m", "xlsx", "sheet", 1, 1, None, &x);
+    fx.add(false, "docs", path, "m", "xlsx", "sheet", 2, 2, None, &y);
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path}));
+    assert_eq!(body(g["text"].as_str().unwrap()), format!("named\n{x}\n"));
+    assert_eq!(g["next"], json!({"start": 2, "sheet": ""}));
+    let g = s.ok("get", json!({"path": path, "start": 2, "sheet": ""}));
+    assert_eq!(body(g["text"].as_str().unwrap()), format!("{y}\n"));
+    assert!(g["next"].is_null());
+}
+
+#[test]
+fn get_sparse_csv_row_after_chunking() {
+    let fx = Fixture::new("sparse-csv");
+    let path = "/home/x/docs/sparse.csv";
+    let extracted = llm_index::extract::extract(
+        "sparse.csv",
+        llm_index::extract::FileType::Csv,
+        b"one\n,\nthree\n",
+        &llm_index::config::Limits::default(),
+    )
+    .unwrap();
+    let chunks = llm_index::chunk::chunk(
+        &extracted.segments,
+        extracted.file_type,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    for c in chunks {
+        fx.add(
+            false,
+            "docs",
+            path,
+            "sparse",
+            "csv",
+            "sheet",
+            c.start as i64,
+            c.end as i64,
+            c.heading_or_symbol.as_deref(),
+            &c.text,
+        );
+    }
+    let mut s = fx.session("public");
+    let g = s.ok(
+        "get",
+        json!({"path": path, "sheet": "sparse.csv", "start": 3, "end": 3}),
+    );
+    assert_eq!(body(g["text"].as_str().unwrap()), "three\n");
+}
+
+#[test]
+fn get_joins_split_sheet_row_before_paging() {
+    let fx = Fixture::new("split-row");
+    let path = "/home/x/docs/split.csv";
+    let row = "x".repeat(45_000);
+    let extracted = llm_index::extract::extract(
+        "split.csv",
+        llm_index::extract::FileType::Csv,
+        row.as_bytes(),
+        &llm_index::config::Limits::default(),
+    )
+    .unwrap();
+    let chunks = llm_index::chunk::chunk(
+        &extracted.segments,
+        extracted.file_type,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(chunks.len() > 1);
+    for c in chunks {
+        fx.add(
+            false,
+            "docs",
+            path,
+            "split",
+            "csv",
+            "sheet",
+            c.start as i64,
+            c.end as i64,
+            c.heading_or_symbol.as_deref(),
+            &c.text,
+        );
+    }
+    let mut s = fx.session("public");
+    let (all, nexts) = drain(&mut s, json!({"path": path, "sheet": "split.csv"}));
+    assert_eq!(all.trim_end_matches('\n'), row);
+    assert_eq!(nexts[0]["offset"], 20_000);
+}
+
+#[test]
+fn get_pages_across_sheets_and_uses_escaped_sheet_cursors() {
+    let fx = Fixture::new("sheet-cursors");
+    let path = "/home/x/docs/three.xlsx";
+    let mut expected = String::new();
+    for sheet in ["<x", "&lt;x", "Z"] {
+        let rows: String = (1..=250)
+            .map(|i| format!("{sheet}-{i:03}-{}\n", "a".repeat(80)))
+            .collect();
+        expected.push_str(&rows);
+        fx.add(
+            false,
+            "docs",
+            path,
+            "three",
+            "xlsx",
+            "sheet",
+            1,
+            250,
+            Some(sheet),
+            rows.trim_end(),
+        );
+    }
+    let mut s = fx.session("public");
+    let (all, nexts) = drain(&mut s, json!({"path": path}));
+    assert_eq!(all, expected);
+    assert!(nexts.iter().any(|n| n["sheet"] == "&lt;x"));
+    assert!(nexts.iter().any(|n| n["sheet"] == "&amp;lt;x"));
+    let bounded = s.ok(
+        "get",
+        json!({"path": path, "sheet": "&lt;x", "start": 249, "end": 250}),
+    );
+    assert_eq!(
+        body(bounded["text"].as_str().unwrap()),
+        expected
+            .lines()
+            .skip(248)
+            .take(2)
+            .map(|s| format!("{s}\n"))
+            .collect::<String>()
+    );
+    assert!(bounded["next"].is_null());
+    let later = s.ok("get", json!({"path": path, "sheet": "&lt;x", "start": 999}));
+    assert!(body(later["text"].as_str().unwrap()).starts_with("&lt;x-001"));
+}
+
+#[test]
+fn get_merges_split_pdf_pages_and_rejects_oversized_start() {
+    let fx = Fixture::new("split-page");
+    let path = "/home/x/docs/split.pdf";
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 1, 1, None, "first",
+    );
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 1, 1, None, "second",
+    );
+    fx.add(
+        false, "docs", path, "split", "pdf", "page", 2, 2, None, "third",
+    );
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path, "start": 1, "end": 1}));
+    assert_eq!(body(g["text"].as_str().unwrap()), "first\n\nsecond\n");
+    assert!(
+        s.call("get", json!({"path": path, "start": i64::MAX as u64 + 1}))
+            .0
+    );
+}
+
+#[test]
+fn search_and_recent_bound_stored_titles() {
+    let fx = Fixture::new("long-title");
+    let title = format!("needle {}", "z".repeat(10_000));
+    fx.add(
+        false,
+        "docs",
+        "/home/x/docs/title.md",
+        &title,
+        "markdown",
+        "section",
+        1,
+        1,
+        None,
+        "needle body",
+    );
+    let mut s = fx.session("public");
+    let hit = s.ok("search", json!({"query": "needle", "mode": "words"}));
+    let title = hit["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == "/home/x/docs/title.md")
+        .unwrap()["title"]
+        .as_str()
+        .unwrap();
+    assert_eq!(title.chars().count(), 200);
+    let recent = s.ok("recent", json!({"days": 1}));
+    let title = recent["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == "/home/x/docs/title.md")
+        .unwrap()["title"]
+        .as_str()
+        .unwrap();
+    assert_eq!(title.chars().count(), 200);
+}
+
+#[test]
 #[ignore = "needs the embedding model: set LLM_INDEX_MODEL_DIR at build time (the nix build does)"]
 fn meaning_and_hybrid_search() {
     assert_ne!(

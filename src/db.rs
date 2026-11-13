@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER NOT NU
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id, ord);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, tokenize='unicode61 remove_diacritics 2');
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(title, path, tokenize='unicode61 remove_diacritics 2');
-CREATE TABLE IF NOT EXISTS embed_cache(input_blake3 BLOB PRIMARY KEY, vector BLOB);
 CREATE TABLE IF NOT EXISTS validated(path_blake3 BLOB PRIMARY KEY, config_error INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta(model_rev TEXT, schema_version INTEGER);
 ";
@@ -52,9 +51,11 @@ fn open(path: &Path, mode: Mode, private: bool) -> Res<Connection> {
             .mode(0o600)
             .open(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::default())?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "journal_size_limit", 67_108_864)?; // WAL shrinks back after big writes
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch("DROP TABLE IF EXISTS embed_cache")?; // vectors now live in chunks
         if private {
             conn.execute_batch(PRIVATE_ONLY)?;
         }
