@@ -116,7 +116,12 @@ Result:
 | `passage` | Up to 800 characters of text, wrapped (see below). |
 
 Which of `lines`, `symbol`, `heading`, `page`, `rows`, `sheet` appear depends
-on the kind of passage. If the embedding model cannot be loaded, `meaning`
+on the kind of passage. `title`, `symbol`, `heading` and `sheet` in `search`
+(and `title` in `recent`) are shortened to at most 200 characters; a cut
+`sheet` label is not a valid `get` argument (use `next.sheet` or omit
+`sheet`). On the private server, word hits are ranked per database
+(`public.db` and `private.db` each rank their own matches, and the two lists
+are merged by rank). If the embedding model cannot be loaded, `meaning`
 mode fails with `meaning search unavailable`; `hybrid` falls back to words.
 
 ### `get`
@@ -128,8 +133,8 @@ else).
 | --- | --- | --- | --- |
 | `path` | string, required | | Absolute path of an indexed file, as returned by `search`. A relative path is an error: `path must be absolute`. |
 | `start` | integer | 1 | First page, row or line. |
-| `end` | integer | the end | Last page, row or line. |
-| `sheet` | string | all sheets | Sheet name. Spreadsheets only. |
+| `end` | integer | the end | Last page, row or line. On a spreadsheet, bounds only the starting sheet and stops at its end. |
+| `sheet` | string | first sheet | Spreadsheets only: the sheet where reading starts (in escaped form, as in `next.sheet`), continuing through later sheets unless `end` is set. |
 | `offset` | integer | 0 | Character offset inside the first unit. Pass the `offset` of a previous `next`. |
 
 A call returns at most 20,000 characters of file text. The `text` field can be
@@ -242,13 +247,25 @@ and any other extension.
 
 A file is skipped when:
 
-- its content does not match its extension (for example a `.pdf` that is not a PDF);
-- it looks binary (a NUL byte in the first 8 KiB, or not valid UTF-8, for text types);
-- a text, CSV or code file is generated (`@generated`, or `Code generated` … `DO NOT EDIT` in the first 4 KiB);
-- a `.js`, `.css`, `.json` or `.map` file looks minified (mean line length over 250);
-- it matches the built-in denylist (secrets, keys, browser and agent
-  profiles; see [security](security.md)), a configured `exclude.paths` entry,
-  or lies under the state directory;
+- its content does not match its extension (for example a `.pdf` that is not a
+  PDF);
+- it looks binary (a NUL byte in the first 8 KiB, or not valid UTF-8, for text
+  types);
+- a text, CSV or code file is generated (`@generated`, or `Code generated` …
+  `DO NOT EDIT` in the first 4 KiB);
+- a `.js`, `.css`, `.json` or `.map` file looks minified (mean line length over
+  250);
+- it is a lockfile (`Cargo.lock`, `package-lock.json`, `yarn.lock`,
+  `pnpm-lock.yaml`, `flake.lock`, `poetry.lock`, `Pipfile.lock`,
+  `composer.lock`, `Gemfile.lock`, `go.sum`, `uv.lock`);
+- it is inside a skipped directory: one named `.git`, `node_modules`,
+  `.venv`, `venv`, `__pycache__`, `.direnv`, `vendor`, `target` or
+  `third_party`, one whose name starts with `result` (`result*`), or one
+  that contains a regular `CACHEDIR.TAG` file;
+- it matches an ignore file (`.gitignore`, `.ignore`, `.llmindexignore`,
+  `.git/info/exclude`, or the global git ignore), the built-in denylist
+  (secrets, keys, browser and agent profiles; see [security](security.md)), a
+  configured `exclude.paths` entry, or lies under the state directory;
 - it is a symlink, or lies across a mount boundary;
 - it exceeds a limit.
 
@@ -259,14 +276,15 @@ see [installation](installation.md)).
 
 | Limit | Default | Effect |
 | --- | --- | --- |
-| `maxFileMb` | 50 | Larger files are skipped. |
+| `maxFileMb` | 50 | Must be positive (at least 1). Larger files are skipped. |
 | `maxTextBytes` | 33554432 (32 MiB) | Extracted text above this fails the file. |
 | `maxCells` | 2000000 | `.xlsx`, `.ods` and `.xls` workbooks above this many cells, counted across the workbook, fail. For `.ods` and `.xls`, calamine loads every sheet when it opens the file, so that allocation happens before the check; it is bounded by the 20 MiB file cap and the worker's 4 GiB address-space limit. |
 
 Fixed limits in the extractors, which `maxFileMb` does not lift: PDFs over 5000
-pages are rejected; `.xls` and `.ods` files over 20 MiB are rejected; zip-based formats (`.docx`, `.odt`,
-`.xlsx`, `.ods`) are rejected when they decompress to more than 500 MiB or
-more than 100 times their size, and any XML member over 64 MiB fails.
+pages are rejected; `.xls` and `.ods` files over 20 MiB are rejected; zip-based
+formats (`.docx`, `.odt`, `.xlsx`, `.ods`) are rejected when they decompress to
+more than 500 MiB or more than 100 times their size, and any XML member over
+64 MiB fails.
 
 A parser failure or timeout fails only that file, with no retry. If an extract
 worker dies (crash or out of memory) while other work ran beside it, the file is

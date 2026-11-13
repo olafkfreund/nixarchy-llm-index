@@ -93,7 +93,7 @@ Run `llm-index status` and read the state and reason.
 | `config_error`, `root path is not a directory` | The path is a file or does not resolve to a directory. | Fix `path`. |
 | `config_error`, `landlock unavailable` | See "Landlock" above. | |
 | `offline`, an OS error or a stall reason | The path is missing or the share stopped answering. | Mount the share; check the path. Retried after 60 s, then at doubling intervals up to `limits.backoffMax`. |
-| `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted). | Mount the right share, or fix `share`. If the path changed, rename the root or set `share`; the message can still mean the wrong mount. |
+| `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted), or an older version left the root with indexed files and no recorded mount identity after an incomplete first scan. | Mount the right share, or fix `share`. If the path changed, or if the root is stuck from an incomplete first scan, set `share` for the root or rename the root; the message can still mean the wrong mount. |
 | `degraded`, `ENOSPC` | The inotify watch limit is reached. The root is polled every two minutes instead. | Raise `fs.inotify.max_user_watches`. |
 | `degraded`, `IN_Q_OVERFLOW` | The inotify event queue overflowed. Polled every two minutes. | Raise `fs.inotify.max_queued_events`. |
 | `degraded`, `watcher exited`, `watch setup stalled`, `watch degraded` or another OS error text | The watcher failed or stalled. Polled every two minutes. | Read the log. |
@@ -106,10 +106,11 @@ A `config_error` root hides its files from search until fixed. `offline` and
 Public server only. It is its one answer for any config or validation problem:
 the config is missing or invalid, a root is in `config_error`, or a root or
 exclusion path has not yet been validated.
-If it persists, run `llm-index status` as the owner: the private view shows root states and
-reasons, including `config error:` lines. The private MCP server has no
-validation gate, so a pending validation gives normal results there; it returns
-the real message only for config-load and database-open failures.
+If it persists, run `llm-index status` as the owner: the private view shows
+root states and reasons, including `config error:` lines. The private MCP
+server has no validation gate, so a pending validation gives normal results
+there; it returns the real message only for config-load and database-open
+failures.
 
 ## A file is not found
 

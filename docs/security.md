@@ -50,18 +50,22 @@ it), `TasksMax`, low CPU and idle I/O priority. The NixOS unit also sets
 Before each start the unit runs `llm-index index --self-test`, which checks
 that a worker cannot write in its root, can read its root, cannot read one file
 outside it (the config file), has the right `oom_score_adj`, and, where the
-kernel can restrict TCP, cannot open TCP (the TCP probe is skipped otherwise). If Landlock is
-missing, the service refuses to start.
+kernel can restrict TCP, cannot open TCP (the TCP probe is skipped otherwise).
+If Landlock is missing, the service refuses to start.
 
 ## Which files are read
 
 - **Built-in denylist.** Matched case-insensitively against the absolute path.
   It covers dotenv files (`.env*`), keys and certificates (`*.pem`, `*.key`,
   `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`, `*.kdbx`, `*.age`), credential
-  files (`.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`,
-  `.docker/config.json`, `.cargo/credentials*`), and these folders: `.ssh/`,
-  `.gnupg/`, `.password-store/`, `.aws/`, `.azure/`, `.kube/`,
-  `.config/gcloud/`, `.config/gh/`, `.config/sops/`, `.local/share/keyrings/`,
+  and secret files (`.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`,
+  `.docker/config.json`, `.cargo/credentials*`, `nix.conf`, `rclone.conf`,
+  `.config/containers/auth.json`, `credentials.tfrc.json`, `secrets.yaml`,
+  `secrets.yml`, `secrets.json`, `credentials.json`,
+  `service-account*.json`), and these folders: `.ssh/`, `.gnupg/`,
+  `.password-store/`, `.aws/`, `.azure/`, `.kube/`, `.config/gcloud/`,
+  `.config/gh/`, `.config/glab-cli/`, `.config/github-copilot/`,
+  `.config/sops/`, `.config/age/`, `.local/share/keyrings/`,
   agent profiles (`.claude/`, `.codex/`, `.gemini/`, `.antigravity/`,
   `.config/Antigravity/`), browser profiles (`.mozilla/`, `.thunderbird/`,
   Chrome, Chromium, Brave, Vivaldi), and `/run/`, `/proc/`, `/sys/`.
@@ -99,8 +103,11 @@ risk but cannot remove it.
 
 - **Parser bugs.** Parsers run on hostile input. A crash is contained to one
   file and one sandboxed process, not prevented.
-- **Anyone with your account.** The databases are readable by the user the
-  service runs as, and by root. File permissions are the only barrier.
+- **Anyone with your account, including a local agent with a shell.** The
+  databases are readable by the user the service runs as, and by root; file
+  permissions are the only barrier. The tier split guards what an MCP client
+  can ask the server, not an agent running as the owner with shell access
+  (which can run `llm-index mcp --tier private` or read your files directly).
 - **Paths are returned as stored, but unsafe names are never indexed.** A
   file or directory whose name has a control character, an invisible or
   bidirectional Unicode character (the set stripped from content), or bytes
