@@ -344,6 +344,26 @@ Files: `src/deny.rs`, `docs/`.
   `a_share_mounted_later_is_scanned_at_once`, which fails without it). The
   VM test prints status and the journal when that stage fails.
 
+- Step 3: sheet names are sanitized (invisible characters stripped) before
+  the 1000-character cut and the `#N` de-duplication, so stored names stay
+  clean and unique; they are not otherwise normalised. CSV sheet names are
+  sanitized the same way.
+- Final reviews (Opus, Codex, agy) found defects the plan's own rules
+  produced or left open; fixed in two follow-up commits, each with tests:
+  - an unconfirmed scan identity is discarded before any mismatch handling;
+  - transient and store failures requeue at the back, so one bad file no
+    longer blocks its root; a `changed` file's rescan waits `RETRY`;
+  - dispatch drains for a solo retry only while live workers can free the
+    share, and refilters the solo queue after an identity eviction;
+  - durations are capped at 365 days and scheduler time arithmetic
+    saturates; the self-test socket uses a short `/proc/self/fd` path;
+  - `get` joins a row split into fragments, sheet chunks break at row
+    gaps, NULL sheet names page correctly, and a sheet cursor seeks by
+    `ord`; code symbols are cut when created; sheet names stay within 1000
+    characters with their suffix.
+  - Not done: a `scan()`-level test for the early return when the root's
+    mount id cannot be read (the helper is unit-tested).
+
 ## Tests
 
 - Every step's check passes in its worktree, then on the branch after each
