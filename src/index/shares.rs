@@ -125,9 +125,9 @@ impl ShareBook {
         e.backoff = if e.backoff.is_zero() {
             FIRST_BACKOFF.min(max)
         } else {
-            (e.backoff * 2).min(max)
+            e.backoff.saturating_mul(2).min(max)
         };
-        e.not_before = now + e.backoff;
+        e.not_before = now.saturating_add(e.backoff);
     }
     pub fn healthy(&mut self, share: &Share) {
         if let Some(e) = self.map.get_mut(share) {
@@ -193,5 +193,14 @@ mod tests {
         assert!(!book.free(&s, Duration::from_secs(10_000)));
         book.release(1);
         assert!(book.free(&s, Duration::ZERO));
+    }
+
+    #[test]
+    fn backoff_saturates_duration_arithmetic() {
+        let s = share("/m", "s");
+        let mut book = ShareBook::default();
+        book.offline(&s, Duration::MAX, Duration::MAX);
+        book.offline(&s, Duration::MAX, Duration::MAX);
+        assert!(book.free(&s, Duration::MAX));
     }
 }

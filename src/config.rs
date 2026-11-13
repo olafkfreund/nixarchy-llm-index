@@ -144,7 +144,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         _ => return Err(bad()),
     };
     match n.checked_mul(mult) {
-        Some(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        Some(secs) if (1..=365 * 86400).contains(&secs) => Ok(Duration::from_secs(secs)),
         _ => Err(bad()),
     }
 }
@@ -253,7 +253,16 @@ mod tests {
     #[test]
     fn durations_and_limits_are_validated() {
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
-        for bad in ["5µ", "0s", "", "s", "99999999999999999d", "1\u{202e}"] {
+        assert_eq!(parse_duration("365d"), Ok(Duration::from_secs(365 * 86400)));
+        for bad in [
+            "5µ",
+            "0s",
+            "",
+            "s",
+            "366d",
+            "99999999999999999d",
+            "1\u{202e}",
+        ] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }
         assert!(

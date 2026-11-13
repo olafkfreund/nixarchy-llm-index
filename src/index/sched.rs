@@ -106,6 +106,14 @@ impl RootRt {
             self.queue.push_front(rel);
         }
     }
+
+    /// Transient and store failures yield to files already waiting.
+    fn requeue_back(&mut self, rel: String, size: u64, mtime: i64) {
+        if let Slot::Vacant(v) = self.queued.entry(rel.clone()) {
+            v.insert((size, mtime));
+            self.queue.push_back(rel);
+        }
+    }
 }
 
 pub struct Sched<S, K> {
@@ -313,7 +321,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if matches!(r.busy, Some((_, Role::Scan))) {
             r.rescan = true;
         } else {
-            r.scan_due = r.scan_due.min(now + delay);
+            r.scan_due = r.scan_due.min(now.saturating_add(delay));
         }
     }
 
@@ -325,7 +333,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             next
         };
         r.rescan = false;
-        r.scan_due = now + d;
+        r.scan_due = now.saturating_add(d);
     }
 
     fn interval_for(&self, i: usize) -> Duration {
@@ -409,12 +417,12 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 if let Some(job) = take_job(w, &relpath) {
                     if reason == "changed" {
                         // the file moved under the worker: keep the row, a scan finds the new state
-                        self.request_scan(i, now, Duration::ZERO);
+                        self.request_scan(i, now, RETRY);
                     } else if transient(&reason) {
                         // keep the indexed row; try again later, not in a tight loop
                         let r = &mut self.roots[i];
                         r.hold = now + RETRY;
-                        r.requeue(job.rel, job.size, job.mtime);
+                        r.requeue_back(job.rel, job.size, job.mtime);
                     } else {
                         self.fail(i, &job, &reason, now);
                     }
@@ -513,7 +521,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             eprintln!("sched: store error on {}: {error}", r.spec.name);
         }
         r.hold = now + RETRY;
-        r.requeue(job.rel.clone(), job.size, job.mtime);
+        r.requeue_back(job.rel.clone(), job.size, job.mtime);
     }
 
     /// Feed the extract worker its next file, or let it exit.
@@ -627,6 +635,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         let i = w.root;
         self.shutdown(id, now);
         let name = self.roots[i].spec.name.clone();
+        // An identity the worker could not confirm is unknown, not a mismatch.
+        if before.is_none() || after.is_none() {
+            self.scan_finished(i, now, RETRY);
+            return;
+        }
         let changed = matches!((&before, &after), (Some(b), Some(a)) if b != a);
         let v = before.as_ref().map(|b| {
             let r = &self.roots[i];
@@ -643,8 +656,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.scan_finished(i, now, RETRY);
             return;
         }
-        // an identity the worker could not confirm is unknown, not a mismatch: discard, no state change
-        if v == Some(Verdict::Probe) || before.is_none() || after.is_none() {
+        if v == Some(Verdict::Probe) {
             self.scan_finished(i, now, RETRY);
             return;
         }
@@ -901,28 +913,31 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
         while let Some((i, rel, size, mtime)) = self.solo.front().cloned() {
             let (name, cur) = (&self.roots[i].spec.name, (size, mtime));
-            if (self.allow)(name, &rel)
-                && self.sink.known(name, &rel) != Some(cur)
-                && self.roots[i].failed.get(&rel) != Some(&cur)
+            if !(self.allow)(name, &rel)
+                || self.sink.known(name, &rel) == Some(cur)
+                || self.roots[i].failed.get(&rel) == Some(&cur)
             {
-                break;
+                self.solo.pop_front();
+                continue;
             }
-            self.solo.pop_front();
-        }
-        if let Some(&(i, ..)) = self.solo.front()
-            && now >= self.roots[i].hold
-        {
-            self.check_identity(i, now); // a mismatch drops the root's solo entries
+            if now >= self.roots[i].hold && self.check_identity(i, now) == Verdict::Mismatch {
+                continue; // the mismatch evicted this root; filter the new front too
+            }
+            break;
         }
         if let Some(&(i, ..)) = self.solo.front()
             && !self.solo_held(i, now)
         {
             let share = self.roots[i].derived.share.clone();
-            if self.pool_live() == 0 && (!self.network(i) || self.shares.free(&share, now)) {
-                let (_, rel, size, mtime) = self.solo.pop_front().expect("front");
-                self.start(i, Role::Extract, Some((rel, size, mtime)), now);
+            if self.pool_live() == 0 {
+                if !self.network(i) || self.shares.free(&share, now) {
+                    let (_, rel, size, mtime) = self.solo.pop_front().expect("front");
+                    self.start(i, Role::Extract, Some((rel, size, mtime)), now);
+                    return;
+                }
+            } else {
+                return; // drain while a live worker may release the share
             }
-            return; // drain: nothing else starts while a solo retry waits for the pool
         }
         let n = self.roots.len();
         for k in 0..n {
@@ -2226,6 +2241,19 @@ mod tests {
             assert!(s.sink.states.borrow().is_empty());
             assert_eq!(s.roots[0].scan_due, secs(1) + RETRY);
         }
+        let mut sink = Mem::default();
+        sink.expected.insert("r".into(), who.share);
+        let mut s = mem_sched(sink, Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        s.handle(id, entry("f"), secs(1));
+        s.handle(
+            id,
+            done_msg(true, Some(ident("/mnt/nas", "wrong:/a", "nfs", 2)), None),
+            secs(1),
+        );
+        assert!(s.sink.states.borrow().is_empty());
+        assert!(s.sink.scans.is_empty());
     }
 
     #[test]
@@ -2269,7 +2297,7 @@ mod tests {
 
     #[test]
     fn transient_failure_holds_the_root_before_the_next_file_is_sent() {
-        let (mut s, e) = extracting(&[("f", 10, 5), ("g", 10, 5)]);
+        let (mut s, e) = extracting(&[("f", 10, 5), ("g", 10, 5), ("h", 10, 5)]);
         s.handle(e, failed_msg("f", "EIO"), secs(2));
         assert_eq!(extracts(&s).len(), 1, "g must not follow within RETRY");
         s.handle(e, Event::Exit, secs(2));
@@ -2277,6 +2305,27 @@ mod tests {
         assert_eq!(extracts(&s).len(), 1);
         s.tick(secs(70));
         assert_eq!(extracts(&s).len(), 2);
+        assert!(extracts(&s)[1].1.contains("\"g\""));
+    }
+
+    #[test]
+    fn scan_deadline_saturates_at_duration_max() {
+        let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
+        s.scan_finished(0, Time::MAX, RETRY);
+        assert_eq!(s.roots[0].scan_due, Time::MAX);
+        s.request_scan(0, Time::MAX, RETRY);
+        assert_eq!(s.roots[0].scan_due, Time::MAX);
+    }
+
+    #[test]
+    fn store_error_yields_to_files_already_queued() {
+        let (mut s, e) = extracting(&[("f", 10, 5), ("g", 10, 5), ("h", 10, 5)]);
+        s.sink.store_err = true;
+        s.handle(e, extracted_msg("f"), secs(2));
+        s.handle(e, Event::Exit, secs(2));
+        s.sink.store_err = false;
+        s.tick(secs(70));
+        assert!(extracts(&s)[1].1.contains("\"g\""));
     }
 
     #[test]
@@ -2285,7 +2334,7 @@ mod tests {
         s.handle(e, failed_msg("f", "changed"), secs(2));
         assert!(s.sink.failed.is_empty() && s.roots[0].failed.is_empty());
         assert!(s.roots[0].queue.is_empty());
-        assert_eq!(s.roots[0].scan_due, secs(2));
+        assert_eq!(s.roots[0].scan_due, secs(2) + RETRY);
         // a network root too
         let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
         s.tick(secs(0));
@@ -2303,7 +2352,7 @@ mod tests {
         s.handle(e, failed_msg("f", "changed"), secs(2));
         assert!(s.sink.failed.is_empty() && s.roots[0].failed.is_empty());
         assert!(s.roots[0].queue.is_empty());
-        assert_eq!(s.roots[0].scan_due, secs(2));
+        assert_eq!(s.roots[0].scan_due, secs(2) + RETRY);
     }
 
     #[test]
@@ -2335,6 +2384,44 @@ mod tests {
             // held: worker e carries on with g; not held: the pool drains for the solo retry
             assert_eq!(extracts(&s).len(), if held { 2 } else { 1 });
         }
+    }
+
+    #[test]
+    fn blocked_solo_share_does_not_stop_another_root() {
+        let mut s = sched(
+            2,
+            &[("a", "/mnt/a"), ("b", "/mnt/b"), ("c", "/local")],
+            &[ext4(1, "/"), nfs(2, "/mnt", "nas:/a")],
+        );
+        let share = s.roots[0].derived.share.clone();
+        s.roots[0].expected = Some(share.clone());
+        s.shares.charge(&share, 99);
+        let mut worker = new_worker(1, Role::Scan, true, secs(0));
+        worker.abandoned = true;
+        s.workers.insert(99, worker);
+        s.solo.push_back((0, "f".into(), 1, 1));
+        s.roots[2].scan_due = secs(0);
+        s.dispatch(secs(1));
+        assert!(scans(&s).iter().any(|(_, name)| name == "c"));
+    }
+
+    #[test]
+    fn solo_front_is_filtered_again_after_identity_eviction() {
+        let mut s = sched(
+            2,
+            &[("a", "/mnt/a"), ("b", "/mnt/b")],
+            &[ext4(1, "/"), ext4(2, "/mnt/a"), ext4(3, "/mnt/b")],
+        );
+        s.roots[0].expected = Some(ident("/mnt/a", "wrong", "ext4", 2).share);
+        s.roots[1].expected = Some(s.roots[1].derived.share.clone());
+        s.solo.push_back((0, "bad".into(), 1, 1));
+        s.solo.push_back((1, "excluded".into(), 1, 1));
+        s.solo.push_back((1, "allowed".into(), 1, 1));
+        s.allow = Box::new(|_, rel| rel != "excluded");
+        s.dispatch(secs(1));
+        let sent = extracts(&s);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1.contains("allowed"));
     }
 
     fn extracted_msg(rel: &str) -> Event {

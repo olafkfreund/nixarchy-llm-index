@@ -10,9 +10,10 @@ pub(crate) fn mtime_ns(sec: i64, nsec: i64) -> i64 {
 use std::cell::Cell;
 use std::error::Error;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -78,9 +79,19 @@ pub fn tcp_denied(e: &io::Error) -> bool {
 }
 
 /// `index --self-test` probe: the sandbox must hold for a worker on this host.
+fn selftest_socket_path(state_dir: &Path) -> Result<(std::fs::File, PathBuf), Box<dyn Error>> {
+    let dir = std::fs::File::open(state_dir)?;
+    let path = PathBuf::from(format!(
+        "/proc/self/fd/{}/selftest-{}.sock",
+        dir.as_raw_fd(),
+        std::process::id()
+    ));
+    Ok((dir, path))
+}
+
 fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
     let state_dir = crate::config::load(config)?.state_dir;
-    let socket_path = state_dir.join(format!("selftest-{}.sock", std::process::id()));
+    let (_dir, socket_path) = selftest_socket_path(&state_dir)?;
     let _pathname = UnixListener::bind(&socket_path)?;
     let abstract_addr = SocketAddr::from_abstract_name(
         format!("llm-index-selftest-{}", std::process::id()).as_bytes(),
@@ -216,6 +227,25 @@ mod tests {
     #[test]
     fn mtime_past_2262_saturates() {
         assert_eq!(mtime_ns(10_000_000_000, 1), i64::MAX);
+    }
+
+    #[test]
+    fn selftest_socket_works_under_a_long_state_dir() {
+        let dir = std::env::temp_dir()
+            .join(format!("llm-index-long-state-{}", std::process::id()))
+            .join("a".repeat(95));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            dir.join(format!("selftest-{}.sock", std::process::id()))
+                .as_os_str()
+                .len()
+                > 107
+        );
+        let (_fd, socket) = selftest_socket_path(&dir).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        UnixStream::connect(&socket).unwrap();
+        drop(listener);
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]

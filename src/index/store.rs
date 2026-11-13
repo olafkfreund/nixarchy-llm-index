@@ -1200,18 +1200,40 @@ mod tests {
 
     #[test]
     fn indexed_files_is_zero_or_one_and_stops_at_the_first_database() {
+        use rusqlite::functions::FunctionFlags;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let mut f = fx("indexed-exists");
-        let break_db = |f: &Fx, t: Tier| {
-            f.sink.conn(t).execute_batch("DROP TABLE files").unwrap();
-        };
         assert_eq!(f.sink.indexed_files("pub"), 0);
         f.sink.extracted("pub", extracted("a.txt", "a")).unwrap();
         f.sink.extracted("pub", extracted("b.txt", "b")).unwrap();
         assert_eq!(f.sink.indexed_files("pub"), 1); // a count, not 2
-        // the private database is not consulted once the public one answers yes
-        break_db(&f, Tier::Private);
+        // Querying this view calls observe(); the first database must short-circuit it.
+        let queries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&queries);
+        f.sink
+            .conn(Tier::Private)
+            .create_scalar_function("observe", 0, FunctionFlags::SQLITE_UTF8, move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok("pub")
+            })
+            .unwrap();
+        f.sink
+            .conn(Tier::Private)
+            .execute_batch(
+                "DROP TABLE files; CREATE VIEW files AS SELECT observe() AS root_id, 'ok' AS state",
+            )
+            .unwrap();
         assert_eq!(f.sink.indexed_files("pub"), 1);
+        assert_eq!(queries.load(Ordering::Relaxed), 0);
+        assert_eq!(f.sink.indexed_files("other"), 0);
+        assert!(queries.load(Ordering::Relaxed) > 0);
         // an error answers "some", so adoption stays conservative
+        f.sink
+            .conn(Tier::Private)
+            .execute_batch("DROP VIEW files")
+            .unwrap();
         assert_eq!(f.sink.indexed_files("other"), 1);
     }
 
