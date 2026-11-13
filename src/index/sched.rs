@@ -1468,7 +1468,10 @@ mod tests {
         s.tick(secs(0));
         s.tick(secs(30)); // mismatch: the root is held
         assert!(s.spawner.spawned.is_empty());
-        s.rederive(&mut mi(&[&ext4(1, "/"), &nfs(2, "/mnt/nas", "nas:/a")]), secs(31));
+        s.rederive(
+            &mut mi(&[&ext4(1, "/"), &nfs(2, "/mnt/nas", "nas:/a")]),
+            secs(31),
+        );
         s.tick(secs(31));
         assert!(
             s.spawner.spawned.iter().any(|w| w.1 == Role::Scan),

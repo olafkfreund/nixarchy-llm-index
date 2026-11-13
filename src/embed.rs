@@ -40,14 +40,6 @@ pub fn input(relpath: &str, symbol_or_heading: Option<&str>, text: &str) -> Stri
     format!("{relpath}\n{}\n{text}", symbol_or_heading.unwrap_or(""))
 }
 
-/// Embed-cache key: BLAKE3(model_rev ‖ full input).
-pub fn cache_key(input: &str) -> blake3::Hash {
-    let mut h = blake3::Hasher::new();
-    h.update(MODEL_REV.as_bytes());
-    h.update(input.as_bytes());
-    h.finalize()
-}
-
 /// Validate the safetensors header; returns (absolute data start, vocab). Every size and
 /// offset is checked arithmetic and must lie inside the file.
 fn parse_header(json: &serde_json::Value, n: u64, file_len: u64) -> Res<(u64, u64)> {
@@ -186,10 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_changes_with_path_prefix() {
-        let a = cache_key(&input("a/x.md", Some("H"), "text"));
-        let b = cache_key(&input("b/x.md", Some("H"), "text"));
-        assert_ne!(a, b);
+    fn input_format() {
         assert_eq!(input("p", None, "t"), "p\n\nt");
     }
 

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use super::{ExtractedFile, ScanResult, Sink};
 use crate::auth::{self, RootStates, Validated, path_hash};
@@ -58,7 +58,14 @@ pub struct DbSink {
     config: Config,
     #[cfg(test)]
     abort_after_first_commit: bool,
+    #[cfg(test)]
+    embed_calls: std::cell::Cell<usize>,
+    #[cfg(test)]
+    move_batches: std::cell::RefCell<Vec<usize>>,
 }
+
+/// Files moved between tiers per transaction pair.
+const MOVE_BATCH: usize = 256;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -225,12 +232,29 @@ impl DbSink {
             config: config::load(config_path)?,
             #[cfg(test)]
             abort_after_first_commit: false,
+            #[cfg(test)]
+            embed_calls: Default::default(),
+            #[cfg(test)]
+            move_batches: Default::default(),
         };
         for t in TIERS {
-            s.conn(t).execute(
+            let tx = s.conn(t).unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO meta SELECT ?1, 1 WHERE NOT EXISTS (SELECT 1 FROM meta)",
                 [embed::MODEL_REV],
             )?;
+            // A new model makes every stored vector wrong: drop them and re-extract files.
+            let stale: bool = tx.query_row(
+                "SELECT coalesce(model_rev <> ?1, 0) FROM meta",
+                [embed::MODEL_REV],
+                |r| r.get(0),
+            )?;
+            if stale {
+                tx.execute("UPDATE chunks SET vec = NULL", [])?;
+                tx.execute("UPDATE files SET size = -1 WHERE state = 'ok'", [])?;
+                tx.execute("UPDATE meta SET model_rev = ?1", [embed::MODEL_REV])?;
+            }
+            tx.commit()?;
         }
         s.sync_roots()?;
         s.purge()?;
@@ -456,47 +480,35 @@ impl DbSink {
     /// One transaction per database; the source delete commits before the destination insert,
     /// so a crash in between loses a row (re-indexed later) and never leaves a copy behind.
     fn move_tier(&self, from: Tier, to: Tier, ids: &[i64]) -> Res<()> {
-        let rows = ids
-            .iter()
-            .map(|id| read_file(self.conn(from), *id))
-            .collect::<Res<Vec<_>>>()?;
-        let tx = self.conn(from).unchecked_transaction()?;
-        delete_files(&tx, ids)?;
-        tx.commit()?;
-        #[cfg(test)]
-        if self.abort_after_first_commit {
-            return Err("simulated crash after the first commit".into());
+        for batch in ids.chunks(MOVE_BATCH) {
+            #[cfg(test)]
+            self.move_batches.borrow_mut().push(batch.len());
+            let rows = batch
+                .iter()
+                .map(|id| read_file(self.conn(from), *id))
+                .collect::<Res<Vec<_>>>()?;
+            let tx = self.conn(from).unchecked_transaction()?;
+            delete_files(&tx, batch)?;
+            tx.commit()?;
+            #[cfg(test)]
+            if self.abort_after_first_commit {
+                return Err("simulated crash after the first commit".into());
+            }
+            let tx = self.conn(to).unchecked_transaction()?;
+            for (f, chunks) in &rows {
+                delete_files(&tx, &existing(&tx, &f.root_id, &f.relpath)?)?;
+                insert_file(&tx, f, chunks)?;
+            }
+            tx.commit()?;
         }
-        let tx = self.conn(to).unchecked_transaction()?;
-        for (f, chunks) in &rows {
-            delete_files(&tx, &existing(&tx, &f.root_id, &f.relpath)?)?;
-            insert_file(&tx, f, chunks)?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
-    fn vector(&self, c: &Connection, input: &str) -> Option<Vec<u8>> {
-        let key = embed::cache_key(input);
-        let hit = c
-            .query_row(
-                "SELECT vector FROM embed_cache WHERE input_blake3 = ?1",
-                [key.as_bytes().as_slice()],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if hit.is_some() {
-            return hit;
-        }
+    fn vector(&self, input: &str) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        self.embed_calls.set(self.embed_calls.get() + 1);
         let v = self.embedder.as_ref()?.embed(input).ok()??;
-        let bytes: Vec<u8> = v.iter().map(|x| *x as u8).collect();
-        let _ = c.execute(
-            "INSERT OR IGNORE INTO embed_cache VALUES(?1, ?2)",
-            params![key.as_bytes().as_slice(), bytes],
-        );
-        Some(bytes)
+        Some(v.iter().map(|x| *x as u8).collect())
     }
 
     fn store_file(
@@ -528,13 +540,33 @@ impl DbSink {
         };
         let c = self.conn(t);
         let tx = c.unchecked_transaction()?;
-        delete_files(&tx, &existing(&tx, root, rel)?)?;
+        let old = existing(&tx, root, rel)?;
+        // vectors of unchanged chunks survive an edit; only new text is embedded
+        let mut kept: std::collections::HashMap<(Option<String>, String), Vec<u8>> =
+            Default::default();
+        for id in &old {
+            let mut stmt = tx.prepare(
+                "SELECT heading_or_symbol, text, vec FROM chunks WHERE file_id = ?1 AND vec IS NOT NULL",
+            )?;
+            for r in stmt.query_map([id], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))? {
+                let (k, v) = r?;
+                kept.insert(k, v);
+            }
+        }
+        delete_files(&tx, &old)?;
         let rows: Vec<ChunkRow> = chunks
             .into_iter()
             .map(|ch| {
-                let input = embed::input(rel, ch.heading_or_symbol.as_deref(), &ch.text);
+                let key = (ch.heading_or_symbol.clone(), ch.text.clone());
+                let vec = kept.get(&key).cloned().or_else(|| {
+                    self.vector(&embed::input(
+                        rel,
+                        ch.heading_or_symbol.as_deref(),
+                        &ch.text,
+                    ))
+                });
                 ChunkRow {
-                    vec: self.vector(&tx, &input),
+                    vec,
                     ord: ch.ord as i64,
                     kind: ch.kind,
                     start: ch.start as i64,
@@ -1372,5 +1404,126 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn model_revision_change_resets_vectors_and_sizes_not_mtime() {
+        let mut f = fx("modelrev");
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
+        for t in TIERS {
+            f.sink
+                .conn(t)
+                .execute("UPDATE meta SET model_rev = 'old'", [])
+                .unwrap();
+        }
+        f.sink
+            .conn(Tier::Public)
+            .execute("UPDATE chunks SET vec = zeroblob(512)", [])
+            .unwrap();
+        let dir = f.dir.join("state");
+        f.sink = DbSink::open_with(&dir, &f.cfg, None).unwrap();
+        let c = f.sink.conn(Tier::Public);
+        assert_eq!(
+            count(c, "SELECT count(*) FROM chunks WHERE vec IS NOT NULL"),
+            0
+        );
+        assert_eq!(count(c, "SELECT size FROM files"), -1);
+        assert_eq!(count(c, "SELECT mtime_ns FROM files"), 7);
+        let rev: String = c
+            .query_row("SELECT model_rev FROM meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rev, embed::MODEL_REV);
+    }
+
+    #[test]
+    fn embed_cache_table_is_gone_after_open() {
+        let mut f = fx("nocache");
+        let c = f.sink.conn(Tier::Public);
+        c.execute(
+            "CREATE TABLE embed_cache(input_blake3 BLOB PRIMARY KEY, vector BLOB)",
+            [],
+        )
+        .unwrap();
+        let dir = f.dir.join("state");
+        f.sink = DbSink::open_with(&dir, &f.cfg, None).unwrap();
+        for t in TIERS {
+            let q = "SELECT count(*) FROM sqlite_master WHERE name = 'embed_cache'";
+            assert_eq!(count(f.sink.conn(t), q), 0);
+        }
+    }
+
+    #[test]
+    fn unchanged_chunks_keep_their_vector_and_are_not_embedded() {
+        let mut f = fx("reuse");
+        let two = |second: &str| {
+            let mut ef = extracted("a.txt", "keep me");
+            ef.chunks.push(Chunk {
+                ord: 1,
+                text: second.into(),
+                ..ef.chunks[0].clone()
+            });
+            ef
+        };
+        f.sink.extracted("pub", two("second")).unwrap();
+        f.sink
+            .conn(Tier::Public)
+            .execute("UPDATE chunks SET vec = zeroblob(512)", [])
+            .unwrap();
+        f.sink.embed_calls.set(0);
+        f.sink.extracted("pub", two("changed")).unwrap();
+        assert_eq!(
+            f.sink.embed_calls.get(),
+            1,
+            "only the changed chunk is embedded"
+        );
+        let c = f.sink.conn(Tier::Public);
+        assert_eq!(
+            count(
+                c,
+                "SELECT count(*) FROM chunks WHERE text = 'keep me' AND length(vec) = 512"
+            ),
+            1
+        );
+    }
+
+    fn many(name: &str, n: usize) -> Fx {
+        let mut f = fx(name);
+        for i in 0..n {
+            f.sink
+                .extracted("moving", extracted(&format!("m{i}.txt"), "w"))
+                .unwrap();
+        }
+        assert_eq!(files(&f.sink, Tier::Public), n as i64);
+        fs::write(
+            &f.cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"pub\"\npath = \"/data/pub\"\ntier = \"public\"\n\
+                 [[root]]\nname = \"moving\"\npath = \"/data/pub/moving\"\ntier = \"private\"\n",
+                f.dir.join("state").display()
+            ),
+        )
+        .unwrap();
+        f.sink.embed_calls.set(0);
+        f
+    }
+
+    #[test]
+    fn tier_move_works_in_batches_of_256() {
+        let mut f = many("batches", 1000);
+        f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(*f.sink.move_batches.borrow(), vec![256, 256, 256, 232]);
+        assert_eq!(files(&f.sink, Tier::Public), 0);
+        assert_eq!(files(&f.sink, Tier::Private), 1000);
+    }
+
+    #[test]
+    fn tier_move_crash_after_first_batch_keeps_the_rest_in_the_source() {
+        let mut f = many("batchcrash", 1000);
+        f.sink.abort_after_first_commit = true;
+        assert!(f.sink.reload(&f.cfg).is_err());
+        assert_eq!(files(&f.sink, Tier::Public), 744);
+        assert_eq!(files(&f.sink, Tier::Private), 0);
     }
 }

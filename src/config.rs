@@ -256,7 +256,11 @@ mod tests {
         for bad in ["5µ", "0s", "", "s", "99999999999999999d", "1\u{202e}"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }
-        assert!(!parse_duration("1\u{202e}").unwrap_err().contains('\u{202e}'));
+        assert!(
+            !parse_duration("1\u{202e}")
+                .unwrap_err()
+                .contains('\u{202e}')
+        );
         let base = |extra: &str| -> Config {
             toml::from_str(&format!(
                 "state_dir = \"/state\"\n{extra}[[root]]\nname = \"a\"\npath = \"/home/x\"\n"
