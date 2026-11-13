@@ -22,16 +22,13 @@ change; the plan gives the order and the tests.
   Adoption only needs a stable mount, so the `complete` condition was the
   bug.
 - Recovery for a root already stuck (`expected` NULL, no `share`, indexed
-  files > 0): `verdict` returns a new `Verdict::Confirm` instead of
-  `Mismatch` in exactly that case. `Confirm` allows a scan and refuses
-  extraction (without clearing the queue or setting `offline`). In
-  `scan_done`, a `Confirm` scan with a stable mount adopts the identity
-  only if at least one scanned file entry is already known to the sink
-  (`sink.known(name, rel).is_some()`). A missing mount shows an empty
-  directory, so nothing matches and the result is discarded with
-  `offline / identity mismatch`, as today. This keeps the protection the
-  verdict exists for (a restart over a missing mount must not delete
-  everything) while letting a real root recover with no owner action.
+  files > 0) stays manual, and this deviates from the intent's "recovers
+  on its own": without a recorded identity nothing on disk tells a real
+  root from an unmounted mount point, which can hold leftover files with
+  the same names, and adopting it would let the next complete scan delete
+  the real rows. `docs/troubleshooting.md` gives the two fixes: set
+  `share` for the root (the verdict already adopts then), or rename the
+  root. No root on p620 is stuck.
 - `Mismatch` with a recorded identity is unchanged.
 
 **2. Transient retry** (`sched.rs` `Message::Failed` handler, `send_next`).
@@ -44,9 +41,13 @@ on a held root then exits after its current file, and the root waits
 ordered by chunk order, which is sheet order then row. `sheet` plus `start`
 become a cursor: output starts at the first unit of that sheet with row
 `>= start` and continues through later sheets. `end`, when given, bounds
-rows in the starting sheet and stops there. `next.sheet` is always the raw
-name, and `get` accepts either the raw or the escaped name (as `search`
-returns it). `docs/reference.md` is updated to say `sheet` is where reading
+rows in the starting sheet and stops there. There is one encoding: the
+escaped name (`untrusted`, which is injective), the same form `search`
+returns in `sheet`. `next.sheet` is emitted escaped and `get` compares its
+`sheet` argument with the escaped stored name. A long name is matched in
+full, not as the 200-character label `search` displays; `search`'s
+`sheet` field is the label, and `docs/reference.md` says a cut label is not
+a valid `get` argument (use `next.sheet`, or omit `sheet`). `docs/reference.md` is updated to say `sheet` is where reading
 starts, not a filter. Alternative rejected below.
 
 **4. HTML slice** (`src/extract/html.rs` `skip_rawtext_element`). Compare
@@ -55,8 +56,9 @@ slicing remains in that function.
 
 **5. Vanished directory** (`src/worker/watch.rs` additions loop,
 `src/worker/scan.rs` `walk_subtree`). When opening the subtree root itself
-fails with an error `scan.rs` already treats as recoverable (`ENOENT`,
-`ENOTDIR`, `EACCES`), `add_watches` skips that path and the watcher carries
+fails with `ENOENT`, `ENOTDIR` or `EACCES` (the first and last are what
+`scan.rs` `recoverable` already accepts; `ENOTDIR` covers a directory
+replaced by a file), `add_watches` skips that path and the watcher carries
 on. Other errors still degrade, as today.
 
 **6. Durations** (`src/index/mod.rs` `parse_duration`, `src/config.rs`
@@ -67,10 +69,13 @@ call it from `Config::validate` for `interval` and `backoff_max` of every
 root, so `check-config`, the self-test and `mcp` reject what the indexer
 would reject.
 
-**7. "changed" is transient** (`sched.rs` `transient`). Add `"changed"`.
-The good row stays and the file is retried after `RETRY` (item 2's hold).
-A file that is always being appended to keeps its last good row and is
-retried, rather than becoming a failed row.
+**7. "changed" keeps the good row** (`sched.rs` `Message::Failed`). A
+`"changed"` failure is not passed to `fail()`. The queued request, which
+carries the old size and mtime, is dropped, and the root's `scan_due` is
+set to `now` so the next scan (which respects `hold`) queues the file again
+with fresh metadata. On a watched root the watcher usually queues it first.
+This works for network roots, which have no watcher, and never retries a
+request whose metadata is known to be stale.
 
 **8. Solo retry** (`sched.rs` `send_next`, dispatch). Factor the
 `held` expression in dispatch into `fn solo_held(&self, i, now) -> bool`.
@@ -99,17 +104,27 @@ to `ABI::V9` (landlock 0.4.7 supports it) and add
 UNIX socket is denied; the scopes deny abstract sockets and signals to
 processes outside the worker's domain. Compatibility stays `BestEffort` for
 these newer rights: on an older kernel the worker keeps today's protection.
+Minimum ABI is unchanged; the socket rule is enforced from ABI 9 and the
+scopes from ABI 6, and the worker logs which ones the kernel enforced.
 The existing hard checks (filesystem enforced, TCP bind/connect) are
 unchanged. The coordinator and `mcp` are not changed.
 
-**11. Labels** (`src/worker/extract.rs`, new `sanitize::label`). Before
-chunking, every title, heading, symbol and sheet name passes through
-`sanitize::label(s, 200)`: `sanitize`, then every control character
-(including `\n`, `\r`, `\t`) becomes a space, runs of spaces collapse, and
-the result is cut to 200 characters. Applied before `chunk::chunk`, so a
-huge heading is never copied into every chunk. `mcp.rs` also caps these
-fields with the same function on output, so rows already in the index are
-covered without a re-index.
+**11. Labels** (`src/worker/extract.rs`, `src/extract/sheet.rs`, new
+`sanitize::label`).
+
+- Before chunking, every title, heading and symbol passes through
+  `sanitize::label(s, 200)`: `sanitize`, then every control character
+  (including `\n`, `\r`, `\t`) becomes a space, runs of spaces collapse, and
+  the result is cut to 200 characters. Applied before `chunk::chunk`, so a
+  huge heading is never copied into every chunk.
+- Sheet names are an identity (item 3 uses them as the paging position), so
+  they are not normalised. `sheet.rs` cuts a name longer than 1000
+  characters and, if that makes two names in one workbook equal, appends
+  `#2`, `#3` and so on, so names stay unique.
+- `mcp.rs` applies `label(…, 200)` to `title`, `heading`, `symbol` and the
+  displayed `sheet` in `search` and `recent` hits, so rows already in the
+  index are covered without a re-index. `get`'s `next.sheet` is the paging
+  key (item 3), not a display field.
 
 **12. Control characters** (`src/sanitize.rs`). `sanitize` also removes C0
 controls except `\t` and `\n`, DEL, and all C1 controls (U+0080-U+009F),
@@ -140,24 +155,31 @@ are the existing ones. `docs/reference.md` lists them.
 **15. Tier move in batches** (`store.rs` `move_tier`). Process ids in
 batches of 256: read the batch, delete it from the source and commit, insert
 it into the destination and commit. A crash loses at most one batch, which
-is re-indexed, and never leaves a copy in both. Peak memory is one batch.
+is re-indexed, and never leaves a copy in both. Peak memory is the id list
+(8 bytes a file) plus one batch of rows.
 
 **16. Existence, not count** (`store.rs` `indexed_files`). Query
 `SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND state = 'ok')`
 per database and return 0 or 1. The verdict only tests zero.
 
 **17. Store errors** (`Sink::extracted`, `Sink::failed`, `sched.rs`). Both
-return `Result<(), String>`. On error the scheduler requeues the file, sets
-the root's `hold` (item 2 makes the worker stop), and logs once per hold.
-The writer connection sets `busy_timeout = 5000`.
+return `Result<(), String>`. Every failure path already goes through
+`fail()` (extract failure, worker death, timeout); `fail()` now calls
+`sink.failed` first and records `r.failed` only when that write succeeded.
+On any store error the scheduler requeues the file, sets the root's `hold`
+(item 2 makes the worker stop) and logs once per hold. The writer
+connection sets `busy_timeout = 5000`.
 
 **18. Quadratic paths.**
 
 - `queue_one`: `queued` becomes `HashMap<String, (u64, i64)>`, holding the
   latest size and mtime. A duplicate updates the map entry; `next_allowed`
   takes size and mtime from the map when it pops. No linear search.
-- `get`: in `lines` mode, the chunk query skips chunks that end before
-  `start` (`AND end >= ?2`), so later pages do not rebuild earlier lines.
+- `get`: the chunk query skips chunks that end before `start` (lines
+  mode) and the units are produced lazily from the row iterator; building
+  stops as soon as the output budget is used and `next` is known. Overlap
+  de-duplication (`last_line`) and the intra-unit `offset` keep working.
+  Each page then costs about one page of work.
 - Coordinator pipe (`src/index/mod.rs` reader): remember how far the buffer
   has been searched for a newline and search only the new bytes.
 
@@ -176,8 +198,15 @@ skipped directory names, the `result*` prefix, lockfiles and `CACHEDIR.TAG`.
 
 - **Item 1: never queue extracts from an incomplete first scan.** A root
   with one persistently failing subdirectory would then never be indexed.
-- **Item 1: auto-adopt any stuck root.** That is exactly what the verdict
-  guards against: a missing mount would be adopted and its rows deleted.
+- **Item 1: auto-adopt any stuck root,** or adopt one where a scanned
+  relpath is already known. An unmounted mount point can hold leftover
+  files with the same names, so both can adopt the wrong filesystem and
+  delete the real rows.
+- **Item 3: accept both raw and escaped sheet names.** Ambiguous: a sheet
+  named `<x` and one named `&lt;x` collide.
+- **Item 7: treat `changed` as transient.** The retry carries the stale
+  size and mtime, so it fails again every time and blocks the scan that
+  would refresh it.
 - **Item 3: a new `cursor` argument.** Changes the tool schema for clients;
   redefining `sheet` as the start point fixes the documented loop with no
   schema change.
@@ -194,11 +223,9 @@ skipped directory names, the `result*` prefix, lockfiles and `CACHEDIR.TAG`.
 
 ## Risks
 
-- **Item 1 `Confirm`:** a different share mounted at the path that happens
-  to contain one same-named file would be adopted. The same risk exists
-  today for a root with `share` unset and no files; it needs a matching
-  relpath, and a complete scan of the wrong share would then delete rows.
-  Accepted: the alternative is a root stuck forever.
+- **Item 1:** adopting on an incomplete but stable first scan has the same
+  exposure as today's adoption on a complete one (an empty root adopts
+  whatever is mounted). A root already stuck needs the owner to act.
 - **Item 9 model change** re-indexes everything once (about 24 minutes on
   p620). Only on a model bump; this change does not bump the model.
 - **Item 10** could deny something a parser needs. pdfium and the parsers
@@ -216,13 +243,21 @@ skipped directory names, the `result*` prefix, lockfiles and `CACHEDIR.TAG`.
 
 - `cargo test` and `cargo clippy -- -D warnings` pass. New tests, each
   failing on 84fc986:
-  - sched: incomplete first scan with a stable mount adopts; a stuck root
-    with a known file recovers; a stuck root over an empty directory stays
-    `offline`; a transient failure holds the root and does not resend
-    within `RETRY`; a held solo item does not stop other workers; a store
-    error requeues.
+  - sched: incomplete first scan with a stable mount adopts and indexing
+    continues; a stuck legacy root stays `offline`; a transient failure
+    holds the root and does not resend within `RETRY`; a `changed` failure
+    keeps the row, drops the request and makes a scan due (including on a
+    network root); a held solo item does not stop other workers; each of
+    `extracted` and `failed` failing requeues, and the retry succeeds.
   - mcp: a three-sheet workbook paged with a small budget returns every
-    row of every sheet exactly once; an escaped sheet name works.
+    row of every sheet exactly once; sheets named `<x` and `&lt;x` in one
+    workbook page correctly; paging a large text file does work
+    proportional to the page.
+  - sheet: two names equal after the 1000-character cut get unique names.
+  - sandbox: under the worker rules, connecting to a pathname socket
+    outside the root, connecting to an abstract socket and `kill(ppid, 0)`
+    are denied when the kernel's ABI supports them (the test reports and
+    skips otherwise); p620 (kernel 7.3) runs them.
   - html: `<script></aaaaaé</script>` does not panic.
   - config: `5µ`, `0s`, an overflowing number, and `max_file_mb = 0` are
     rejected.
