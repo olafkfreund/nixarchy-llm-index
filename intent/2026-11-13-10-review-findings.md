@@ -55,8 +55,8 @@ spot-checked the code.
    for up to `backoffMax` every file costs a new worker process.
 9. **Smaller correctness gaps** (traced): `max_file_mb = 0` means "skip
    every non-empty file" in scan and "unlimited" in extract; mtime
-   arithmetic overflows in scan and watch but saturates in extract; `meta.model_rev` is never read,
-   so a model change leaves old vectors.
+   arithmetic overflows in scan and watch but saturates in extract;
+   `meta.model_rev` is never read, so a model change leaves old vectors.
 
 ### Hardening
 
