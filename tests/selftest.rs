@@ -18,6 +18,10 @@ fn index_self_test_passes_on_this_host() {
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout);
     fs::remove_dir_all(&base).unwrap();
     assert!(out.status.success(), "{err}");
+    assert!(stdout.contains("pathname socket denied="), "{stdout}");
+    assert!(stdout.contains("abstract socket denied="), "{stdout}");
+    assert!(stdout.contains("parent signal denied="), "{stdout}");
 }

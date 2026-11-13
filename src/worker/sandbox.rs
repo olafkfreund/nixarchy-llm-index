@@ -5,7 +5,7 @@ use std::path::Path;
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -103,11 +103,12 @@ pub fn tcp_restriction_supported() -> bool {
 }
 
 fn restrict(role: &str, root_fd: Option<&OwnedFd>) -> Result<(), Box<dyn Error>> {
-    let abi = ABI::V6;
+    let abi = ABI::V9;
     let mut rules = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))?
         .handle_access(AccessNet::from_all(abi))?
+        .scope(Scope::from_all(abi))?
         .create()?;
     if role == "validate" {
         rules = rules.add_rule(PathBeneath::new(

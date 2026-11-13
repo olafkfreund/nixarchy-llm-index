@@ -545,6 +545,7 @@ fn self_test_in(config: &Config, dir: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+        print!("{stdout}");
     }
     let mut mountinfo = File::open("/proc/self/mountinfo")?;
     if derive(&mut mountinfo, &root).share.fstype == "unknown" {

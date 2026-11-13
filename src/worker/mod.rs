@@ -6,11 +6,14 @@ pub mod watch;
 use std::cell::Cell;
 use std::error::Error;
 use std::io::{self, Write};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::proto::{Job, Message};
+use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope};
 
 pub struct Output {
     writer: Mutex<io::Stdout>,
@@ -72,6 +75,18 @@ pub fn tcp_denied(e: &io::Error) -> bool {
 
 /// `index --self-test` probe: the sandbox must hold for a worker on this host.
 fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let state_dir = crate::config::load(config)?.state_dir;
+    let socket_path = state_dir.join(format!("selftest-{}.sock", std::process::id()));
+    let _pathname = UnixListener::bind(&socket_path)?;
+    let abstract_addr = SocketAddr::from_abstract_name(
+        format!("llm-index-selftest-{}", std::process::id()).as_bytes(),
+    )?;
+    let _abstract = UnixListener::bind_addr(&abstract_addr)?;
+    UnixStream::connect(&socket_path)?;
+    UnixStream::connect_addr(&abstract_addr)?;
+    let parent = rustix::process::getppid().ok_or("missing parent pid")?;
+    rustix::process::test_kill_process(parent)?;
+
     let ready = sandbox::start(config, role, root)?;
     let dir = &ready.config.roots[ready.root.ok_or("missing root")?].path;
     if std::fs::File::create(dir.join("selftest-probe")).is_ok() {
@@ -83,6 +98,49 @@ fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn
             && denied(std::net::TcpStream::connect("127.0.0.1:1").map(drop)))
     {
         return Err("worker can open TCP".into());
+    }
+    let pathname_supported = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::ResolveUnix)
+        .is_ok();
+    let scope_supported = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .scope(Scope::from_all(landlock::ABI::V6))
+        .is_ok();
+    let pathname_denied = UnixStream::connect(&socket_path)
+        .is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    let abstract_denied = UnixStream::connect_addr(&abstract_addr)
+        .is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    let signal_denied =
+        rustix::process::test_kill_process(parent).is_err_and(|e| e == rustix::io::Errno::PERM);
+    println!(
+        "pathname socket denied={pathname_denied}{}",
+        if pathname_supported {
+            ""
+        } else {
+            " (kernel ABI < 9; skipped)"
+        }
+    );
+    println!(
+        "abstract socket denied={abstract_denied}{}",
+        if scope_supported {
+            ""
+        } else {
+            " (kernel ABI < 6; skipped)"
+        }
+    );
+    println!(
+        "parent signal denied={signal_denied}{}",
+        if scope_supported {
+            ""
+        } else {
+            " (kernel ABI < 6; skipped)"
+        }
+    );
+    if (pathname_supported && !pathname_denied)
+        || (scope_supported && (!abstract_denied || !signal_denied))
+    {
+        return Err("worker sandbox isolation probe failed".into());
     }
     // The root stays readable, the config next to it (outside the root) does not.
     if std::fs::read(dir.join("fixture.txt")).is_err() {
