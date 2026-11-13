@@ -889,6 +889,34 @@ fn get_null_sheet_name_continues_to_next_chunk() {
 }
 
 #[test]
+fn get_pages_into_an_unnamed_sheet_after_a_named_one() {
+    let fx = Fixture::new("null-sheet-paging");
+    let path = "/home/x/docs/mixed.xlsx";
+    let (x, y) = ("x".repeat(15_000), "y".repeat(15_000));
+    fx.add(
+        false,
+        "docs",
+        path,
+        "m",
+        "xlsx",
+        "sheet",
+        1,
+        1,
+        Some("A"),
+        "named",
+    );
+    fx.add(false, "docs", path, "m", "xlsx", "sheet", 1, 1, None, &x);
+    fx.add(false, "docs", path, "m", "xlsx", "sheet", 2, 2, None, &y);
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path}));
+    assert_eq!(body(g["text"].as_str().unwrap()), format!("named\n{x}\n"));
+    assert_eq!(g["next"], json!({"start": 2, "sheet": ""}));
+    let g = s.ok("get", json!({"path": path, "start": 2, "sheet": ""}));
+    assert_eq!(body(g["text"].as_str().unwrap()), format!("{y}\n"));
+    assert!(g["next"].is_null());
+}
+
+#[test]
 fn get_sparse_csv_row_after_chunking() {
     let fx = Fixture::new("sparse-csv");
     let path = "/home/x/docs/sparse.csv";

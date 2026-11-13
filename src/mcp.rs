@@ -174,6 +174,14 @@ fn untrusted(s: &str) -> String {
     esc(&sanitize(s))
 }
 
+/// A stored sheet name as `get` cursors spell it: escaped, and "" for an unnamed sheet.
+fn sheet_key(stored: Option<&str>) -> String {
+    stored
+        .filter(|s| !s.is_empty())
+        .map(untrusted)
+        .unwrap_or_default()
+}
+
 fn head(s: &str, max: usize) -> &str {
     s.char_indices().nth(max).map_or(s, |(i, _)| &s[..i])
 }
@@ -442,7 +450,7 @@ impl Core {
                 if let Some((idx, (name, _))) = groups
                     .iter()
                     .enumerate()
-                    .find(|(_, (name, _))| name.as_deref().is_some_and(|s| untrusted(s) == wanted))
+                    .find(|(_, (name, _))| sheet_key(name.as_deref()) == wanted)
                 {
                     let ord: Option<i64> = conn.query_row("SELECT MIN(ord) FROM chunks WHERE file_id = ?1 AND heading_or_symbol IS ?2 AND end >= ?3", rusqlite::params![id, name, lo_i64], |r| r.get(0))?;
                     ord.or_else(|| groups.get(idx + 1).map(|g| g.1))
@@ -507,7 +515,9 @@ impl Core {
             true
         };
         let mut last_line = 0;
-        let mut first_sheet: Option<Option<String>> = a.sheet.clone().map(Some);
+        // an unnamed sheet (NULL or empty name, from older rows) is addressed as "" in a cursor
+        let mut first_sheet: Option<Option<String>> =
+            a.sheet.clone().map(|s| (!s.is_empty()).then_some(s));
         let mut page: Option<(u64, String)> = None;
         let mut sheet_row: Option<(u64, Option<String>, String)> = None;
         'chunks: while let Some(row) = rows.next()? {
@@ -517,7 +527,10 @@ impl Core {
                 work.set((rows + 1, units));
             });
             let start = row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64;
-            let name = row.get::<_, Option<String>>(1)?.map(|s| untrusted(&s));
+            let name = row
+                .get::<_, Option<String>>(1)?
+                .filter(|s| !s.is_empty())
+                .map(|s| untrusted(&s));
             let chunk = row.get::<_, Option<String>>(2)?.unwrap_or_default();
             match kind {
                 "pages" => {
@@ -561,7 +574,7 @@ impl Core {
                             continue;
                         }
                         if let Some((old_pos, old_name, body)) = sheet_row.take()
-                            && emit(old_pos, old_name.as_deref(), &body)
+                            && emit(old_pos, Some(old_name.as_deref().unwrap_or("")), &body)
                         {
                             break 'chunks;
                         }
@@ -592,7 +605,7 @@ impl Core {
             emit(pos, None, &body);
         }
         if let Some((pos, name, body)) = sheet_row {
-            emit(pos, name.as_deref(), &body);
+            emit(pos, Some(name.as_deref().unwrap_or("")), &body);
         }
         Ok(json!({
             "path": a.path, "unit": kind, "truncated": truncated, "next": next,

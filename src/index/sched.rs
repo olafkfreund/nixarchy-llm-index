@@ -416,8 +416,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             Message::Failed { relpath, reason } => {
                 if let Some(job) = take_job(w, &relpath) {
                     if reason == "changed" {
-                        // the file moved under the worker: keep the row, a scan finds the new state
-                        self.request_scan(i, now, RETRY);
+                        // the file moved under the worker: keep the row, a scan finds the new state,
+                        // but not sooner than RETRY, even if a scan was already due
+                        let r = &mut self.roots[i];
+                        if matches!(r.busy, Some((_, Role::Scan))) {
+                            r.rescan = true;
+                        } else {
+                            r.scan_due = now.saturating_add(RETRY);
+                        }
                     } else if transient(&reason) {
                         // keep the indexed row; try again later, not in a tight loop
                         let r = &mut self.roots[i];
@@ -2353,6 +2359,11 @@ mod tests {
         assert!(s.sink.failed.is_empty() && s.roots[0].failed.is_empty());
         assert!(s.roots[0].queue.is_empty());
         assert_eq!(s.roots[0].scan_due, secs(2) + RETRY);
+        // an overdue scan is pushed back too: a changing file never rescans at once
+        let (mut s, e) = extracting(&[("f", 10, 5)]);
+        s.roots[0].scan_due = secs(1);
+        s.handle(e, failed_msg("f", "changed"), secs(3));
+        assert_eq!(s.roots[0].scan_due, secs(3) + RETRY);
     }
 
     #[test]
