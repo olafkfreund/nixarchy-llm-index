@@ -35,7 +35,8 @@ it must be `NotDumpable`, else the self-test fails with `extract worker
 is dumpable`; for `scan` it must be `Dumpable`, else it fails with `scan
 worker is not dumpable` (the role split is deliberate). `rustix` 1.1.6,
 already locked, has `set_dumpable_behavior` and `dumpable_behavior`
-(`src/process/prctl.rs`). `self_test_in` already runs both probes. Print `dumpable=<bool>` with the other probe lines. The
+(`src/process/prctl.rs`). `self_test_in` already runs both probes. Print
+`dumpable=<bool>` with the other probe lines. The
 `index --self-test` output (`src/index/mod.rs` `self_test_in`, which
 prints the child's stdout) then shows it.
 
