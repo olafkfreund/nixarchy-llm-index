@@ -558,6 +558,8 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
             });
         }
     };
+    // Not tested: statx on a local directory fd does not fail without kernel or FUSE fault
+    // injection; NFS/FUSE can give ESTALE/EIO, which is why this branch exists.
     let fd_id = match root_mount_id(ready.root_fd.as_ref().ok_or("missing root fd")?) {
         Ok(id) => id,
         Err(error) => {
@@ -686,6 +688,84 @@ mod tests {
         assert_eq!(on_fd_mount(Some(id.clone()), Some(2)), Some(id.clone()));
         assert_eq!(on_fd_mount(Some(id.clone()), Some(1)), None);
         assert_eq!(on_fd_mount(Some(id), None), None);
+    }
+
+    #[test]
+    fn foreign_mount_identity_is_unknown() {
+        let Some(base) = std::env::var_os("LLM_INDEX_FOREIGN_BASE").map(PathBuf::from) else {
+            let base =
+                std::env::temp_dir().join(format!("llm-index-foreign-{}", std::process::id()));
+            std::fs::create_dir_all(base.join("root")).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::scan::tests::foreign_mount_identity_is_unknown",
+                    "--nocapture",
+                ])
+                .env("LLM_INDEX_FOREIGN_BASE", &base)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            std::fs::remove_dir_all(&base).unwrap();
+            assert!(out.status.success(), "{stderr}");
+            let done: serde_json::Value = serde_json::from_str(
+                stdout
+                    .lines()
+                    .find(|line| line.starts_with("{\"message\":\"ScanDone\""))
+                    .expect("ScanDone message"),
+            )
+            .unwrap();
+            assert_eq!(done["complete"], false);
+            assert!(done["identity_before"].is_null());
+            assert!(done["identity_after"].is_null());
+            return;
+        };
+        let cfg = base.join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"r\"\npath = \"{}\"\n",
+                base.join("state").display(),
+                base.join("root").display()
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(&cfg).unwrap();
+        let root_fd = openat2(
+            CWD,
+            &config.roots[0].path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        // A mount id that is never the root fd's: the line parses, but off the fd's mount.
+        let fake_id = root_mount_id(&root_fd).unwrap() + 1;
+        let info = base.join("mountinfo");
+        std::fs::write(
+            &info,
+            format!(
+                "{fake_id} 0 0:1 / {} rw - ext4 /dev/fake rw\n",
+                config.roots[0].path.display()
+            ),
+        )
+        .unwrap();
+        let mut mountinfo = File::open(&info).unwrap();
+        assert!(
+            mount_state(&mut mountinfo, &config.roots[0].path)
+                .unwrap()
+                .is_some()
+        );
+        let mut ready = Ready {
+            root: Some(0),
+            root_fd: Some(root_fd),
+            mountinfo,
+            global_ignore: Gitignore::empty(),
+            oom_score_adj: String::new(),
+            config,
+        };
+        scan(&mut ready, &Output::new()).unwrap();
     }
 
     #[test]
