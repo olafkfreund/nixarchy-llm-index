@@ -8,7 +8,9 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
-use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+use rustix::process::{
+    DumpableBehavior, Resource, Rlimit, getrlimit, set_dumpable_behavior, setrlimit,
+};
 
 use super::scan;
 use crate::config::{self, Config};
@@ -40,6 +42,9 @@ pub fn start(
             maximum: Some(0),
         },
     )?;
+    if role == "extract" {
+        set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
+    }
     let old = getrlimit(Resource::As);
     let limit = 4 * 1024 * 1024 * 1024;
     setrlimit(
