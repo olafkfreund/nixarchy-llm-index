@@ -103,6 +103,17 @@ fn selftest(config: &Path, role: &str, root: Option<&str>) -> Result<(), Box<dyn
     rustix::process::test_kill_process(parent)?;
 
     let ready = sandbox::start(config, role, root)?;
+    let dumpable = rustix::process::dumpable_behavior()?;
+    if role == "extract" && dumpable != rustix::process::DumpableBehavior::NotDumpable {
+        return Err("extract worker is dumpable".into());
+    }
+    if role == "scan" && dumpable != rustix::process::DumpableBehavior::Dumpable {
+        return Err("scan worker is not dumpable".into());
+    }
+    println!(
+        "dumpable={}",
+        dumpable == rustix::process::DumpableBehavior::Dumpable
+    );
     let dir = &ready.config.roots[ready.root.ok_or("missing root")?].path;
     if std::fs::File::create(dir.join("selftest-probe")).is_ok() {
         return Err("worker created a file in its root".into());
@@ -301,6 +312,63 @@ mod tests {
         );
         let output = Output::new();
         scan::scan(&mut ready, &output).unwrap();
+    }
+
+    #[test]
+    fn sandbox_dumpable_child() {
+        if std::env::var_os("LLM_INDEX_SANDBOX_CHILD").is_none() {
+            return;
+        }
+        let base = std::env::var("LLM_INDEX_TEST_BASE").unwrap();
+        let role = std::env::var("LLM_INDEX_TEST_ROLE").unwrap();
+        sandbox::start(&Path::new(&base).join("config.toml"), &role, Some("root")).unwrap();
+        println!(
+            "dumpable={:?}",
+            rustix::process::dumpable_behavior().unwrap()
+        );
+    }
+
+    #[test]
+    fn sandbox_dumpability_by_role() {
+        let base = std::env::temp_dir().join(format!("llm-index-dumpable-{}", std::process::id()));
+        fs::create_dir_all(base.join("root")).unwrap();
+        fs::write(
+            base.join("config.toml"),
+            format!(
+                "state_dir = \"/tmp/state\"\n[[root]]\nname = \"root\"\npath = \"{}\"\n",
+                base.join("root").display()
+            ),
+        )
+        .unwrap();
+        for (role, expected) in [
+            ("extract", "dumpable=NotDumpable"),
+            ("scan", "dumpable=Dumpable"),
+        ] {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::tests::sandbox_dumpable_child",
+                    "--nocapture",
+                ])
+                .env("LLM_INDEX_SANDBOX_CHILD", "1")
+                .env("LLM_INDEX_TEST_BASE", &base)
+                .env("LLM_INDEX_TEST_ROLE", role)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stdout)
+                    .lines()
+                    .any(|line| line == expected),
+                "{role}: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

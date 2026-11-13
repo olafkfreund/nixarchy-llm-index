@@ -24,4 +24,12 @@ fn index_self_test_passes_on_this_host() {
     assert!(stdout.contains("pathname socket denied="), "{stdout}");
     assert!(stdout.contains("abstract socket denied="), "{stdout}");
     assert!(stdout.contains("parent signal denied="), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line == "dumpable=false"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "dumpable=true"),
+        "{stdout}"
+    );
 }
