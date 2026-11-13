@@ -69,9 +69,9 @@ The flake exposes `homeManagerModules.default`, `nixosModules.default` and
 }
 ```
 
-The root path must be the real path with no symlink anywhere in it; check with
-`realpath ~/Source` and use what it prints. Apply it with your usual Home
-Manager switch. The unit starts at login.
+Root and exclusion paths must be real paths with no symlink anywhere in them;
+check with `realpath ~/Source` and use what it prints. Apply it with your
+usual Home Manager switch. The unit starts at login.
 
 With `registerPublic = true` (the default) the module sets
 `programs.mcp.servers.llm-index-public`. That helps only clients whose Home

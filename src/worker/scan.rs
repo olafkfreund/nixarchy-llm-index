@@ -765,6 +765,7 @@ mod tests {
             oom_score_adj: String::new(),
             config,
         };
+        println!(); // libtest may have written "test ... " without a newline
         scan(&mut ready, &Output::new()).unwrap();
     }
 

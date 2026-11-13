@@ -50,9 +50,9 @@ then:
 }
 ```
 
-The root path must be the real path with no symlink anywhere in it; check with
-`realpath ~/Source` and use what it prints. Apply it with your usual Home
-Manager switch.
+Root and exclusion paths must be real paths with no symlink anywhere in them;
+check with `realpath ~/Source` and use what it prints. Apply it with your
+usual Home Manager switch.
 
 ## Quick start: NixOS
 

@@ -122,6 +122,16 @@ Files: `README.md`, `docs/installation.md`, `docs/security.md`.
   and `dumpable=true`, both roots end `ok`, a public search from Claude,
   Codex and agy returns results.
 
+## Deviations recorded during implementation
+
+- Final review (agy): the two child-process tests matched whole stdout
+  lines, but with one test thread libtest writes `test <name> ... ` without
+  a newline first. Both children now print a newline before their output;
+  checked with `RUST_TEST_THREADS=1`.
+- The docs sentence covers exclusion paths too, which follow the same
+  no-symlink rule.
+- Cherry-pick order was 1, 3, 2; the files are disjoint.
+
 ## Rollback
 
 Revert the merge on `main`, bump the nixos_config input back to 332b56c and

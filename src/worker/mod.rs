@@ -323,7 +323,7 @@ mod tests {
         let role = std::env::var("LLM_INDEX_TEST_ROLE").unwrap();
         sandbox::start(&Path::new(&base).join("config.toml"), &role, Some("root")).unwrap();
         println!(
-            "dumpable={:?}",
+            "\ndumpable={:?}",
             rustix::process::dumpable_behavior().unwrap()
         );
     }
