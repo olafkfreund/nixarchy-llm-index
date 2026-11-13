@@ -122,9 +122,7 @@ fn extract_with_deadlines(
         });
     }
     let actual_size = meta.st_size as u64;
-    let actual_mtime_ns = (meta.st_mtime as i64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(meta.st_mtime_nsec as i64);
+    let actual_mtime_ns = super::mtime_ns(meta.st_mtime as i64, meta.st_mtime_nsec as i64);
     if actual_size != expected_size || actual_mtime_ns != expected_mtime_ns {
         return output.send(&Message::Failed {
             relpath,

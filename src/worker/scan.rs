@@ -366,7 +366,23 @@ impl<'a> Walker<'a> {
     {
         let mut fd = rustix::io::dup(self.ready.root_fd.as_ref().ok_or("missing root fd")?)?;
         for part in rel.components() {
-            fd = open_dir(&fd, &CString::new(part.as_os_str().as_bytes())?)?;
+            fd = match open_dir(&fd, &CString::new(part.as_os_str().as_bytes())?) {
+                Ok(fd) => fd,
+                Err(error)
+                    if !rel.as_os_str().is_empty()
+                        && matches!(
+                            error,
+                            rustix::io::Errno::NOENT
+                                | rustix::io::Errno::NOTDIR
+                                | rustix::io::Errno::ACCESS
+                                | rustix::io::Errno::LOOP
+                                | rustix::io::Errno::XDEV
+                        ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
         }
         let st = statx(&fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?;
         visit(rel, &st, Some(&fd), None)?;
@@ -575,7 +591,7 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
             output.send(&Message::Entry {
                 relpath,
                 size: st.stx_size,
-                mtime_ns: st.stx_mtime.tv_sec * 1_000_000_000 + i64::from(st.stx_mtime.tv_nsec),
+                mtime_ns: super::mtime_ns(st.stx_mtime.tv_sec, i64::from(st.stx_mtime.tv_nsec)),
                 is_dir,
             })?;
             output.entry(st.stx_size)?;

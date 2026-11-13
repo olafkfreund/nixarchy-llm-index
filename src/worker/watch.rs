@@ -81,7 +81,25 @@ fn add_watches(
         let rules = loader.load_rules(fd, &root.join(rel));
         let pinned = rustix::io::dup(fd)?;
         let proc_path = format!("/proc/self/fd/{}/.", pinned.as_raw_fd());
-        let wd = inotify.watches().add(&proc_path, MASK)?;
+        let wd = match inotify.watches().add(&proc_path, MASK) {
+            Ok(wd) => wd,
+            Err(error)
+                if !rel.as_os_str().is_empty()
+                    && matches!(
+                        rustix::io::Errno::from_io_error(&error),
+                        Some(
+                            rustix::io::Errno::NOENT
+                                | rustix::io::Errno::NOTDIR
+                                | rustix::io::Errno::ACCESS
+                                | rustix::io::Errno::LOOP
+                                | rustix::io::Errno::XDEV
+                        )
+                    ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         drop(pinned);
         by_wd.insert(wd.clone(), rel.to_path_buf());
         watched.insert(rel.to_path_buf(), (wd, rules));
@@ -274,7 +292,10 @@ fn stat_regular(ready: &Ready, rel: &Path) -> (Option<u64>, Option<i64>) {
     match st {
         Some(st) if st.stx_mode & 0o170000 == 0o100000 => (
             Some(st.stx_size),
-            Some(st.stx_mtime.tv_sec * 1_000_000_000 + i64::from(st.stx_mtime.tv_nsec)),
+            Some(super::mtime_ns(
+                st.stx_mtime.tv_sec,
+                i64::from(st.stx_mtime.tv_nsec),
+            )),
         ),
         _ => (None, None),
     }
@@ -296,6 +317,77 @@ pub fn watch(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn vanished_subtree_does_not_degrade_watcher() {
+        let base =
+            std::env::temp_dir().join(format!("llm-index-watch-race-{}", std::process::id()));
+        let root = base.join("root");
+        fs::create_dir_all(root.join("gone")).unwrap();
+        let cfg = base.join("config.toml");
+        fs::write(
+            &cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"r\"\npath = \"{}\"\n",
+                base.join("state").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(&cfg).unwrap();
+        let ready = Ready {
+            root: Some(0),
+            root_fd: Some(
+                rustix::fs::openat(
+                    rustix::fs::CWD,
+                    &root,
+                    rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                    rustix::fs::Mode::empty(),
+                )
+                .unwrap(),
+            ),
+            mountinfo: fs::File::open("/proc/self/mountinfo").unwrap(),
+            global_ignore: Gitignore::empty(),
+            oom_score_adj: String::new(),
+            config,
+        };
+        let output = Output::new();
+        let mut inotify = Inotify::init().unwrap();
+        let mut watched = Watches::new();
+        let mut by_wd = HashMap::new();
+        add_watches(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            None,
+        )
+        .unwrap();
+        fs::remove_dir(root.join("gone")).unwrap();
+        add_watches(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            Some(Path::new("gone")),
+        )
+        .unwrap();
+        fs::create_dir(root.join("live")).unwrap();
+        add_watches(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            Some(Path::new("live")),
+        )
+        .unwrap();
+        assert!(watched.contains_key(Path::new("live")));
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn pinned_watch_and_add_failure() {

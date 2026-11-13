@@ -3,6 +3,10 @@ pub mod sandbox;
 pub mod scan;
 pub mod watch;
 
+pub(crate) fn mtime_ns(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
 use std::cell::Cell;
 use std::error::Error;
 use std::io::{self, Write};
@@ -208,6 +212,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn mtime_past_2262_saturates() {
+        assert_eq!(mtime_ns(10_000_000_000, 1), i64::MAX);
+    }
 
     #[test]
     fn sandbox_child() {
