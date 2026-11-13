@@ -29,8 +29,18 @@ Self-contained: every decision below is from the approved spec. Item numbers
   (`../llm-index-10-sN`). The lead reviews each diff, commits it in that
   worktree and cherry-picks onto the branch. Implementers never stage or
   commit.
-- Wave A in parallel: steps 1, 3, 4, 5, 7, 8. Wave B after its dependency
-  is on the branch: step 6 after step 1 (same coder), step 2 after step 3.
+- Wave A in parallel: steps 1, 3, 5, 7, 8. Wave B, each once its
+  dependencies are on the branch: step 6 after step 1 (same coder), step 2
+  after step 3, step 4 after steps 1, 3 and 7 (it touches `scan.rs`
+  `scan()`, `worker/extract.rs` and `worker/mod.rs`, which those steps also
+  edit). Cherry-pick order: 1, 5, 3, 7, 8, then 6, 2, 4.
+- Shared files in wave A and who owns what: `src/index/mod.rs` — step 1
+  the `Sink` trait (around line 74), step 5 `parse_duration` and `Proc`;
+  `src/worker/scan.rs` — step 1 only in wave A. The lead resolves any
+  cherry-pick conflict by hand and reruns the checks.
+- A test "fails on `84fc986`" means it asserts the defect itself (a count,
+  a bound, a state), not only that the happy path works. Safety checks
+  that already pass on `84fc986` are allowed but are named as such.
 - Check for every step, in its worktree:
   `cargo test --all-targets && cargo clippy --all-targets -- -D warnings`.
   Run cargo with `CARGO_TARGET_DIR=target-sN` so worktrees do not share a
@@ -45,7 +55,8 @@ Self-contained: every decision below is from the approved spec. Item numbers
 ### 1. Scheduler (#1, #2, #7, #8, #16, #17, #18 queue)
 
 Files: `src/index/sched.rs`, `src/index/shares.rs`, `src/worker/scan.rs`
-(identity part), `src/index/store.rs` (`Sink` impl).
+(identity part), `src/index/mod.rs` (the `Sink` trait declaration, around
+line 74), `src/index/store.rs` (`Sink` impl).
 
 1. **#1 adoption.** In `scan.rs` (around line 551-609), send
    `identity_before`/`identity_after` as `None` when the mount id does not
@@ -95,7 +106,14 @@ fd mount adopts nothing; `Probe` root with queued files scans; transient
 failure holds and does not resend within `RETRY`; `changed` keeps the row,
 drops the request, makes a scan due, also on a network root; held solo
 does not stop other workers; `extracted` failing and `failed` failing each
-requeue and the retry succeeds. Update test sinks for the new signatures.
+requeue and the retry succeeds (the file is not in `r.failed` after a failed
+`failed`). Queue race: an extraction is in flight, a watch event queues the
+same file with newer size/mtime, then the old job is requeued through each
+route (`reload`, `RootError`, `abandon`, transient, store error); assert
+one queue entry with the newer metadata. `indexed_files`: returns 1 when
+only the first database has a row (and does not query the second, via a
+counting test sink or a closed second connection), and 1 on a database
+error. Update test sinks for the new signatures.
 
 Traps: `scan_done` order matters (verdict before adoption); tests in
 `store.rs` call `sink.extracted(...)` about 20 times and need `.unwrap()`
@@ -121,8 +139,16 @@ File: `src/mcp.rs`. Runs after step 3.
   `sheet` go through `sanitize::label(…, 200)` before `untrusted`.
 - Tests: three-sheet workbook paged with a small budget returns every row
   once; sheets `<x` and `&lt;x` in one workbook page correctly; large text
-  file paging does bounded work per call (count units built); `start`
-  above `i64::MAX` errors; a 10 000-character title is cut in `search`.
+  file paging does bounded work per call (count chunk rows fetched and
+  units built for a late page: both bounded by about one page, not by the
+  file's earlier content); `start` above `i64::MAX` errors; a
+  10 000-character title is cut in `search`. Safety (passes today too): a
+  PDF page split over several chunks comes back merged; a unit longer than
+  the budget pages with `offset` and loses no character.
+- "About one page of work" (spec #18) is measured in Rust (rows fetched,
+  units built). SQLite still walks the `(file_id, ord)` index past earlier
+  chunks to apply `end >= ?2`; that reads index and row headers, not the
+  text, and is accepted. No new index.
 
 Traps: `docs/reference.md` changes are step 8's; `get` must keep the
 `visible()` gate and the "not found" for hidden files.
@@ -154,7 +180,8 @@ existing sanitize tests must pass.
 ### 4. HTML, watcher, mtime (#4, #5, #9 mtime)
 
 Files: `src/extract/html.rs`, `src/worker/watch.rs`, `src/worker/scan.rs`
-(`walk_subtree` only), `src/worker/mod.rs`.
+(`walk_subtree` and the mtime line in `scan()`), `src/worker/extract.rs`
+(mtime only), `src/worker/mod.rs`.
 
 - `skip_rawtext_element`: compare bytes,
   `bytes[a..b].eq_ignore_ascii_case(tag_name.as_bytes())`.
@@ -162,13 +189,15 @@ Files: `src/extract/html.rs`, `src/worker/watch.rs`, `src/worker/scan.rs`
   its inotify watch fails with `ENOENT`, `ENOTDIR`, `EACCES`, `ELOOP` or
   `EXDEV`, skip that path and continue; other errors still degrade.
 - One saturating `statx` → nanoseconds helper in `src/worker/mod.rs`, used
-  by `scan.rs` (~571), `watch.rs` (~277) and `worker/extract.rs`.
+  by `scan.rs` `scan()` (~571), `watch.rs` (~277) and `worker/extract.rs`
+  (~125-127).
 - Tests: `<script></aaaaaé</script>` does not panic; a directory created
   and removed before its watch is added leaves the watcher healthy; an
   mtime past 2262 saturates.
 
-Traps: step 1 edits `scan.rs` around lines 551-609; touch only
-`walk_subtree` (~360-372) and the mtime line there.
+Traps: runs after steps 1, 3 and 7 are on the branch, so start from the
+branch head; in `scan.rs` touch only `walk_subtree` (~360-372) and the
+mtime expression in `scan()`.
 
 ### 5. Config and pipe reader (#6, #9 max_file_mb, #18 pipe)
 
@@ -183,8 +212,9 @@ Files: `src/config.rs`, `src/index/mod.rs`.
   `\n`; reset it whenever the buffer is cleared (including the `MAX_LINE`
   overflow path); drain consumed lines once per read.
 - Tests: `5µ`, `0s`, an overflowing number, `max_file_mb = 0` rejected;
-  `Proc::parse` with a line split over many reads and with an over-long
-  line then a good one.
+  `Proc::parse` with a line split over many reads (assert total bytes
+  searched for `\n` is linear in the input, via a counter in the parser)
+  and with an over-long line then a good one (cursor reset, no panic).
 
 ### 6. Store (#9 model, #13, #15, #17 timeout)
 
@@ -203,9 +233,13 @@ Files: `src/index/store.rs`, `src/db.rs`. Runs after step 1.
 - `move_tier`: batches of 256 ids; per batch read, delete from source and
   commit, insert into destination and commit.
 - Tests: model revision change resets vectors and sizes and leaves
-  `mtime_ns`; `embed_cache` is gone after open; an unchanged chunk keeps
-  its vector across an edit; a tier move of 1 000 files works and a crash
-  after the first batch leaves no row in both databases.
+  `mtime_ns` (the spec's verification line says `mtime_ns`; its design,
+  which this plan follows, says `size`); `embed_cache` is gone after open;
+  an unchanged chunk keeps its seeded vector across an edit with the
+  embedder called only for the changed chunk (counting embedder); a tier
+  move of 1 000 files reads at most 256 files per batch (assert via a
+  batch-size counter) and an injected crash after the first batch leaves
+  256 files in the destination, 744 in the source, none in both.
 
 Traps: compaction (#8) already runs after `purge` at open; keep the order
 open → purge → compact.
@@ -221,8 +255,13 @@ Files: `src/worker/sandbox.rs`, `src/worker/mod.rs` (self-test).
 - Self-test: under the worker rules, probe a pathname socket outside the
   root, an abstract socket and `kill(getppid(), 0)`; print whether each
   is denied. Do not fail the self-test on a kernel that lacks them.
-- Test: the three probes are denied when the kernel ABI is at least 9
-  (skip with a message otherwise). This host reports ABI 11.
+- Test: with a live listening pathname socket outside the root, a live
+  abstract socket and the parent process: the pathname connect is denied
+  with a permission error when the kernel ABI is at least 9; the abstract
+  connect and `kill(getppid(), 0)` are denied when the ABI is at least 6;
+  each skips with a message on an older kernel. The same connects succeed
+  without the rules (so a missing socket never passes as denied). This
+  host reports ABI 11.
 
 Traps: the TCP hard check (`tcp_restriction_supported`) stays; parser
 crash tests and VM tests must still pass under the new rules.
@@ -239,8 +278,10 @@ Files: `src/deny.rs`, `docs/`.
 - `docs/security.md`: list the new patterns; say plainly that the tier
   split guards what an MCP client can ask, not an agent running as the
   owner with a shell.
-- `docs/reference.md`: "A file is skipped when" lists `vendor`, `target`,
-  `venv`, `third_party`, the `result*` prefix, lockfiles and
+- `docs/reference.md`: "A file is skipped when" lists every directory name
+  in `src/worker/scan.rs` (`.git`, `node_modules`, `.venv`, `venv`,
+  `__pycache__`, `.direnv`, `vendor`, `target`, `third_party`, and any
+  others in that list), the `result*` prefix, the lockfiles and
   `CACHEDIR.TAG`; `get`'s `sheet` is where reading starts (escaped form,
   as in `next.sheet`); a cut `search` label is not a valid `get`
   argument; word hits on the private server are ranked per database;
