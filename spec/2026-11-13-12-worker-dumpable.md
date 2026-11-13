@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 12
 intent: intent/2026-11-13-12-worker-dumpable.md
 ---
