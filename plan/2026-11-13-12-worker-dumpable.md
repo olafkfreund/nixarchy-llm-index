@@ -125,7 +125,7 @@ Files: `README.md`, `docs/installation.md`, `docs/security.md`.
 ## Deviations recorded during implementation
 
 - Final review (agy): the two child-process tests matched whole stdout
-  lines, but with one test thread libtest writes `test <name> ... ` without
+  lines, but with one test thread libtest writes its test-name prefix without
   a newline first. Both children now print a newline before their output;
   checked with `RUST_TEST_THREADS=1`.
 - The docs sentence covers exclusion paths too, which follow the same
