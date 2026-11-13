@@ -50,7 +50,9 @@ then:
 }
 ```
 
-Apply it with your usual Home Manager switch.
+The root path must be the real path with no symlink anywhere in it; check with
+`realpath ~/Source` and use what it prints. Apply it with your usual Home
+Manager switch.
 
 ## Quick start: NixOS
 

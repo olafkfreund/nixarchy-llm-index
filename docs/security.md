@@ -34,7 +34,10 @@ Scan, extract and watch workers run under Landlock before they touch your files:
 - read-only access beneath their own root and `/nix/store`, nothing else;
   the `validate` worker can read the filesystem but cannot write;
 - no TCP, where the kernel's Landlock can restrict it (ABI 4 or later);
-- address-space limit of 4 GiB, no core dumps, `oom_score_adj` of 1000.
+- address-space limit of 4 GiB, no core dumps, `oom_score_adj` of 1000;
+- extract workers are not dumpable, so their crashes are not passed to the
+  core-dump helper (no systemd-coredump entry) and unprivileged processes of
+  the same user cannot `ptrace` them; other workers stay dumpable.
 
 The coordinator may write only beneath the state directory and `/proc`. Its
 Landlock rules are best effort: on a kernel that cannot restrict TCP, only the
@@ -49,7 +52,8 @@ it), `TasksMax`, low CPU and idle I/O priority. The NixOS unit also sets
 
 Before each start the unit runs `llm-index index --self-test`, which checks
 that a worker cannot write in its root, can read its root, cannot read one file
-outside it (the config file), has the right `oom_score_adj`, and, where the
+outside it (the config file), has the right `oom_score_adj`, that the
+extract worker is not dumpable and the scan worker is, and, where the
 kernel can restrict TCP, cannot open TCP (the TCP probe is skipped otherwise).
 If Landlock is missing, the service refuses to start.
 
