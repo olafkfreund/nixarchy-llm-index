@@ -34,23 +34,28 @@ production; each behaviour change has a test that fails on 332b56c.
 
 Files: `src/worker/sandbox.rs`, `src/worker/mod.rs`, `tests/selftest.rs`.
 
-- `sandbox::start`: directly after `setrlimit(Resource::Core, 0)` (after
+- `sandbox::start` (`src/worker/sandbox.rs` ~42): directly after
+  `setrlimit(Resource::Core, 0)` (after
   the `oom_score_adj` write and read-back, which must stay first), when
   `role == "extract"`, call
   `rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)?`.
   Only `extract`: the self-test's extract probe also arrives as `extract`
   because `worker::run` strips `selftest-`. Scan, watch and validate stay
   dumpable (the watcher test reads a watch child's `/proc/<pid>/fd`).
-- `selftest` (worker/mod.rs): after `sandbox::start`, read
+- `selftest` (`src/worker/mod.rs` ~105): after `sandbox::start`, read
   `rustix::process::dumpable_behavior()?`. Role `extract`: must be
   `NotDumpable`, else error `extract worker is dumpable`. Role `scan`:
   must be `Dumpable`, else error `scan worker is not dumpable`. Print
   `dumpable=<bool>` next to the existing probe lines.
-- Tests: in `src/worker/mod.rs`, a child (existing
-  `LLM_INDEX_SANDBOX_CHILD` pattern) runs `sandbox::start` with role
-  `extract` and prints `dumpable_behavior()`; parent asserts
-  `NotDumpable`. Same with role `scan`: `Dumpable`. `tests/selftest.rs`
-  also asserts a `dumpable=false` and a `dumpable=true` line.
+- Tests: in `src/worker/mod.rs` (harness pattern at ~251 and ~344), a
+  child (existing `LLM_INDEX_SANDBOX_CHILD` pattern, its own temp-dir
+  prefix) runs `sandbox::start` with role `extract` and prints a tagged
+  line `dumpable=<Debug>`; the parent matches the whole line
+  (`dumpable=NotDumpable`), never a substring, because "NotDumpable"
+  contains "Dumpable". Same with role `scan`: `dumpable=Dumpable`. In
+  `selftest`, print the probe as its own line beside the other probe lines
+  (~131-154). `tests/selftest.rs`
+  (~24) also asserts a `dumpable=false` and a `dumpable=true` line.
 - `docs/security.md` is step 3's.
 
 ### 2. A `scan()`-level identity test
@@ -64,11 +69,15 @@ File: `src/worker/scan.rs` only.
   directory, `root: Some(0)`, the directory opened as `root_fd`, a
   `mountinfo` `File` (a temp file) whose line for the root's path parses
   to `Some` identity but carries a mount id that is not the root fd's,
-  `Gitignore::empty()`, `oom_score_adj: String::new()`. Assert first, in
+  `Gitignore::empty()`, `oom_score_adj: String::new()`. Use mount id
+  `root_mount_id(&root_fd).unwrap() + 1` in the fake line, so it can never
+  match the host's mount, and a temp-dir prefix distinct from the other
+  scan tests (~716, ~735). Assert first, in
   the child, that the fixture parses to `Some` identity. The parent finds
   the `ScanDone` line in stdout and asserts `complete: false`,
   `identity_before: null`, `identity_after: null`.
-- A one-line comment at the initial `root_mount_id` error branch: not
+- Tests go in the `mod tests` at ~675.
+- A one-line comment at the initial `root_mount_id` error branch (~563): not
   tested, because `statx` on a local directory fd does not fail without
   kernel or FUSE fault injection (NFS/FUSE can give `ESTALE`/`EIO`, the
   reason the branch exists).
@@ -77,11 +86,14 @@ File: `src/worker/scan.rs` only.
 
 Files: `README.md`, `docs/installation.md`, `docs/security.md`.
 
-- README examples (~43 and ~69) and `docs/installation.md` examples (~56
-  and ~95): after the first example block in each file, one sentence: the
+- One sentence right after the Home Manager `roots` example in each file:
+  after `README.md` line 51 and after `docs/installation.md` line 70. The
+  NixOS examples (`/home/alice/Source`) are left alone. Sentence: the
   root path must be the real path with no symlink anywhere in it; check
   with `realpath ~/Source` and use what it prints.
-- `docs/security.md` sandbox section: extract workers are not dumpable, so
+- `docs/security.md` `## Worker sandbox` (lines 30-54), next to the
+  limits bullet (~37) and the self-test summary (~50-54): extract workers
+  are not dumpable, so
   their crashes are not passed to the core-dump helper (no systemd-coredump
   entry) and unprivileged processes of the same user cannot `ptrace` them;
   other workers stay dumpable. The self-test checks both.
@@ -92,6 +104,13 @@ Files: `README.md`, `docs/installation.md`, `docs/security.md`.
 
 - Each step's check passes in its worktree and again on the branch after
   the cherry-picks.
+- Regression proof (the lead runs these on the branch):
+  - the extract dumpability test and the self-test `dumpable=false`
+    assertion fail with step 1's `set_dumpable_behavior` call removed;
+  - the scan identity test fails with either `on_fd_mount` call in
+    `scan()` removed (~573, ~627). It is new coverage of existing
+    behaviour, so it passes on 332b56c; the scan `Dumpable` check is a
+    guard that also passes there.
 - `nix flake check` on the branch.
 - Run `cargo test --all-targets` once on the branch and count
   `journalctl --since <start> | grep -E 'llm[-_]index.*terminated
