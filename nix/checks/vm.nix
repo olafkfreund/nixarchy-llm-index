@@ -639,7 +639,12 @@ in
         # (4) a share mounted after `index` started is scanned at once (interval is 1 day)
         assert not hits("private", "latemarker")
         client.succeed(f"{NFS} server2:/late /mnt/late")
-        retry(lambda _: bool(hits("private", "latemarker")), timeout=seconds(60))
+        try:
+            retry(lambda _: bool(hits("private", "latemarker")), timeout=seconds(60))
+        except Exception:
+            print("DIAG status:\n" + status(client))
+            print("DIAG journal:\n" + client.succeed("journalctl -u llm-index-alice --no-pager | tail -60"))
+            raise
 
         # (5) reclassify (a)-(c) with the share unmounted
         client.succeed(f"{NFS} server2:/pub /mnt/pubshare")

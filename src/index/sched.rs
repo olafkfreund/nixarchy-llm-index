@@ -212,6 +212,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 }
             }
             self.roots[i].derived = d;
+            // a new mount may end what the hold waited out (mismatch, offline): scan at once
+            self.roots[i].hold = now;
             self.request_scan(i, now, Duration::ZERO);
         }
     }
@@ -1452,6 +1454,27 @@ mod tests {
             sink,
             Box::new(|_, _| true),
         )
+    }
+
+    #[test]
+    fn a_share_mounted_later_is_scanned_at_once() {
+        let mut sink = Mem {
+            indexed: 10_000,
+            ..Mem::default()
+        };
+        sink.expected
+            .insert("r".into(), ident("/mnt/nas", "nas:/a", "nfs", 2).share);
+        let mut s = mem_sched(sink, Kind::Auto, &[ext4(1, "/")]);
+        s.tick(secs(0));
+        s.tick(secs(30)); // mismatch: the root is held
+        assert!(s.spawner.spawned.is_empty());
+        s.rederive(&mut mi(&[&ext4(1, "/"), &nfs(2, "/mnt/nas", "nas:/a")]), secs(31));
+        s.tick(secs(31));
+        assert!(
+            s.spawner.spawned.iter().any(|w| w.1 == Role::Scan),
+            "{:?}",
+            s.spawner.spawned
+        );
     }
 
     #[test]

@@ -336,6 +336,13 @@ Files: `src/deny.rs`, `docs/`.
   `embed::tests::query_mode_does_not_map_and_rss_stays_flat`, which measures
   the whole test process's RSS and then failed. That test now re-runs
   itself in a child process, so it measures only itself.
+- `nix flake check` failed once in `network-mounts` stage 4: a share
+  mounted after the indexer started was indexed only after the root's
+  mismatch hold (up to `RETRY`, 60 s) ran out, at the edge of the test's
+  60 s limit. `rederive` now clears the hold when a root's mount changes,
+  so the requested scan really starts at once (unit test
+  `a_share_mounted_later_is_scanned_at_once`, which fails without it). The
+  VM test prints status and the journal when that stage fails.
 
 ## Tests
 
