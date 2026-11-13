@@ -237,6 +237,22 @@ mod tests {
             println!("skipped: LLM_INDEX_MODEL_DIR unset");
             return;
         }
+        // RSS is per process: measure in a child running only this test, not beside the others
+        if std::env::var_os("LLM_INDEX_RSS_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "embed::tests::query_mode_does_not_map_and_rss_stays_flat",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("LLM_INDEX_RSS_CHILD", "1")
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && log.contains("1 passed"), "{log}");
+            return;
+        }
         let before = rss_kb(); // before the tokenizer and header are loaded
         let e = Embedder::open(Path::new(dir), Mode::Query).unwrap();
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();

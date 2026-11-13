@@ -330,6 +330,13 @@ Files: `src/deny.rs`, `docs/`.
 - Check: `npx markdownlint-cli2 "docs/**/*.md"` and the step's cargo
   check.
 
+## Deviations recorded during implementation
+
+- Step 1's new tests run in parallel with
+  `embed::tests::query_mode_does_not_map_and_rss_stays_flat`, which measures
+  the whole test process's RSS and then failed. That test now re-runs
+  itself in a child process, so it measures only itself.
+
 ## Tests
 
 - Every step's check passes in its worktree, then on the branch after each
