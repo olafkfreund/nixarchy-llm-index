@@ -29,11 +29,12 @@ Self-contained: every decision below is from the approved spec. Item numbers
   (`../llm-index-10-sN`). The lead reviews each diff, commits it in that
   worktree and cherry-picks onto the branch. Implementers never stage or
   commit.
-- Wave A in parallel: steps 1, 3, 5, 7, 8. Wave B, each once its
+- Wave A in parallel: steps 1, 3, 5, 8. Wave B, each once its
   dependencies are on the branch: step 6 after step 1 (same coder), step 2
-  after step 3, step 4 after steps 1, 3 and 7 (it touches `scan.rs`
+  after step 3, step 7 after steps 1 and 5 (it edits `src/index/mod.rs`
+  `self_test_in`), step 4 after steps 1, 3 and 7 (it touches `scan.rs`
   `scan()`, `worker/extract.rs` and `worker/mod.rs`, which those steps also
-  edit). Cherry-pick order: 1, 5, 3, 7, 8, then 6, 2, 4.
+  edit). Cherry-pick order: 1, 5, 3, 8, then 6, 2, 7, 4.
 - Shared files in wave A and who owns what: `src/index/mod.rs` — step 1
   the `Sink` trait (around line 74), step 5 `parse_duration` and `Proc`;
   `src/worker/scan.rs` — step 1 only in wave A. The lead resolves any
@@ -58,18 +59,24 @@ Files: `src/index/sched.rs`, `src/index/shares.rs`, `src/worker/scan.rs`
 (identity part), `src/index/mod.rs` (the `Sink` trait declaration, around
 line 74), `src/index/store.rs` (`Sink` impl).
 
-1. **#1 adoption.** In `scan.rs` (around line 551-609), send
+1. **#1 adoption.** In `scan.rs` `scan()` (lines ~540-609), send
    `identity_before`/`identity_after` as `None` when the mount id does not
-   equal the root fd's mount id (today that check only feeds `complete`).
-   In `sched.rs` `scan_done`: discard a scan with `before.is_none()` (set
-   no state change beyond today's offline handling for a changed mount;
-   just `scan_finished(i, now, RETRY)` and return). Adopt when
+   equal the root fd's mount id (today that check only feeds `complete`),
+   including the early return when `root_mount_id` fails (~540-549). In
+   `sched.rs` `scan_done`: when both identities are `Some` and differ,
+   keep today's `offline / identity mismatch`; when either is `None`,
+   discard the scan with no state change (`scan_finished(i, now, RETRY)`
+   and return, before `queue_extracts`). Adopt when
    `v == Some(Adopt) && before == after`, dropping the `complete`
    condition. Completeness still decides deletions (unchanged).
-2. **#1 try_root.** Choose `Role::Extract` only when the identity allows
-   extraction (verdict `Ok` or `Adopt`); otherwise fall through to the
-   `Scan` branch. `Probe` (autofs) and a root with queued files must still
-   scan. Start watchers only on `Ok` or `Adopt`.
+2. **#1 identity checks.** Split `identity_allows` into a pure
+   `fn verdict_of(&self, i) -> Verdict` plus two uses: scanning is allowed
+   unless `Mismatch`; extraction and watchers only on `Ok` or `Adopt`.
+   The `Mismatch` side effects (clear queue, hold, `offline`) stay where
+   they are today. `send_next` and the solo path use the extract check;
+   `try_root` chooses `Role::Extract` only when extraction is allowed and
+   otherwise falls through to the `Scan` branch, so `Probe` (autofs) and a
+   root with queued files still scan.
 3. **#1 legacy roots** stay `Mismatch` (no auto-recovery). Existing tests
    `shares.rs` ~158 and `sched.rs` ~1408 keep their expectations.
 4. **#2.** In the `Message::Failed` transient branch, set `hold = now +
@@ -78,32 +85,40 @@ line 74), `src/index/store.rs` (`Sink` impl).
 5. **#7.** `"changed"` is not passed to `fail()`: drop the request, keep
    the row, set the root's `scan_due = now`. Do not add it to
    `transient()`.
-6. **#8.** Add `fn solo_held(&self, i, now) -> bool` = `now <
-   roots[i].hold || root_blocked(i) || identity refuses extraction ||
-   share backoff (now < not_before for that share)`. Not `shares.free`.
-   `send_next` stops for solo only when `solo.front()` exists and is not
-   held. Dispatch keeps its own `shares.free` check before starting the
-   solo worker.
+6. **#8.** Add `pub fn backing_off(&self, share, now) -> bool` to
+   `ShareBook` in `shares.rs` (`now < not_before`, ignoring `live`). Add
+   `fn solo_held(&self, i, now) -> bool` = `now < roots[i].hold ||
+   root_blocked(i) || extraction refused by verdict_of(i) ||
+   shares.backing_off(…)`. Not `shares.free`. `send_next` stops for solo
+   only when `solo.front()` exists and is not held. In dispatch, the drain
+   `return` is gated on `!solo_held`; `shares.free` is checked only inside
+   `if self.pool_live() == 0`, right before starting the solo worker.
 7. **#16.** `DbSink::indexed_files`: `SELECT EXISTS(SELECT 1 FROM files
    WHERE root_id = ?1 AND state = 'ok')`, stop at the first database that
    says yes, return 0 or 1; a database error returns 1.
 8. **#17.** `Sink::extracted` and `Sink::failed` return
    `Result<(), String>`; `DbSink` stops logging these errors itself.
    `fail()` calls `sink.failed` first and inserts into `r.failed` only on
-   `Ok`. `extract_died` takes `now`. On any store error: requeue, set
+   `Ok`. `fail()` and `extract_died` take `now`; update their callers
+   (~399, ~703, ~751). On any store error: requeue, set
    `hold = now + RETRY`, log once per hold.
 9. **#18 queue.** `queued: HashMap<String, (u64, i64)>`, `queue:
    VecDeque<String>`. `queue_one` updates the map for a duplicate (no
-   linear search); `next_allowed` reads size/mtime from the map. One
-   requeue helper (`entry().or_insert`, push to the front) used by
+   linear search); `next_allowed` and `has_allowed` read size/mtime from
+   the map. One requeue helper (on `Entry::Vacant` only: insert and push to
+   the front; an occupied entry is left alone, it is newer) used by
    `reload`, `RootError`, `abandon`, the transient branch and store
    errors, so a newer watch-event entry is never overwritten and `queue`
    and `queued` stay one-to-one.
 
 Tests (sched unit tests): incomplete stable first scan adopts and
-indexing continues; legacy stuck root stays offline; scan with mismatched
-fd mount adopts nothing; `Probe` root with queued files scans; transient
-failure holds and does not resend within `RETRY`; `changed` keeps the row,
+indexing continues; legacy stuck root stays offline; a `ScanDone` with
+`(Some, None)` or `(None, Some)` identities queues nothing and calls no
+`sink.scan_done`; a `scan.rs` test where the root fd is not on the
+reported mount sends `None`; `Probe` root with queued files scans, and a
+`Kind::Local` root on autofs starts no watcher; with two queued files, a
+transient failure of the first holds the root and the second is not sent
+within `RETRY`; `changed` keeps the row,
 drops the request, makes a scan due, also on a network root; held solo
 does not stop other workers; `extracted` failing and `failed` failing each
 requeue and the retry succeeds (the file is not in `r.failed` after a failed
@@ -117,7 +132,8 @@ error. Update test sinks for the new signatures.
 
 Traps: `scan_done` order matters (verdict before adoption); tests in
 `store.rs` call `sink.extracted(...)` about 20 times and need `.unwrap()`
-or `?` for clippy.
+or `?` for clippy; the test at `sched.rs` ~1525 builds `queue`/`queued`
+directly and must use the new types.
 
 ### 2. `get` paging (#3, #18 get, #11 output)
 
@@ -134,15 +150,21 @@ File: `src/mcp.rs`. Runs after step 3.
 - Lines and pages mode: the chunk query adds `AND end >= ?2` with `lo`
   bound as `i64` (`i64::try_from`, else argument error).
 - Stream units from the row iterator; stop once the budget is used and
-  `next` is known. Keep `last_line` de-duplication and `offset`.
+  `next` is known. Keep `last_line` de-duplication and `offset`. In pages
+  mode, consecutive chunks with the same `start` are still joined into one
+  unit with `\n\n` before `offset` and the budget apply (peek the next
+  row before emitting a page).
 - `search` and `recent`: `title`, `heading`, `symbol` and the displayed
-  `sheet` go through `sanitize::label(…, 200)` before `untrusted`.
+  `sheet` go through `sanitize::label(…, 200)` before `untrusted`; an
+  empty label for an optional field is left out, as an absent one is
+  today.
 - Tests: three-sheet workbook paged with a small budget returns every row
   once; sheets `<x` and `&lt;x` in one workbook page correctly; large text
   file paging does bounded work per call (count chunk rows fetched and
   units built for a late page: both bounded by about one page, not by the
   file's earlier content); `start` above `i64::MAX` errors; a
-  10 000-character title is cut in `search`. Safety (passes today too): a
+  10 000-character title is cut in `search` and `recent`; `end` on a
+  multi-sheet workbook stops at the starting sheet. Safety (passes today too): a
   PDF page split over several chunks comes back merged; a unit longer than
   the budget pages with `offset` and loses no character.
 - "About one page of work" (spec #18) is measured in Rust (rows fetched,
@@ -187,10 +209,13 @@ Files: `src/extract/html.rs`, `src/worker/watch.rs`, `src/worker/scan.rs`
   `bytes[a..b].eq_ignore_ascii_case(tag_name.as_bytes())`.
 - `walk_subtree` / `add_watches`: when opening the subtree root or adding
   its inotify watch fails with `ENOENT`, `ENOTDIR`, `EACCES`, `ELOOP` or
-  `EXDEV`, skip that path and continue; other errors still degrade.
-- One saturating `statx` → nanoseconds helper in `src/worker/mod.rs`, used
-  by `scan.rs` `scan()` (~571), `watch.rs` (~277) and `worker/extract.rs`
-  (~125-127).
+  `EXDEV`, skip that path and continue; other errors still degrade. This
+  applies only when the path is not the root itself (`rel != ""`): a
+  failing root watch still degrades.
+- One saturating `fn mtime_ns(sec: i64, nsec: i64) -> i64` helper in
+  `src/worker/mod.rs` (it takes plain numbers because `worker/extract.rs`
+  uses `fstat`, not `statx`), used by `scan.rs` `scan()` (~571),
+  `watch.rs` (~277) and `worker/extract.rs` (~125-127).
 - Tests: `<script></aaaaaé</script>` does not panic; a directory created
   and removed before its watch is added leaves the watcher healthy; an
   mtime past 2262 saturates.
@@ -218,7 +243,9 @@ Files: `src/config.rs`, `src/index/mod.rs`.
 
 ### 6. Store (#9 model, #13, #15, #17 timeout)
 
-Files: `src/index/store.rs`, `src/db.rs`. Runs after step 1.
+Files: `src/index/store.rs`, `src/db.rs`, `src/embed.rs` (remove
+`cache_key` if nothing else uses it, or clippy fails on dead code). Runs
+after step 1.
 
 - `db.rs` writer open: `busy_timeout = 5000` first, then the WAL pragma,
   then `DROP TABLE IF EXISTS embed_cache`; remove the table from the
@@ -238,15 +265,17 @@ Files: `src/index/store.rs`, `src/db.rs`. Runs after step 1.
   an unchanged chunk keeps its seeded vector across an edit with the
   embedder called only for the changed chunk (counting embedder); a tier
   move of 1 000 files reads at most 256 files per batch (assert via a
-  batch-size counter) and an injected crash after the first batch leaves
-  256 files in the destination, 744 in the source, none in both.
+  batch-size counter) and the existing `abort_after_first_commit` hook,
+  firing after the first batch's source commit, leaves 744 files in the
+  source and none in the destination (today: 0 and 0).
 
 Traps: compaction (#8) already runs after `purge` at open; keep the order
 open → purge → compact.
 
 ### 7. Worker sandbox (#10)
 
-Files: `src/worker/sandbox.rs`, `src/worker/mod.rs` (self-test).
+Files: `src/worker/sandbox.rs`, `src/worker/mod.rs` (self-test),
+`src/index/mod.rs` (`self_test_in` output). Runs after steps 1 and 5.
 
 - `restrict`: `ABI::V9`, keep `BestEffort`, add
   `.scope(Scope::from_all(abi))?`.
@@ -254,7 +283,13 @@ Files: `src/worker/sandbox.rs`, `src/worker/mod.rs` (self-test).
   not, so pathname socket connects are denied.
 - Self-test: under the worker rules, probe a pathname socket outside the
   root, an abstract socket and `kill(getppid(), 0)`; print whether each
-  is denied. Do not fail the self-test on a kernel that lacks them.
+  is denied. Do not fail the self-test on a kernel that lacks them. Both
+  listeners are bound *before* `sandbox::start` (an abstract socket bound
+  inside the worker's own domain is allowed by the scope), and the
+  pathname one under the self-test's state directory, because the
+  coordinator's Landlock rule already denies binding in `/tmp`.
+- `src/index/mod.rs` `self_test_in` today discards the child's stdout and
+  stderr on success; it prints the probe lines.
 - Test: with a live listening pathname socket outside the root, a live
   abstract socket and the parent process: the pathname connect is denied
   with a permission error when the kernel ABI is at least 9; the abstract
@@ -284,8 +319,9 @@ Files: `src/deny.rs`, `docs/`.
   others in that list), the `result*` prefix, the lockfiles and
   `CACHEDIR.TAG`; `get`'s `sheet` is where reading starts (escaped form,
   as in `next.sheet`); a cut `search` label is not a valid `get`
-  argument; word hits on the private server are ranked per database;
-  `max_file_mb` must be positive.
+  argument; on a spreadsheet `end` bounds only the starting sheet; word
+  hits on the private server are ranked per database; `maxFileMb` (the
+  option name used there) must be positive.
 - `docs/troubleshooting.md`: a root stuck in `identity mismatch` from an
   incomplete first scan recovers by setting `share` or renaming the root.
 - Check: `npx markdownlint-cli2 "docs/**/*.md"` and the step's cargo
