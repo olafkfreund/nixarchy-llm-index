@@ -618,19 +618,17 @@ impl DbSink {
 
 impl Sink for DbSink {
     fn indexed_files(&self, root: &str) -> usize {
-        // on a database error answer "many": adoption and mismatch then stay conservative
-        TIERS
-            .iter()
-            .map(|t| {
-                self.conn(*t)
-                    .query_row(
-                        "SELECT count(*) FROM files WHERE root_id = ?1 AND state = 'ok'",
-                        [root],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_or(usize::MAX / 4, |n| n as usize)
-            })
-            .sum()
+        // 0 or 1 is enough for the verdict; a database error answers 1 so adoption stays conservative
+        let any = |t: &Tier| {
+            self.conn(*t)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND state = 'ok')",
+                    [root],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(true)
+        };
+        usize::from(TIERS.iter().any(any))
     }
 
     fn expected_identity(&self, root: &str) -> Option<Share> {
@@ -676,7 +674,7 @@ impl Sink for DbSink {
         log(r);
     }
 
-    fn extracted(&mut self, root: &str, f: ExtractedFile) {
+    fn extracted(&mut self, root: &str, f: ExtractedFile) -> Result<(), String> {
         let rel = f.relpath.clone();
         let r = self.store_file(root, &rel, |abs| {
             let title = if f.title.is_empty() {
@@ -700,10 +698,17 @@ impl Sink for DbSink {
             };
             Some((row, f.chunks.clone()))
         });
-        log(r);
+        r.map_err(|e| e.to_string())
     }
 
-    fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str) {
+    fn failed(
+        &mut self,
+        root: &str,
+        relpath: &str,
+        size: u64,
+        mtime_ns: i64,
+        reason: &str,
+    ) -> Result<(), String> {
         let r = self.store_file(root, relpath, |abs| {
             let row = FileRow {
                 root_id: root.into(),
@@ -719,7 +724,7 @@ impl Sink for DbSink {
             };
             Some((row, Vec::new()))
         });
-        log(r);
+        r.map_err(|e| e.to_string())
     }
 
     fn root_state(&mut self, root: &str, state: &str, reason: &str) {
@@ -860,7 +865,8 @@ mod tests {
         f.sink.reload(&f.cfg).unwrap();
         for i in 0..300 {
             f.sink
-                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)))
+                .unwrap();
         }
         let before = pages(&f).0;
         cfg_with(&f, &[("keep", "/data/keep")]);
@@ -883,11 +889,13 @@ mod tests {
         f.sink.reload(&f.cfg).unwrap();
         for i in 0..100 {
             f.sink
-                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)));
+                .extracted("pub", extracted(&format!("n{i}.txt"), &big(i)))
+                .unwrap();
         }
         for i in 0..5 {
             f.sink
-                .extracted("pub2", extracted(&format!("s{i}.txt"), "tiny"));
+                .extracted("pub2", extracted(&format!("s{i}.txt"), "tiny"))
+                .unwrap();
         }
         cfg_with(&f, &[("pub", "/data/pub")]);
         f.sink.reload(&f.cfg).unwrap();
@@ -929,9 +937,11 @@ mod tests {
     fn tier_routing_and_search_rows() {
         let mut f = fx("route");
         f.sink
-            .extracted("pub", extracted("a.txt", "alpha public words"));
+            .extracted("pub", extracted("a.txt", "alpha public words"))
+            .unwrap();
         f.sink
-            .extracted("secret", extracted("b.txt", "beta private words"));
+            .extracted("secret", extracted("b.txt", "beta private words"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         assert_eq!(files(&f.sink, Tier::Private), 1);
         assert_eq!(f.sink.known("pub", "a.txt"), Some((5, 7)));
@@ -951,7 +961,9 @@ mod tests {
             1
         );
         // re-extract replaces, not duplicates
-        f.sink.extracted("pub", extracted("a.txt", "alpha again"));
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha again"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         assert_eq!(
             count(f.sink.conn(Tier::Public), "SELECT count(*) FROM chunks"),
@@ -962,7 +974,9 @@ mod tests {
             1
         );
         // a denied file is never stored
-        f.sink.extracted("pub", extracted(".env", "SECRET=1"));
+        f.sink
+            .extracted("pub", extracted(".env", "SECRET=1"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
     }
 
@@ -970,8 +984,11 @@ mod tests {
     fn public_db_has_no_private_name_or_path() {
         let mut f = fx("leak");
         f.sink
-            .extracted("secret", extracted("b.txt", "beta private words"));
-        f.sink.extracted("pub", extracted("a.txt", "alpha"));
+            .extracted("secret", extracted("b.txt", "beta private words"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
         f.sink.root_state("secret", "offline", "x");
         f.sink.set_expected_identity(
             "secret",
@@ -1054,8 +1071,8 @@ mod tests {
     fn unsafe_name_row_is_deleted_by_a_complete_scan() {
         let mut f = fx("unsafe-row");
         let bad = "d\u{202e}x/a.txt";
-        f.sink.extracted("pub", extracted("keep.txt", "k"));
-        f.sink.extracted("pub", extracted(bad, "b"));
+        f.sink.extracted("pub", extracted("keep.txt", "k")).unwrap();
+        f.sink.extracted("pub", extracted(bad, "b")).unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 2);
         f.sink.scan_done(
             "pub",
@@ -1067,8 +1084,8 @@ mod tests {
     #[test]
     fn deletion_needs_a_complete_scan() {
         let mut f = fx("del");
-        f.sink.extracted("pub", extracted("keep.txt", "k"));
-        f.sink.extracted("pub", extracted("gone.txt", "g"));
+        f.sink.extracted("pub", extracted("keep.txt", "k")).unwrap();
+        f.sink.extracted("pub", extracted("gone.txt", "g")).unwrap();
         f.sink.scan_done("pub", scan(false, &["keep.txt"], &[]));
         assert_eq!(
             files(&f.sink, Tier::Public),
@@ -1107,7 +1124,7 @@ mod tests {
             "io/d.txt",
             "plain.txt",
         ] {
-            f.sink.extracted("pub", extracted(rel, "x"));
+            f.sink.extracted("pub", extracted(rel, "x")).unwrap();
         }
         f.sink.scan_done(
             "pub",
@@ -1149,10 +1166,28 @@ mod tests {
         assert_eq!(f.sink.indexed_files("pub"), 0);
     }
 
+    #[test]
+    fn indexed_files_is_zero_or_one_and_stops_at_the_first_database() {
+        let mut f = fx("indexed-exists");
+        let break_db = |f: &Fx, t: Tier| {
+            f.sink.conn(t).execute_batch("DROP TABLE files").unwrap();
+        };
+        assert_eq!(f.sink.indexed_files("pub"), 0);
+        f.sink.extracted("pub", extracted("a.txt", "a")).unwrap();
+        f.sink.extracted("pub", extracted("b.txt", "b")).unwrap();
+        assert_eq!(f.sink.indexed_files("pub"), 1); // a count, not 2
+        // the private database is not consulted once the public one answers yes
+        break_db(&f, Tier::Private);
+        assert_eq!(f.sink.indexed_files("pub"), 1);
+        // an error answers "some", so adoption stays conservative
+        assert_eq!(f.sink.indexed_files("other"), 1);
+    }
+
     fn move_fixture(name: &str) -> Fx {
         let mut f = fx(name);
         f.sink
-            .extracted("moving", extracted("m.txt", "movable words"));
+            .extracted("moving", extracted("m.txt", "movable words"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
         // config now makes the nested root private
         fs::write(
@@ -1220,8 +1255,12 @@ mod tests {
     #[test]
     fn purge_removes_rows_a_new_exclusion_rejects() {
         let mut f = fx("purge");
-        f.sink.extracted("pub", extracted("docs/a.txt", "a"));
-        f.sink.extracted("pub", extracted("keep/b.txt", "b"));
+        f.sink
+            .extracted("pub", extracted("docs/a.txt", "a"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("keep/b.txt", "b"))
+            .unwrap();
         fs::write(
             &f.cfg,
             format!(
@@ -1242,8 +1281,12 @@ mod tests {
     #[test]
     fn prune_drops_legacy_rows_with_an_unsafe_path() {
         let mut f = fx("prune-unsafe");
-        f.sink.extracted("pub", extracted("a\u{202e}b.txt", "bad"));
-        f.sink.extracted("pub", extracted("ok.txt", "good"));
+        f.sink
+            .extracted("pub", extracted("a\u{202e}b.txt", "bad"))
+            .unwrap();
+        f.sink
+            .extracted("pub", extracted("ok.txt", "good"))
+            .unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 2);
         f.sink.reload(&f.cfg).unwrap();
         assert_eq!(files(&f.sink, Tier::Public), 1);
@@ -1295,8 +1338,12 @@ mod tests {
     #[test]
     fn rows_and_validation_of_removed_roots_are_purged() {
         let mut f = fx("orphans");
-        f.sink.extracted("pub", extracted("a.txt", "alpha"));
-        f.sink.extracted("secret", extracted("b.txt", "beta"));
+        f.sink
+            .extracted("pub", extracted("a.txt", "alpha"))
+            .unwrap();
+        f.sink
+            .extracted("secret", extracted("b.txt", "beta"))
+            .unwrap();
         f.sink
             .validated("/data/secret-things", ValidationResult::Eloop);
         f.sink.validated("/data/pub", ValidationResult::Ok);

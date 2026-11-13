@@ -1,6 +1,7 @@
 //! Scheduler: pool, per-share rule, timeouts, abandonment, solo retry, watcher lifecycle.
 //! Pure state machine: time, process control and storage are injected, so it never does I/O.
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::hash_map::Entry as Slot;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -88,12 +89,23 @@ struct RootRt {
     validate_paths: Vec<String>,
     validate_due: bool,
     validate_at: Time,
-    queue: VecDeque<(String, u64, i64)>,
-    queued: HashSet<String>,
+    /// Order of `queued`: one entry per file, size and mtime live in the map.
+    queue: VecDeque<String>,
+    queued: HashMap<String, (u64, i64)>,
     failed: HashMap<String, (u64, i64)>,
     retried: HashMap<String, (u64, i64)>,
     busy: Option<(WorkerId, Role)>,
     watch: WatchState,
+}
+
+impl RootRt {
+    /// Put a job back at the front; a file already queued is newer (a watch event), so it stays.
+    fn requeue(&mut self, rel: String, size: u64, mtime: i64) {
+        if let Slot::Vacant(v) = self.queued.entry(rel.clone()) {
+            v.insert((size, mtime));
+            self.queue.push_front(rel);
+        }
+    }
 }
 
 pub struct Sched<S, K> {
@@ -132,7 +144,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 validate_due: true,
                 validate_at: Time::ZERO,
                 queue: VecDeque::new(),
-                queued: HashSet::new(),
+                queued: HashMap::new(),
                 failed: HashMap::new(),
                 retried: HashMap::new(),
                 busy: None,
@@ -224,8 +236,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             match w.role {
                 Role::Extract => {
                     if let Some(j) = w.job.take() {
-                        self.roots[i].queued.insert(j.rel.clone());
-                        self.roots[i].queue.push_front((j.rel, j.size, j.mtime));
+                        self.roots[i].requeue(j.rel, j.size, j.mtime);
                     }
                 }
                 Role::Scan => {
@@ -273,8 +284,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     fn next_allowed(&mut self, i: usize) -> Option<(String, u64, i64)> {
         loop {
             let r = &mut self.roots[i];
-            let (rel, size, mtime) = r.queue.pop_front()?;
-            r.queued.remove(&rel);
+            let rel = r.queue.pop_front()?;
+            let (size, mtime) = r.queued.remove(&rel)?;
             let (name, cur) = (&r.spec.name, (size, mtime));
             if (self.allow)(name, &rel)
                 && self.sink.known(name, &rel) != Some(cur)
@@ -288,9 +299,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     fn has_allowed(&mut self, i: usize) -> bool {
         match self.next_allowed(i) {
             Some((rel, size, mtime)) => {
-                let r = &mut self.roots[i];
-                r.queued.insert(rel.clone());
-                r.queue.push_front((rel, size, mtime));
+                self.roots[i].requeue(rel, size, mtime);
                 true
             }
             None => false,
@@ -388,25 +397,26 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                         size: job.size,
                         mtime_ns: job.mtime,
                     };
-                    self.sink.extracted(&self.roots[i].spec.name, file);
+                    if let Err(e) = self.sink.extracted(&self.roots[i].spec.name, file) {
+                        self.store_error(i, &job, &e, now);
+                    }
                     self.send_next(id, now);
                 }
             }
             Message::Failed { relpath, reason } => {
                 if let Some(job) = take_job(w, &relpath) {
-                    let transient = transient(&reason);
-                    if !transient {
-                        self.fail(i, &job, &reason);
-                    }
-                    self.send_next(id, now);
-                    if transient {
+                    if reason == "changed" {
+                        // the file moved under the worker: keep the row, a scan finds the new state
+                        self.request_scan(i, now, Duration::ZERO);
+                    } else if transient(&reason) {
                         // keep the indexed row; try again later, not in a tight loop
                         let r = &mut self.roots[i];
                         r.hold = now + RETRY;
-                        if r.queued.insert(job.rel.clone()) {
-                            r.queue.push_back((job.rel, job.size, job.mtime));
-                        }
+                        r.requeue(job.rel, job.size, job.mtime);
+                    } else {
+                        self.fail(i, &job, &reason, now);
                     }
+                    self.send_next(id, now);
                 }
             }
             Message::RootError { state, reason } if role != Role::Watch => {
@@ -420,8 +430,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 w.scan = None;
                 let requeue = w.job.take();
                 if let Some(j) = requeue {
-                    self.roots[i].queued.insert(j.rel.clone());
-                    self.roots[i].queue.push_front((j.rel, j.size, j.mtime));
+                    self.roots[i].requeue(j.rel, j.size, j.mtime);
                 }
                 let r = &mut self.roots[i];
                 r.hold = now + RETRY;
@@ -481,11 +490,28 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
     }
 
-    fn fail(&mut self, i: usize, job: &ExtractJob, reason: &str) {
+    /// Record a permanent failure; only a stored one is remembered, a store error retries.
+    fn fail(&mut self, i: usize, job: &ExtractJob, reason: &str, now: Time) {
         let r = &mut self.roots[i];
-        r.failed.insert(job.rel.clone(), (job.size, job.mtime));
-        self.sink
-            .failed(&r.spec.name, &job.rel, job.size, job.mtime, reason);
+        match self
+            .sink
+            .failed(&r.spec.name, &job.rel, job.size, job.mtime, reason)
+        {
+            Ok(()) => {
+                r.failed.insert(job.rel.clone(), (job.size, job.mtime));
+            }
+            Err(e) => self.store_error(i, job, &e, now),
+        }
+    }
+
+    /// The store refused a result: requeue the job and hold the root, logging once per hold.
+    fn store_error(&mut self, i: usize, job: &ExtractJob, error: &str, now: Time) {
+        let r = &mut self.roots[i];
+        if now >= r.hold {
+            eprintln!("sched: store error on {}: {error}", r.spec.name);
+        }
+        r.hold = now + RETRY;
+        r.requeue(job.rel.clone(), job.size, job.mtime);
     }
 
     /// Feed the extract worker its next file, or let it exit.
@@ -496,9 +522,10 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         let i = w.root;
         let capped = w.served >= MAX_FILES || now.saturating_sub(w.started) >= MAX_RUN;
         let stop = w.solo
-            || !self.solo.is_empty()
+            || now < self.roots[i].hold
+            || self.solo.front().is_some_and(|s| !self.solo_held(s.0, now))
             || (capped && self.others_waiting(i, now))
-            || !self.identity_allows(i, now);
+            || !self.may_extract(i, now);
         let next = if stop { None } else { self.next_allowed(i) };
         let Some((rel, size, mtime)) = next else {
             self.shutdown(id, now);
@@ -544,15 +571,19 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
     }
 
-    fn identity_allows(&mut self, i: usize, now: Time) -> bool {
+    fn verdict_of(&self, i: usize) -> Verdict {
         let r = &self.roots[i];
-        let indexed = self.sink.indexed_files(&r.spec.name);
-        let v = verdict(
+        verdict(
             r.expected.as_ref(),
             r.spec.share.as_deref(),
             &r.derived.share,
-            indexed,
-        );
+            self.sink.indexed_files(&r.spec.name),
+        )
+    }
+
+    /// `verdict_of` plus the Mismatch consequences: queue dropped, root held and offline.
+    fn check_identity(&mut self, i: usize, now: Time) -> Verdict {
+        let v = self.verdict_of(i);
         if v == Verdict::Mismatch {
             let r = &mut self.roots[i];
             r.queue.clear();
@@ -561,7 +592,20 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.solo.retain(|s| s.0 != i);
             self.set_state(i, "offline", "identity mismatch");
         }
-        v != Verdict::Mismatch
+        v
+    }
+
+    /// Extraction and watchers need a confirmed identity; scanning only needs it not to mismatch.
+    fn may_extract(&mut self, i: usize, now: Time) -> bool {
+        matches!(self.check_identity(i, now), Verdict::Ok | Verdict::Adopt)
+    }
+
+    /// The solo retry of root `i` cannot start now; other work must not wait for it.
+    fn solo_held(&self, i: usize, now: Time) -> bool {
+        now < self.roots[i].hold
+            || self.root_blocked(i)
+            || !matches!(self.verdict_of(i), Verdict::Ok | Verdict::Adopt)
+            || self.shares.backing_off(&self.roots[i].derived.share, now)
     }
 
     fn scan_done(
@@ -597,12 +641,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.scan_finished(i, now, RETRY);
             return;
         }
-        if v == Some(Verdict::Probe) {
+        // an identity the worker could not confirm is unknown, not a mismatch: discard, no state change
+        if v == Some(Verdict::Probe) || before.is_none() || after.is_none() {
             self.scan_finished(i, now, RETRY);
             return;
         }
-        let accepted = complete && before.is_some() && before == after;
-        if accepted && v == Some(Verdict::Adopt) {
+        let accepted = complete && before == after;
+        // equal identities on both sides adopt even when the walk was incomplete
+        if v == Some(Verdict::Adopt) {
             self.roots[i].expected = before.as_ref().map(|b| b.share.clone());
             if let Some(b) = &before {
                 self.sink.set_expected_identity(&name, &b.share);
@@ -648,10 +694,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if self.sink.known(&r.spec.name, &rel) == Some(cur) || r.failed.get(&rel) == Some(&cur) {
             return;
         }
-        if r.queued.insert(rel.clone()) {
-            r.queue.push_back((rel, size, mtime));
-        } else if let Some(q) = r.queue.iter_mut().find(|q| q.0 == rel) {
-            *q = (rel, size, mtime);
+        match r.queued.entry(rel.clone()) {
+            Slot::Vacant(v) => {
+                v.insert(cur);
+                r.queue.push_back(rel);
+            }
+            Slot::Occupied(mut o) => {
+                o.insert(cur);
+            }
         }
     }
 
@@ -681,7 +731,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             }
             Role::Extract => {
                 if let Some(job) = w.job {
-                    self.extract_died(i, job);
+                    self.extract_died(i, job, now);
                 }
             }
             Role::Validate => {
@@ -694,13 +744,13 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     }
 
     /// Died or was OOM-killed mid-extract: one solo retry if it had company, else failed.
-    fn extract_died(&mut self, i: usize, job: ExtractJob) {
+    fn extract_died(&mut self, i: usize, job: ExtractJob, now: Time) {
         let cur = (job.size, job.mtime);
         if job.overlap && self.roots[i].retried.get(&job.rel) != Some(&cur) {
             self.roots[i].retried.insert(job.rel.clone(), cur);
             self.solo.push_back((i, job.rel, job.size, job.mtime));
         } else {
-            self.fail(i, &job, "worker died");
+            self.fail(i, &job, "worker died", now);
         }
     }
 
@@ -744,11 +794,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         }
         if let Some(job) = job {
             if stuck {
-                let r = &mut self.roots[i];
-                r.queued.insert(job.rel.clone());
-                r.queue.push_front((job.rel, job.size, job.mtime));
+                self.roots[i].requeue(job.rel, job.size, job.mtime);
             } else {
-                self.fail(i, &job, why);
+                self.fail(i, &job, why, now);
             }
         } else if was_scanning {
             self.scan_finished(i, now, RETRY);
@@ -820,7 +868,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             if !self.network(i)
                 && self.roots[i].watch.should_spawn(now)
                 && !self.root_blocked(i)
-                && self.identity_allows(i, now)
+                && self.may_extract(i, now)
             {
                 self.start_watcher(i, now);
             }
@@ -859,18 +907,20 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             }
             self.solo.pop_front();
         }
-        if let Some((i, ..)) = self.solo.front().cloned() {
+        if let Some(&(i, ..)) = self.solo.front()
+            && now >= self.roots[i].hold
+        {
+            self.check_identity(i, now); // a mismatch drops the root's solo entries
+        }
+        if let Some(&(i, ..)) = self.solo.front()
+            && !self.solo_held(i, now)
+        {
             let share = self.roots[i].derived.share.clone();
-            let held = now < self.roots[i].hold
-                || self.root_blocked(i)
-                || (self.network(i) && !self.shares.free(&share, now));
-            if !held && self.identity_allows(i, now) {
-                if self.pool_live() == 0 {
-                    let (_, rel, size, mtime) = self.solo.pop_front().expect("front");
-                    self.start(i, Role::Extract, Some((rel, size, mtime)), now);
-                }
-                return; // drain: nothing else starts while a solo retry waits for the pool
+            if self.pool_live() == 0 && (!self.network(i) || self.shares.free(&share, now)) {
+                let (_, rel, size, mtime) = self.solo.pop_front().expect("front");
+                self.start(i, Role::Extract, Some((rel, size, mtime)), now);
             }
+            return; // drain: nothing else starts while a solo retry waits for the pool
         }
         let n = self.roots.len();
         for k in 0..n {
@@ -891,14 +941,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             && !self.roots[i].validate_paths.is_empty()
         {
             Role::Validate
-        } else if self.has_allowed(i) {
+        } else if self.has_allowed(i) && self.may_extract(i, now) {
             Role::Extract
         } else if self.roots[i].scan_due <= now {
             Role::Scan
         } else {
             return;
         };
-        if role != Role::Validate && !self.identity_allows(i, now) {
+        if role == Role::Scan && self.check_identity(i, now) == Verdict::Mismatch {
             return;
         }
         if self.network(i) && !self.shares.free(&self.roots[i].derived.share, now) {
@@ -1061,6 +1111,9 @@ mod tests {
         expected: HashMap<String, Share>,
         scans: Vec<(String, bool)>,
         failed: Vec<String>,
+        extracted: Vec<String>,
+        /// The store refuses results while set.
+        store_err: bool,
         validated: Vec<(String, ValidationResult)>,
         states: RefCell<Vec<(String, String, String)>>,
     }
@@ -1080,9 +1133,26 @@ mod tests {
         fn scan_done(&mut self, root: &str, scan: ScanResult) {
             self.scans.push((root.into(), scan.complete));
         }
-        fn extracted(&mut self, _: &str, _: ExtractedFile) {}
-        fn failed(&mut self, _: &str, relpath: &str, _: u64, _: i64, _: &str) {
+        fn extracted(&mut self, _: &str, f: ExtractedFile) -> Result<(), String> {
+            if self.store_err {
+                return Err("disk full".into());
+            }
+            self.extracted.push(f.relpath);
+            Ok(())
+        }
+        fn failed(
+            &mut self,
+            _: &str,
+            relpath: &str,
+            _: u64,
+            _: i64,
+            _: &str,
+        ) -> Result<(), String> {
+            if self.store_err {
+                return Err("disk full".into());
+            }
             self.failed.push(relpath.into());
+            Ok(())
         }
         fn validated(&mut self, path: &str, result: ValidationResult) {
             self.validated.push((path.into(), result));
@@ -1522,7 +1592,7 @@ mod tests {
         s.handle(e, Event::Exit, secs(41));
         assert!(!s.shares.free(&share, secs(42)));
         assert!(s.sink.failed.is_empty()); // g is retried later, not failed
-        assert!(s.roots[0].queue.iter().any(|q| q.0 == "g"));
+        assert!(s.roots[0].queue.iter().any(|q| q == "g"));
     }
 
     #[test]
@@ -2057,6 +2127,271 @@ mod tests {
         s.handle(scans(&s)[0].0, Event::Exit, secs(40)); // the scan that ran meanwhile ends
         s.tick(secs(62));
         assert_eq!(roles(&s, Role::Validate), 2);
+    }
+
+    fn done_msg(
+        complete: bool,
+        before: Option<MountIdentity>,
+        after: Option<MountIdentity>,
+    ) -> Event {
+        Event::Msg(Message::ScanDone {
+            complete,
+            identity_before: before,
+            identity_after: after,
+        })
+    }
+
+    fn entry(rel: &str) -> Event {
+        Event::Msg(Message::Entry {
+            relpath: rel.into(),
+            size: 10,
+            mtime_ns: 5,
+            is_dir: false,
+        })
+    }
+
+    #[test]
+    fn incomplete_stable_first_scan_adopts_and_indexing_continues() {
+        let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        let who = ident("/mnt/nas", "nas:/a", "nfs", 2);
+        s.handle(id, entry("f"), secs(1));
+        s.handle(id, done_msg(false, Some(who.clone()), Some(who)), secs(1));
+        assert_eq!(s.sink.expected["r"].source, "nas:/a");
+        assert_eq!(s.sink.scans, [("r".to_string(), false)]); // no deletions
+        s.handle(id, Event::Exit, secs(1));
+        s.tick(secs(2));
+        assert_eq!(extracts(&s).len(), 1);
+    }
+
+    #[test]
+    fn legacy_root_with_files_and_no_identity_stays_offline() {
+        let sink = Mem {
+            indexed: 3,
+            ..Mem::default()
+        };
+        let mut s = mem_sched(sink, Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+        for t in [0, 70, 4000] {
+            s.tick(secs(t));
+        }
+        assert!(s.spawner.spawned.is_empty());
+        assert_eq!(
+            s.sink.states.borrow().last().unwrap().2,
+            "identity mismatch"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_scan_identity_discards_the_scan_without_a_state_change() {
+        let who = ident("/mnt/nas", "nas:/a", "nfs", 2);
+        for (before, after) in [
+            (Some(who.clone()), None),
+            (None, Some(who.clone())),
+            (None, None),
+        ] {
+            let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+            s.tick(secs(0));
+            let id = scans(&s)[0].0;
+            s.handle(id, entry("f"), secs(1));
+            s.handle(id, done_msg(true, before, after), secs(1));
+            assert!(s.sink.scans.is_empty());
+            assert!(s.roots[0].queue.is_empty() && s.roots[0].queued.is_empty());
+            assert!(s.sink.states.borrow().is_empty());
+            assert_eq!(s.roots[0].scan_due, secs(1) + RETRY);
+        }
+    }
+
+    #[test]
+    fn probe_root_with_queued_files_scans_and_local_autofs_has_no_watcher() {
+        let autofs = "3 1 0:3 / /mnt/nas rw - autofs /etc/auto.x rw".to_string();
+        let mut s = mem_sched(Mem::default(), Kind::Auto, &[ext4(1, "/"), autofs.clone()]);
+        s.queue_one(0, "f".into(), 1, 1);
+        s.tick(secs(0));
+        assert_eq!(roles(&s, Role::Extract), 0);
+        assert_eq!(roles(&s, Role::Scan), 1);
+        let mut s = mem_sched(Mem::default(), Kind::Local, &[ext4(1, "/"), autofs]);
+        s.tick(secs(0));
+        assert_eq!(roles(&s, Role::Watch), 0);
+    }
+
+    /// One local root `a` with files f and g, the first extract of f in flight (worker `e`).
+    fn extracting(files: &[(&str, u64, i64)]) -> (T, WorkerId) {
+        let mut s = sched(2, &[("a", "/mnt/la")], &[ext4(1, "/"), ext4(2, "/mnt/la")]);
+        s.tick(secs(0));
+        watchers_ready(&mut s, secs(0));
+        let id = scans(&s)[0].0;
+        done_scan(
+            &mut s,
+            id,
+            ident("/mnt/la", "/dev/d2", "ext4", 2),
+            files,
+            secs(1),
+        );
+        s.tick(secs(1));
+        let e = s.spawner.spawned.last().unwrap().0;
+        assert!(extracts(&s)[0].1.contains("\"f\""));
+        (s, e)
+    }
+
+    fn failed_msg(rel: &str, reason: &str) -> Event {
+        Event::Msg(Message::Failed {
+            relpath: rel.into(),
+            reason: reason.into(),
+        })
+    }
+
+    #[test]
+    fn transient_failure_holds_the_root_before_the_next_file_is_sent() {
+        let (mut s, e) = extracting(&[("f", 10, 5), ("g", 10, 5)]);
+        s.handle(e, failed_msg("f", "EIO"), secs(2));
+        assert_eq!(extracts(&s).len(), 1, "g must not follow within RETRY");
+        s.handle(e, Event::Exit, secs(2));
+        s.tick(secs(30));
+        assert_eq!(extracts(&s).len(), 1);
+        s.tick(secs(70));
+        assert_eq!(extracts(&s).len(), 2);
+    }
+
+    #[test]
+    fn changed_keeps_the_row_drops_the_request_and_makes_a_scan_due() {
+        let (mut s, e) = extracting(&[("f", 10, 5)]);
+        s.handle(e, failed_msg("f", "changed"), secs(2));
+        assert!(s.sink.failed.is_empty() && s.roots[0].failed.is_empty());
+        assert!(s.roots[0].queue.is_empty());
+        assert_eq!(s.roots[0].scan_due, secs(2));
+        // a network root too
+        let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+        s.tick(secs(0));
+        let id = scans(&s)[0].0;
+        done_scan(
+            &mut s,
+            id,
+            ident("/mnt/nas", "nas:/a", "nfs", 2),
+            &[("f", 10, 5)],
+            secs(1),
+        );
+        s.tick(secs(1));
+        let e = s.spawner.spawned.last().unwrap().0;
+        assert_eq!(s.roots[0].scan_due, secs(1) + s.roots[0].spec.interval);
+        s.handle(e, failed_msg("f", "changed"), secs(2));
+        assert!(s.sink.failed.is_empty() && s.roots[0].failed.is_empty());
+        assert!(s.roots[0].queue.is_empty());
+        assert_eq!(s.roots[0].scan_due, secs(2));
+    }
+
+    #[test]
+    fn held_solo_does_not_stop_other_workers() {
+        for held in [true, false] {
+            let mut s = sched(
+                2,
+                &[("a", "/mnt/la"), ("b", "/mnt/lb")],
+                &[ext4(1, "/"), ext4(2, "/mnt/la"), ext4(3, "/mnt/lb")],
+            );
+            s.tick(secs(0));
+            let a = scans(&s)[0].0;
+            done_scan(
+                &mut s,
+                a,
+                ident("/mnt/la", "/dev/d2", "ext4", 2),
+                &[("f", 10, 5), ("g", 10, 5)],
+                secs(1),
+            );
+            s.tick(secs(1));
+            let e = s.spawner.spawned.last().unwrap().0;
+            assert!(extracts(&s)[0].1.contains("\"f\""));
+            // a solo retry waits on root b
+            s.solo.push_back((1, "x".into(), 1, 1));
+            if held {
+                s.roots[1].hold = secs(1000);
+            }
+            s.handle(e, extracted_msg("f"), secs(2));
+            // held: worker e carries on with g; not held: the pool drains for the solo retry
+            assert_eq!(extracts(&s).len(), if held { 2 } else { 1 });
+        }
+    }
+
+    fn extracted_msg(rel: &str) -> Event {
+        Event::Msg(Message::Extracted {
+            relpath: rel.into(),
+            title: "t".into(),
+            r#type: "text".into(),
+            blake3: "h".into(),
+            chunks: vec![],
+        })
+    }
+
+    #[test]
+    fn a_failing_store_requeues_extracted_and_failed_and_the_retry_succeeds() {
+        for permanent in [false, true] {
+            let (mut s, e) = extracting(&[("f", 10, 5)]);
+            s.sink.store_err = true;
+            let reply = if permanent {
+                failed_msg("f", "x")
+            } else {
+                extracted_msg("f")
+            };
+            s.handle(e, reply, secs(2));
+            assert!(s.roots[0].failed.is_empty(), "not remembered as failed");
+            assert_eq!(s.roots[0].queue, ["f"]);
+            assert_eq!(s.roots[0].hold, secs(2) + RETRY);
+            s.handle(e, Event::Exit, secs(2));
+            s.sink.store_err = false;
+            s.tick(secs(30));
+            assert_eq!(extracts(&s).len(), 1);
+            s.tick(secs(70));
+            assert_eq!(extracts(&s).len(), 2);
+            let e2 = extracts(&s)[1].0;
+            let reply = if permanent {
+                failed_msg("f", "x")
+            } else {
+                extracted_msg("f")
+            };
+            s.handle(e2, reply, secs(71));
+            if permanent {
+                assert_eq!(s.sink.failed, ["f"]);
+                assert!(s.roots[0].failed.contains_key("f"));
+            } else {
+                assert_eq!(s.sink.extracted, ["f"]);
+            }
+        }
+    }
+
+    #[test]
+    fn requeue_never_overwrites_a_newer_queued_entry() {
+        for route in ["reload", "root_error", "abandon", "transient", "store"] {
+            let mut s = mem_sched(Mem::default(), Kind::Auto, &[nfs(2, "/mnt/nas", "nas:/a")]);
+            s.tick(secs(0));
+            let id = scans(&s)[0].0;
+            let who = ident("/mnt/nas", "nas:/a", "nfs", 2);
+            done_scan(&mut s, id, who, &[("f", 10, 5)], secs(1));
+            s.tick(secs(1));
+            let e = s.spawner.spawned.last().unwrap().0;
+            assert!(extracts(&s)[0].1.contains("\"f\""));
+            // a newer version arrives while the old job is in flight
+            s.queue_one(0, "f".into(), 11, 6);
+            match route {
+                "reload" => s.reload(Box::new(|_, _| true), secs(3)),
+                "root_error" => s.handle(
+                    e,
+                    Event::Msg(Message::RootError {
+                        state: "offline".into(),
+                        reason: "x".into(),
+                    }),
+                    secs(3),
+                ),
+                "abandon" => s.tick(secs(40)),
+                "transient" => s.handle(e, failed_msg("f", "EIO"), secs(3)),
+                _ => {
+                    s.sink.store_err = true;
+                    s.handle(e, extracted_msg("f"), secs(3));
+                }
+            }
+            let r = &s.roots[0];
+            assert_eq!(r.queue, ["f"], "{route}");
+            assert_eq!(r.queued.len(), 1, "{route}");
+            assert_eq!(r.queued["f"], (11, 6), "{route}");
+        }
     }
 
     /// Runs in a child process under a Landlock ruleset that cannot read the fixture roots.

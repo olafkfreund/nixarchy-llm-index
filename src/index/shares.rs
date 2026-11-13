@@ -100,6 +100,10 @@ impl ShareBook {
             .get(share)
             .is_none_or(|e| e.live.is_empty() && now >= e.not_before)
     }
+    /// Inside the offline backoff, whether or not a worker is still live.
+    pub fn backing_off(&self, share: &Share, now: Time) -> bool {
+        self.map.get(share).is_some_and(|e| now < e.not_before)
+    }
     pub fn charge(&mut self, share: &Share, id: WorkerId) {
         self.map.entry(share.clone()).or_default().live.insert(id);
     }

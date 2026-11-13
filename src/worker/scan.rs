@@ -523,6 +523,11 @@ impl<'a> Walker<'a> {
     }
 }
 
+/// An identity is reported only when it is the mount the root fd lives on.
+fn on_fd_mount(identity: Option<MountIdentity>, fd_id: Option<u64>) -> Option<MountIdentity> {
+    identity.filter(|m| Some(m.mount_id) == fd_id)
+}
+
 pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
     let i = ready.root.ok_or("missing root")?;
     let root = &ready.config.roots[i];
@@ -543,12 +548,14 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
             eprintln!("scan root mount id: {error}");
             return output.send(&Message::ScanDone {
                 complete: false,
-                identity_before: before,
+                identity_before: None,
                 identity_after: None,
             });
         }
     };
-    let mut complete = before.as_ref().is_some_and(|m| m.mount_id == fd_id);
+    // An identity that is not the one the root fd lives on is unknown, not a mismatch.
+    let before = on_fd_mount(before, Some(fd_id));
+    let mut complete = before.is_some();
     let max_size = ready.config.limits.max_file_mb.saturating_mul(1024 * 1024);
     let mut walker = Walker::new(ready)?;
     if let Err(error) = walker.walk(|rel, st, _, reason| {
@@ -601,7 +608,8 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
             None
         }
     };
-    complete &= before == after && after.as_ref().is_some_and(|m| Some(m.mount_id) == after_id);
+    let after = on_fd_mount(after, after_id);
+    complete &= before == after && after.is_some();
     output.send(&Message::ScanDone {
         complete,
         identity_before: before,
@@ -652,6 +660,17 @@ pub fn validate_path(path: &Path) -> ValidationResult {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn identity_off_the_root_fd_mount_is_none() {
+        let data = "1 0 0:1 / / rw - ext4 /dev/root rw\n2 1 0:2 / /mnt/nas rw - nfs old rw";
+        let id = mount_identity(&mut Cursor::new(data), Path::new("/mnt/nas"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_fd_mount(Some(id.clone()), Some(2)), Some(id.clone()));
+        assert_eq!(on_fd_mount(Some(id.clone()), Some(1)), None);
+        assert_eq!(on_fd_mount(Some(id), None), None);
+    }
 
     #[test]
     fn mountinfo_identity() {

@@ -79,8 +79,16 @@ pub trait Sink {
     /// Stored (size, mtime_ns) of a file, if indexed.
     fn known(&self, root: &str, relpath: &str) -> Option<(u64, i64)>;
     fn scan_done(&mut self, root: &str, scan: ScanResult);
-    fn extracted(&mut self, root: &str, file: ExtractedFile);
-    fn failed(&mut self, root: &str, relpath: &str, size: u64, mtime_ns: i64, reason: &str);
+    /// An error means nothing was stored: the caller requeues and retries.
+    fn extracted(&mut self, root: &str, file: ExtractedFile) -> Result<(), String>;
+    fn failed(
+        &mut self,
+        root: &str,
+        relpath: &str,
+        size: u64,
+        mtime_ns: i64,
+        reason: &str,
+    ) -> Result<(), String>;
     /// Result of a `validate` worker for one root or exclusion path.
     fn validated(&mut self, path: &str, result: ValidationResult);
     fn root_state(&mut self, root: &str, state: &str, reason: &str);
