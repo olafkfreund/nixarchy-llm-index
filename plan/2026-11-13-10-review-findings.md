@@ -1,0 +1,272 @@
+---
+status: draft
+issue: 10
+spec: spec/2026-11-13-10-review-findings.md
+coders:
+  1: coder   # scheduler state machine across sched.rs/shares.rs/store.rs; large and stateful
+  2: codex   # get paging: small, tricky cursor logic in one function
+  3: codex   # sanitize/label: small, exact character rules with tests
+  4: codex   # three small tricky fixes (byte slice, watch errors, mtime saturation)
+  5: coder   # config validation and the pipe reader; medium, self-contained
+  6: coder   # store.rs/db.rs follow-up to step 1; same agent keeps its cache warm
+  7: codex   # landlock scopes and denial probes: small, security-sensitive
+  8: agy     # denylist entries and docs: large, mechanical text edits
+reviewers:
+  - codex    # independent read of the whole diff against this plan
+  - agy      # second independent read; disagreement is useful on the scheduler
+---
+
+# Plan: fix the bugs and gaps found in the Fable code review
+
+Self-contained: every decision below is from the approved spec. Item numbers
+(`#n`) match the intent and spec. Repo:
+`/mnt/code/Source-home/GitHub/nixarchy-llm-index`, branch
+`fix/10-review-findings`.
+
+## How the steps run
+
+- Each implementer works in its own worktree off `fix/10-review-findings`
+  (`../llm-index-10-sN`). The lead reviews each diff, commits it in that
+  worktree and cherry-picks onto the branch. Implementers never stage or
+  commit.
+- Wave A in parallel: steps 1, 3, 4, 5, 7, 8. Wave B after its dependency
+  is on the branch: step 6 after step 1 (same coder), step 2 after step 3.
+- Check for every step, in its worktree:
+  `cargo test --all-targets && cargo clippy --all-targets -- -D warnings`.
+  Run cargo with `CARGO_TARGET_DIR=target-sN` so worktrees do not share a
+  lock.
+- Traps for every step: no new dependency; no `unwrap` on input; keep each
+  function's existing error handling; every behaviour change gets a test
+  that fails on `84fc986`; the public server must still open only
+  `public.db` and filter every query on `visible()`.
+
+## Steps
+
+### 1. Scheduler (#1, #2, #7, #8, #16, #17, #18 queue)
+
+Files: `src/index/sched.rs`, `src/index/shares.rs`, `src/worker/scan.rs`
+(identity part), `src/index/store.rs` (`Sink` impl).
+
+1. **#1 adoption.** In `scan.rs` (around line 551-609), send
+   `identity_before`/`identity_after` as `None` when the mount id does not
+   equal the root fd's mount id (today that check only feeds `complete`).
+   In `sched.rs` `scan_done`: discard a scan with `before.is_none()` (set
+   no state change beyond today's offline handling for a changed mount;
+   just `scan_finished(i, now, RETRY)` and return). Adopt when
+   `v == Some(Adopt) && before == after`, dropping the `complete`
+   condition. Completeness still decides deletions (unchanged).
+2. **#1 try_root.** Choose `Role::Extract` only when the identity allows
+   extraction (verdict `Ok` or `Adopt`); otherwise fall through to the
+   `Scan` branch. `Probe` (autofs) and a root with queued files must still
+   scan. Start watchers only on `Ok` or `Adopt`.
+3. **#1 legacy roots** stay `Mismatch` (no auto-recovery). Existing tests
+   `shares.rs` ~158 and `sched.rs` ~1408 keep their expectations.
+4. **#2.** In the `Message::Failed` transient branch, set `hold = now +
+   RETRY` and requeue *before* `send_next`. In `send_next`, add
+   `now < self.roots[i].hold` to `stop`.
+5. **#7.** `"changed"` is not passed to `fail()`: drop the request, keep
+   the row, set the root's `scan_due = now`. Do not add it to
+   `transient()`.
+6. **#8.** Add `fn solo_held(&self, i, now) -> bool` = `now <
+   roots[i].hold || root_blocked(i) || identity refuses extraction ||
+   share backoff (now < not_before for that share)`. Not `shares.free`.
+   `send_next` stops for solo only when `solo.front()` exists and is not
+   held. Dispatch keeps its own `shares.free` check before starting the
+   solo worker.
+7. **#16.** `DbSink::indexed_files`: `SELECT EXISTS(SELECT 1 FROM files
+   WHERE root_id = ?1 AND state = 'ok')`, stop at the first database that
+   says yes, return 0 or 1; a database error returns 1.
+8. **#17.** `Sink::extracted` and `Sink::failed` return
+   `Result<(), String>`; `DbSink` stops logging these errors itself.
+   `fail()` calls `sink.failed` first and inserts into `r.failed` only on
+   `Ok`. `extract_died` takes `now`. On any store error: requeue, set
+   `hold = now + RETRY`, log once per hold.
+9. **#18 queue.** `queued: HashMap<String, (u64, i64)>`, `queue:
+   VecDeque<String>`. `queue_one` updates the map for a duplicate (no
+   linear search); `next_allowed` reads size/mtime from the map. One
+   requeue helper (`entry().or_insert`, push to the front) used by
+   `reload`, `RootError`, `abandon`, the transient branch and store
+   errors, so a newer watch-event entry is never overwritten and `queue`
+   and `queued` stay one-to-one.
+
+Tests (sched unit tests): incomplete stable first scan adopts and
+indexing continues; legacy stuck root stays offline; scan with mismatched
+fd mount adopts nothing; `Probe` root with queued files scans; transient
+failure holds and does not resend within `RETRY`; `changed` keeps the row,
+drops the request, makes a scan due, also on a network root; held solo
+does not stop other workers; `extracted` failing and `failed` failing each
+requeue and the retry succeeds. Update test sinks for the new signatures.
+
+Traps: `scan_done` order matters (verdict before adoption); tests in
+`store.rs` call `sink.extracted(...)` about 20 times and need `.unwrap()`
+or `?` for clippy.
+
+### 2. `get` paging (#3, #18 get, #11 output)
+
+File: `src/mcp.rs`. Runs after step 3.
+
+- Read the unit kind first: `SELECT kind FROM chunks WHERE file_id = ?1
+  ORDER BY ord LIMIT 1`.
+- Rows mode: units in chunk order (sheet order, then row). `sheet` +
+  `start` is a cursor: start at the first unit of that sheet with row
+  `>= start`, continue through later sheets. `end` bounds rows of the
+  starting sheet and stops there. One encoding: compare the `sheet`
+  argument with `untrusted(stored_name)` (escaped); emit `next.sheet`
+  escaped the same way.
+- Lines and pages mode: the chunk query adds `AND end >= ?2` with `lo`
+  bound as `i64` (`i64::try_from`, else argument error).
+- Stream units from the row iterator; stop once the budget is used and
+  `next` is known. Keep `last_line` de-duplication and `offset`.
+- `search` and `recent`: `title`, `heading`, `symbol` and the displayed
+  `sheet` go through `sanitize::label(…, 200)` before `untrusted`.
+- Tests: three-sheet workbook paged with a small budget returns every row
+  once; sheets `<x` and `&lt;x` in one workbook page correctly; large text
+  file paging does bounded work per call (count units built); `start`
+  above `i64::MAX` errors; a 10 000-character title is cut in `search`.
+
+Traps: `docs/reference.md` changes are step 8's; `get` must keep the
+`visible()` gate and the "not found" for hidden files.
+
+### 3. Labels and control characters (#11, #12)
+
+Files: `src/sanitize.rs`, `src/worker/extract.rs`, `src/extract/sheet.rs`.
+
+- `sanitize`: also remove C0 controls except `\t` and `\n`, DEL, C1
+  (U+0080-U+009F), U+00AD, U+034F, U+115F, U+1160, U+3164, U+FFA0,
+  U+2028, U+2029, U+206A-U+206F, U+FFF9-U+FFFB, and `\r`.
+- New `pub fn label(s: &str, max: usize) -> String`: map `\n`, `\r`,
+  `\t`, U+0085, U+2028, U+2029 to space; then `sanitize`; then any
+  remaining control char to space; collapse space runs; trim; cut to
+  `max` chars.
+- `worker/extract.rs`: before `chunk::chunk`, apply `label(…, 200)` to the
+  title (and the file-name fallback) and to every segment heading and
+  symbol; an empty optional label becomes `None`.
+- `sheet.rs`: sheet names are not normalised; cut a name over 1000 chars
+  and, if that makes two names in a workbook equal, append `#2`, `#3`, …
+- Tests: ESC, C1, each listed code point, `\r\n`; `label` on a
+  10 000-char string with newlines; a heading of 100 KB is cut before
+  chunking; two 1 200-char sheet names with the same first 1000 chars get
+  unique names.
+
+Traps: `sanitize` is used for chunk text, so `\t` and `\n` must stay;
+existing sanitize tests must pass.
+
+### 4. HTML, watcher, mtime (#4, #5, #9 mtime)
+
+Files: `src/extract/html.rs`, `src/worker/watch.rs`, `src/worker/scan.rs`
+(`walk_subtree` only), `src/worker/mod.rs`.
+
+- `skip_rawtext_element`: compare bytes,
+  `bytes[a..b].eq_ignore_ascii_case(tag_name.as_bytes())`.
+- `walk_subtree` / `add_watches`: when opening the subtree root or adding
+  its inotify watch fails with `ENOENT`, `ENOTDIR`, `EACCES`, `ELOOP` or
+  `EXDEV`, skip that path and continue; other errors still degrade.
+- One saturating `statx` → nanoseconds helper in `src/worker/mod.rs`, used
+  by `scan.rs` (~571), `watch.rs` (~277) and `worker/extract.rs`.
+- Tests: `<script></aaaaaé</script>` does not panic; a directory created
+  and removed before its watch is added leaves the watcher healthy; an
+  mtime past 2262 saturates.
+
+Traps: step 1 edits `scan.rs` around lines 551-609; touch only
+`walk_subtree` (~360-372) and the mtime line there.
+
+### 5. Config and pipe reader (#6, #9 max_file_mb, #18 pipe)
+
+Files: `src/config.rs`, `src/index/mod.rs`.
+
+- Move `parse_duration` from `src/index/mod.rs` to `src/config.rs`
+  (`pub`), using `strip_suffix`/`char_indices` for the unit, `checked_mul`,
+  and rejecting 0. Its error escapes the value like other config errors.
+- `Config::validate` parses every root's `interval` and
+  `limits.backoff_max`, and rejects `max_file_mb = 0`.
+- `Proc::parse`: keep a search cursor so only new bytes are searched for
+  `\n`; reset it whenever the buffer is cleared (including the `MAX_LINE`
+  overflow path); drain consumed lines once per read.
+- Tests: `5µ`, `0s`, an overflowing number, `max_file_mb = 0` rejected;
+  `Proc::parse` with a line split over many reads and with an over-long
+  line then a good one.
+
+### 6. Store (#9 model, #13, #15, #17 timeout)
+
+Files: `src/index/store.rs`, `src/db.rs`. Runs after step 1.
+
+- `db.rs` writer open: `busy_timeout = 5000` first, then the WAL pragma,
+  then `DROP TABLE IF EXISTS embed_cache`; remove the table from the
+  schema.
+- `store_file`: before deleting the file's current chunks, read a map
+  `(heading_or_symbol, text) → vec` (non-NULL only) and reuse it for new
+  chunks with the same pair; embed only the rest. Remove `vector()`'s
+  cache read and write.
+- `open_with`, per database, one transaction each: if `meta.model_rev` is
+  set and differs from `embed::MODEL_REV`, `UPDATE chunks SET vec = NULL`,
+  `UPDATE files SET size = -1 WHERE state = 'ok'`, write the new revision.
+- `move_tier`: batches of 256 ids; per batch read, delete from source and
+  commit, insert into destination and commit.
+- Tests: model revision change resets vectors and sizes and leaves
+  `mtime_ns`; `embed_cache` is gone after open; an unchanged chunk keeps
+  its vector across an edit; a tier move of 1 000 files works and a crash
+  after the first batch leaves no row in both databases.
+
+Traps: compaction (#8) already runs after `purge` at open; keep the order
+open → purge → compact.
+
+### 7. Worker sandbox (#10)
+
+Files: `src/worker/sandbox.rs`, `src/worker/mod.rs` (self-test).
+
+- `restrict`: `ABI::V9`, keep `BestEffort`, add
+  `.scope(Scope::from_all(abi))?`.
+  `AccessFs::from_all(V9)` now includes `ResolveUnix`; `from_read` does
+  not, so pathname socket connects are denied.
+- Self-test: under the worker rules, probe a pathname socket outside the
+  root, an abstract socket and `kill(getppid(), 0)`; print whether each
+  is denied. Do not fail the self-test on a kernel that lacks them.
+- Test: the three probes are denied when the kernel ABI is at least 9
+  (skip with a message otherwise). This host reports ABI 11.
+
+Traps: the TCP hard check (`tcp_restriction_supported`) stays; parser
+crash tests and VM tests must still pass under the new rules.
+
+### 8. Denylist and docs (#14, #19, open questions, #1 and #3 docs)
+
+Files: `src/deny.rs`, `docs/`.
+
+- `deny.rs` `BUILTIN`: add `nix.conf`, `.config/age/`, `rclone.conf`,
+  `.config/containers/auth.json`, `credentials.tfrc.json`,
+  `.config/glab-cli/`, `.config/github-copilot/`, `secrets.yaml`,
+  `secrets.yml`, `secrets.json`, `credentials.json`,
+  `service-account*.json`, with a test per pattern.
+- `docs/security.md`: list the new patterns; say plainly that the tier
+  split guards what an MCP client can ask, not an agent running as the
+  owner with a shell.
+- `docs/reference.md`: "A file is skipped when" lists `vendor`, `target`,
+  `venv`, `third_party`, the `result*` prefix, lockfiles and
+  `CACHEDIR.TAG`; `get`'s `sheet` is where reading starts (escaped form,
+  as in `next.sheet`); a cut `search` label is not a valid `get`
+  argument; word hits on the private server are ranked per database;
+  `max_file_mb` must be positive.
+- `docs/troubleshooting.md`: a root stuck in `identity mismatch` from an
+  incomplete first scan recovers by setting `share` or renaming the root.
+- Check: `npx markdownlint-cli2 "docs/**/*.md"` and the step's cargo
+  check.
+
+## Tests
+
+- Every step's check passes in its worktree, then on the branch after each
+  cherry-pick: `cargo test --all-targets` and `cargo clippy --all-targets
+  -- -D warnings`.
+- `nix flake check` on the branch (includes the VM tests).
+- Final reviews: a fresh Opus agent, Codex and agy each read `git diff
+  84fc986..HEAD` against this plan.
+- p620 after deploy: `systemctl --user status llm-index`, `llm-index
+  status` shows both roots `ok`, a public `search` from Claude, Codex and
+  agy returns results, `sqlite3 ~/.local/state/llm-index/public.db .tables`
+  shows no `embed_cache`, and the worker self-test reports the three
+  probes denied.
+
+## Rollback
+
+- Code: revert the merge commit on `main`, then bump the flake input in
+  nixos_config back to `84fc986` and deploy p620.
+- State: no migration to undo. `embed_cache` is recreated empty by the old
+  code; a model-rev reset only re-indexes.
