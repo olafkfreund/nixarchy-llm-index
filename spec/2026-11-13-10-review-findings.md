@@ -47,8 +47,8 @@ returns in `sheet`. `next.sheet` is emitted escaped and `get` compares its
 `sheet` argument with the escaped stored name. A long name is matched in
 full, not as the 200-character label `search` displays; `search`'s
 `sheet` field is the label, and `docs/reference.md` says a cut label is not
-a valid `get` argument (use `next.sheet`, or omit `sheet`). `docs/reference.md` is updated to say `sheet` is where reading
-starts, not a filter. Alternative rejected below.
+a valid `get` argument (use `next.sheet`, or omit `sheet`). The docs also
+say `sheet` is where reading starts, not a filter. Alternative rejected below.
 
 **4. HTML slice** (`src/extract/html.rs` `skip_rawtext_element`). Compare
 bytes: `bytes[a..b].eq_ignore_ascii_case(tag_name.as_bytes())`. No string
