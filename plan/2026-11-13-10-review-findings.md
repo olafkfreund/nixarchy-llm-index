@@ -240,6 +240,9 @@ Files: `src/config.rs`, `src/index/mod.rs`.
   `Proc::parse` with a line split over many reads (assert total bytes
   searched for `\n` is linear in the input, via a counter in the parser)
   and with an over-long line then a good one (cursor reset, no panic).
+- Implemented (deviation): the buffer, cursor and counter live in a small
+  `Lines` struct that `Proc::parse` calls, because `Proc` owns a real
+  `Child` and cannot be built in a unit test.
 
 ### 6. Store (#9 model, #13, #15, #17 timeout)
 
