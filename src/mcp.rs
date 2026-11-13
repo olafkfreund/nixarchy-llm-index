@@ -433,14 +433,37 @@ impl Core {
             Some("sheet") => "rows",
             _ => "lines",
         };
+        let lower_ord = if kind == "rows" {
+            if let Some(wanted) = a.sheet.as_deref() {
+                let mut names = conn.prepare("SELECT heading_or_symbol, MIN(ord) FROM chunks WHERE file_id = ?1 GROUP BY heading_or_symbol ORDER BY MIN(ord)")?;
+                let groups: Vec<(Option<String>, i64)> = names
+                    .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                if let Some((idx, (name, _))) = groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (name, _))| name.as_deref().is_some_and(|s| untrusted(s) == wanted))
+                {
+                    let ord: Option<i64> = conn.query_row("SELECT MIN(ord) FROM chunks WHERE file_id = ?1 AND heading_or_symbol IS ?2 AND end >= ?3", rusqlite::params![id, name, lo_i64], |r| r.get(0))?;
+                    ord.or_else(|| groups.get(idx + 1).map(|g| g.1))
+                        .unwrap_or(i64::MAX)
+                } else {
+                    i64::MAX
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let sql = if kind == "rows" {
-            "SELECT start, heading_or_symbol, text FROM chunks WHERE file_id = ?1 ORDER BY ord"
+            "SELECT start, heading_or_symbol, text FROM chunks WHERE file_id = ?1 AND ord >= ?2 ORDER BY ord"
         } else {
             "SELECT start, heading_or_symbol, text FROM chunks WHERE file_id = ?1 AND end >= ?2 ORDER BY ord"
         };
         let mut stmt = conn.prepare(sql)?;
         let mut rows = if kind == "rows" {
-            stmt.query([id])?
+            stmt.query(rusqlite::params![id, lower_ord])?
         } else {
             stmt.query(rusqlite::params![id, lo_i64])?
         };
@@ -484,8 +507,9 @@ impl Core {
             true
         };
         let mut last_line = 0;
-        let mut first_sheet: Option<String> = None;
+        let mut first_sheet: Option<Option<String>> = a.sheet.clone().map(Some);
         let mut page: Option<(u64, String)> = None;
+        let mut sheet_row: Option<(u64, Option<String>, String)> = None;
         'chunks: while let Some(row) = rows.next()? {
             #[cfg(test)]
             GET_WORK.with(|work| {
@@ -516,14 +540,11 @@ impl Core {
                 }
                 "rows" => {
                     if first_sheet.is_none() {
-                        if a.sheet.as_ref().is_some_and(|s| Some(s) != name.as_ref()) {
-                            continue;
-                        }
-                        first_sheet = Some(name.clone().unwrap_or_default());
-                    } else if a.end.is_some() && name.as_deref() != first_sheet.as_deref() {
+                        first_sheet = Some(name.clone());
+                    } else if a.end.is_some() && Some(&name) != first_sheet.as_ref() {
                         break;
                     }
-                    let initial = name.as_deref() == first_sheet.as_deref();
+                    let initial = Some(&name) == first_sheet.as_ref();
                     for (i, line) in chunk.lines().enumerate() {
                         let pos = start + i as u64;
                         if initial && pos < lo {
@@ -532,9 +553,19 @@ impl Core {
                         if initial && pos > hi {
                             break 'chunks;
                         }
-                        if emit(pos, name.as_deref(), line) {
+                        if let Some((old_pos, old_name, body)) = sheet_row.as_mut()
+                            && *old_pos == pos
+                            && *old_name == name
+                        {
+                            body.push_str(line);
+                            continue;
+                        }
+                        if let Some((old_pos, old_name, body)) = sheet_row.take()
+                            && emit(old_pos, old_name.as_deref(), &body)
+                        {
                             break 'chunks;
                         }
+                        sheet_row = Some((pos, name.clone(), line.to_string()));
                     }
                 }
                 _ => {
@@ -559,6 +590,9 @@ impl Core {
         }
         if let Some((pos, body)) = page {
             emit(pos, None, &body);
+        }
+        if let Some((pos, name, body)) = sheet_row {
+            emit(pos, name.as_deref(), &body);
         }
         Ok(json!({
             "path": a.path, "unit": kind, "truncated": truncated, "next": next,
@@ -746,8 +780,12 @@ mod tests {
         {
             let mut stmt = tx.prepare("INSERT INTO chunks(file_id, ord, kind, start, end, text) VALUES(?1, ?2, 'section', ?2, ?2, ?3)").unwrap();
             for n in 1..=10_000i64 {
-                stmt.execute(rusqlite::params![id, n, format!("line {n}")])
-                    .unwrap();
+                stmt.execute(rusqlite::params![
+                    id,
+                    n,
+                    format!("line {n} {}", "x".repeat(190))
+                ])
+                .unwrap();
             }
         }
         tx.commit().unwrap();
@@ -766,18 +804,54 @@ mod tests {
         let result = core
             .get(GetArgs {
                 path: "/home/x/docs/late.txt".into(),
-                start: Some(9_991),
+                start: Some(9_001),
                 end: None,
                 sheet: None,
                 offset: None,
             })
             .map_err(|e| e.text(true))
             .unwrap();
-        assert!(result.contains("line 9991"));
+        assert!(result.contains("line 9001"));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(!parsed["next"].is_null());
         GET_WORK.with(|work| {
             let (rows, units) = work.get();
-            assert!(rows <= 20, "fetched {rows} chunks");
-            assert!(units <= 20, "built {units} units");
+            assert!(rows <= 110, "fetched {rows} chunks");
+            assert!(units <= 110, "built {units} units");
+        });
+        writer.public.execute("INSERT INTO files(root_id, relpath, abspath, title, type, state) VALUES('docs', 'late.xlsx', '/home/x/docs/late.xlsx', 'late', 'xlsx', 'ok')", []).unwrap();
+        let sheet_id = writer.public.last_insert_rowid();
+        let tx = writer.public.transaction().unwrap();
+        {
+            let mut stmt = tx.prepare("INSERT INTO chunks(file_id, ord, kind, start, end, heading_or_symbol, text) VALUES(?1, ?2, 'sheet', ?2, ?2, 'S', ?3)").unwrap();
+            for n in 1..=5_000i64 {
+                stmt.execute(rusqlite::params![
+                    sheet_id,
+                    n,
+                    format!("row {n} {}", "x".repeat(190))
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        GET_WORK.with(|work| work.set((0, 0)));
+        let result = core
+            .get(GetArgs {
+                path: "/home/x/docs/late.xlsx".into(),
+                start: Some(4_001),
+                end: None,
+                sheet: Some("S".into()),
+                offset: None,
+            })
+            .map_err(|e| e.text(true))
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(result.contains("row 4001"));
+        assert!(!parsed["next"].is_null());
+        GET_WORK.with(|work| {
+            let (rows, units) = work.get();
+            assert!(rows <= 110, "fetched {rows} row chunks");
+            assert!(units <= 110, "built {units} row units");
         });
         drop(core);
         drop(writer);

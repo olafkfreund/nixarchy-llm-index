@@ -135,7 +135,8 @@ fn unique_sheet_name(name: &str, used: &mut HashSet<String>) -> String {
     let mut candidate = base.clone();
     let mut suffix = 2;
     while !used.insert(candidate.clone()) {
-        candidate = format!("{base}#{suffix}");
+        let ending = format!("#{suffix}");
+        candidate = base.chars().take(1000 - ending.len()).collect::<String>() + &ending;
         suffix += 1;
     }
     candidate
@@ -392,7 +393,9 @@ mod tests {
                 _ => panic!("expected sheet"),
             })
             .collect();
-        assert_eq!(names, [prefix.as_str(), format!("{prefix}#2").as_str()]);
+        assert_eq!(names[0], prefix);
+        assert_eq!(names[1], format!("{}#2", "é".repeat(998)));
+        assert!(names.iter().all(|name| name.chars().count() <= 1000));
     }
 
     #[test]

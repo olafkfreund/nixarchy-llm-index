@@ -861,6 +861,112 @@ fn get_on_sheets_returns_exactly_the_requested_rows() {
 }
 
 #[test]
+fn get_null_sheet_name_continues_to_next_chunk() {
+    let fx = Fixture::new("null-sheet");
+    let path = "/home/x/docs/old.xlsx";
+    fx.add(
+        false, "docs", path, "old", "xlsx", "sheet", 1, 1, None, "one",
+    );
+    fx.add(
+        false, "docs", path, "old", "xlsx", "sheet", 2, 2, None, "two",
+    );
+    fx.add(
+        false,
+        "docs",
+        path,
+        "old",
+        "xlsx",
+        "sheet",
+        1,
+        1,
+        Some("S"),
+        "other",
+    );
+    let mut s = fx.session("public");
+    let g = s.ok("get", json!({"path": path, "end": 2}));
+    assert_eq!(body(g["text"].as_str().unwrap()), "one\ntwo\n");
+    assert!(g["next"].is_null());
+}
+
+#[test]
+fn get_sparse_csv_row_after_chunking() {
+    let fx = Fixture::new("sparse-csv");
+    let path = "/home/x/docs/sparse.csv";
+    let extracted = llm_index::extract::extract(
+        "sparse.csv",
+        llm_index::extract::FileType::Csv,
+        b"one\n,\nthree\n",
+        &llm_index::config::Limits::default(),
+    )
+    .unwrap();
+    let chunks = llm_index::chunk::chunk(
+        &extracted.segments,
+        extracted.file_type,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    for c in chunks {
+        fx.add(
+            false,
+            "docs",
+            path,
+            "sparse",
+            "csv",
+            "sheet",
+            c.start as i64,
+            c.end as i64,
+            c.heading_or_symbol.as_deref(),
+            &c.text,
+        );
+    }
+    let mut s = fx.session("public");
+    let g = s.ok(
+        "get",
+        json!({"path": path, "sheet": "sparse.csv", "start": 3, "end": 3}),
+    );
+    assert_eq!(body(g["text"].as_str().unwrap()), "three\n");
+}
+
+#[test]
+fn get_joins_split_sheet_row_before_paging() {
+    let fx = Fixture::new("split-row");
+    let path = "/home/x/docs/split.csv";
+    let row = "x".repeat(45_000);
+    let extracted = llm_index::extract::extract(
+        "split.csv",
+        llm_index::extract::FileType::Csv,
+        row.as_bytes(),
+        &llm_index::config::Limits::default(),
+    )
+    .unwrap();
+    let chunks = llm_index::chunk::chunk(
+        &extracted.segments,
+        extracted.file_type,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(chunks.len() > 1);
+    for c in chunks {
+        fx.add(
+            false,
+            "docs",
+            path,
+            "split",
+            "csv",
+            "sheet",
+            c.start as i64,
+            c.end as i64,
+            c.heading_or_symbol.as_deref(),
+            &c.text,
+        );
+    }
+    let mut s = fx.session("public");
+    let (all, nexts) = drain(&mut s, json!({"path": path, "sheet": "split.csv"}));
+    assert_eq!(all.trim_end_matches('\n'), row);
+    assert_eq!(nexts[0]["offset"], 20_000);
+}
+
+#[test]
 fn get_pages_across_sheets_and_uses_escaped_sheet_cursors() {
     let fx = Fixture::new("sheet-cursors");
     let path = "/home/x/docs/three.xlsx";
@@ -902,6 +1008,8 @@ fn get_pages_across_sheets_and_uses_escaped_sheet_cursors() {
             .collect::<String>()
     );
     assert!(bounded["next"].is_null());
+    let later = s.ok("get", json!({"path": path, "sheet": "&lt;x", "start": 999}));
+    assert!(body(later["text"].as_str().unwrap()).starts_with("&lt;x-001"));
 }
 
 #[test]

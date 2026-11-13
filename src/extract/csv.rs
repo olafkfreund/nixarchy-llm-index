@@ -59,7 +59,7 @@ pub fn extract(
             global_line += chunk_rows;
             segments.push(Segment {
                 kind: SegmentKind::Sheet {
-                    name: title.clone(),
+                    name: crate::sanitize::sanitize(&title),
                     first_row: chunk_first_row,
                     last_row: chunk_last_row,
                     row_numbers: std::mem::take(&mut chunk_row_numbers),
@@ -77,7 +77,7 @@ pub fn extract(
         global_line += chunk_rows;
         segments.push(Segment {
             kind: SegmentKind::Sheet {
-                name: title.clone(),
+                name: crate::sanitize::sanitize(&title),
                 first_row: chunk_first_row,
                 last_row: chunk_last_row,
                 row_numbers: chunk_row_numbers,
@@ -93,4 +93,17 @@ pub fn extract(
         file_type: FileType::Csv,
         segments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_sheet_name_is_sanitized() {
+        let extracted = extract("a\u{200b}b.csv", b"value\n", 100).unwrap();
+        assert!(
+            matches!(&extracted.segments[0].kind, SegmentKind::Sheet { name, .. } if name == "ab.csv")
+        );
+    }
 }

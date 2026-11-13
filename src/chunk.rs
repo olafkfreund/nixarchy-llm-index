@@ -945,7 +945,8 @@ fn clean_symbol_text(node: Node<'_>, source: &str) -> Option<String> {
     if unquoted.is_empty() || unquoted.contains('\n') {
         None
     } else {
-        Some(unquoted.to_string())
+        let clean = crate::sanitize::label(unquoted, 200);
+        (!clean.is_empty()).then_some(clean)
     }
 }
 
@@ -1135,7 +1136,8 @@ fn chunk_sheet_segment(
             .unwrap_or_else(|| (first_row + line_idx).min(last_row.max(first_row)))
     };
 
-    if approx_tokens(&seg.text) <= TARGET_TOKENS {
+    if approx_tokens(&seg.text) <= TARGET_TOKENS && row_numbers.windows(2).all(|w| w[1] == w[0] + 1)
+    {
         let start = if row_numbers.is_empty() {
             first_row
         } else {
@@ -1193,7 +1195,9 @@ fn chunk_sheet_segment(
         if let Some(b_start) = part_byte_start {
             let cand_words = part_words + line_words;
             let cand_bytes = l_end - b_start;
-            if tokens_from_counts(cand_words, cand_bytes) > TARGET_TOKENS {
+            if row_for_line(line_idx) > row_for_line(part_last_idx) + 1
+                || tokens_from_counts(cand_words, cand_bytes) > TARGET_TOKENS
+            {
                 let block_start = row_for_line(part_first_idx);
                 let block_end = row_for_line(part_last_idx).max(block_start);
                 out.push(Chunk {
@@ -1536,17 +1540,50 @@ mod tests {
         assert_eq!(extracted.segments.len(), 1);
 
         let chunks = chunk(&extracted.segments, extracted.file_type, far_deadline()).unwrap();
-        // Each row is ~211 tokens; 2 rows fit in 512 tokens (~422 tokens), 3 rows exceed 512 (~633 tokens).
-        // So the 6 non-empty rows [1, 2, 100, 250, 500, 1000] split into 3 pairs:
-        // Pair 0: rows 1..=2
-        // Pair 1: rows 100..=250
-        // Pair 2: rows 500..=1000
-        assert_eq!(chunks.len(), 3);
-        assert_eq!((chunks[0].start, chunks[0].end), (1, 2));
-        assert!(chunks[0].text.contains("row_1") && chunks[0].text.contains("row_2"));
-        assert_eq!((chunks[1].start, chunks[1].end), (100, 250));
-        assert!(chunks[1].text.contains("row_100") && chunks[1].text.contains("row_250"));
-        assert_eq!((chunks[2].start, chunks[2].end), (500, 1000));
-        assert!(chunks[2].text.contains("row_500") && chunks[2].text.contains("row_1000"));
+        assert_eq!(
+            chunks.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>(),
+            [(1, 2), (100, 100), (250, 250), (500, 500), (1000, 1000)]
+        );
+    }
+
+    #[test]
+    fn sparse_small_sheet_keeps_row_numbers() {
+        let seg = Segment {
+            kind: SegmentKind::Sheet {
+                name: "S".into(),
+                first_row: 1,
+                last_row: 3,
+                row_numbers: vec![1, 3],
+            },
+            start_line: 1,
+            end_line: 2,
+            text: "one\nthree".into(),
+        };
+        let chunks = chunk(&[seg], FileType::Csv, far_deadline()).unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|c| (c.start, c.end, c.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, 1, "one"), (3, 3, "three")]
+        );
+    }
+
+    #[test]
+    fn code_symbol_is_bounded_before_chunks_are_cloned() {
+        let name = "x".repeat(10_000);
+        let source = format!("fn {name}() {{}}\n");
+        let seg = Segment {
+            kind: SegmentKind::Whole,
+            start_line: 1,
+            end_line: 1,
+            text: source,
+        };
+        let chunks = chunk(&[seg], FileType::Code("rust"), far_deadline()).unwrap();
+        assert!(chunks.iter().all(|c| {
+            c.heading_or_symbol
+                .as_ref()
+                .is_some_and(|s| s.chars().count() <= 200)
+        }));
     }
 }
