@@ -679,4 +679,82 @@ in
         assert not hits("public", "skipmarker"), "excluded file leaked"
       '';
     };
+
+  # A root keeps its identity when the kernel renames its disk (/dev/vdb -> /dev/vdc, cloned
+  # filesystem, same UUID), and goes offline when a different filesystem takes its place.
+  disk-identity = pkgs.testers.runNixOSTest {
+    name = "llm-index-disk-identity";
+    nodes.machine =
+      lib.recursiveUpdate
+        (node {
+          instance.roots.disk = (localRoot "/mnt/disk/root" "public") // {
+            interval = "30s";
+          };
+        })
+        {
+          virtualisation.emptyDiskImages = [
+            64
+            64
+          ];
+        };
+    testScript = ''
+      ${preamble}
+      machine.wait_for_unit("multi-user.target")
+      START = "systemctl start llm-index-alice"
+      STOP = "systemctl stop llm-index-alice"
+
+      def row():
+          out = machine.succeed(
+              "sudo -u alice python3 -c \"import sqlite3; "
+              "c=sqlite3.connect('file:/var/lib/llm-index/alice/public.db?mode=ro', uri=True); "
+              "print(c.execute(\\\"select fs_uuid, share_id, last_scan from roots where name='disk'\\\").fetchone())\"")
+          return eval(out.strip())
+
+      def line():
+          m = [l for l in status(machine).splitlines() if l.startswith("disk ")]
+          return m[0] if m else ""
+
+      def swap(cmd):
+          machine.succeed(STOP)
+          machine.succeed("umount /mnt/disk")
+          machine.succeed(cmd)
+
+      # (1) a filesystem with a known UUID, 20 files
+      machine.succeed("mkdir -p /mnt/disk")
+      machine.succeed("mkfs.ext4 -F -U 11111111-2222-3333-4444-555555555555 /dev/vdb")
+      machine.succeed("mount /dev/vdb /mnt/disk && mkdir -p /mnt/disk/root")
+      machine.succeed("for i in $(seq 20); do echo file$i > /mnt/disk/root/f$i.txt; done")
+      machine.succeed(START)
+      machine.wait_until_succeeds(f"sudo -u alice {EXE} status --config {CFG} | grep -E '^disk .* ok .*files: 20 '", timeout=240)
+
+      # (2) the UUID is enrolled
+      uuid, share, scan1 = row()
+      assert uuid == "11111111222233334444555555555555", uuid
+      assert "/dev/vdb" in share, share
+
+      # (3) rename: the same filesystem on another device
+      swap("dd if=/dev/vdb of=/dev/vdc bs=1M && mount /dev/vdc /mnt/disk")
+      machine.succeed(START)
+      def renamed(_):
+          u, s, t = row()
+          return (t or 0) > scan1 and "/dev/vdc" in (s or "") and " ok " in line() and "files: 20 " in line()
+      retry(renamed, timeout=dt.timedelta(seconds=240))
+      uuid2, share2, _ = row()
+      assert uuid2 == uuid, uuid2
+
+      # (4) a different filesystem at the same path: refused, index untouched
+      swap("mkfs.ext4 -F -U 99999999-9999-9999-9999-999999999999 /dev/vdb && mount /dev/vdb /mnt/disk && mkdir -p /mnt/disk/root")
+      machine.succeed(START)
+      def refused(_):
+          return "offline" in line() and "identity mismatch" in line()
+      try:
+          retry(refused, timeout=dt.timedelta(seconds=180))
+      except Exception:
+          print("DIAG status:\n" + status(machine))
+          print("DIAG journal:\n" + machine.succeed("journalctl -u llm-index-alice --no-pager | tail -60"))
+          raise
+      assert "files: 20 " in line(), line()
+      assert row()[0] == uuid, row()
+    '';
+  };
 }

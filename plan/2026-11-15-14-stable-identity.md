@@ -382,3 +382,6 @@ Traps for every step:
   `&self` and can't rewrite it. A bad value fails at parse time.
 - Step 2: `tests/parser_crash.rs` has its own `Sink` and `RootSpec`, which
   needed the new trait methods and field.
+- Step 4: the disks are added with `lib.recursiveUpdate (node {...})`
+  rather than `node`'s `extra`, and the DB is read with python `sqlite3`
+  in `mode=ro`, as the other checks do.
