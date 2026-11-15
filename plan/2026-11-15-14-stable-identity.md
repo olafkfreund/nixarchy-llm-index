@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 14
 spec: spec/2026-11-15-14-stable-identity.md
 coders:
