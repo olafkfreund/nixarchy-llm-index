@@ -89,6 +89,68 @@ If Landlock is missing, the service refuses to start.
 The denylist is applied when scanning, when extracting, and again when a result
 is returned, so changing the config hides files at once.
 
+## Root identity guard
+
+Before indexing or updating a root, llm-index compares the mount at the root's
+path against the identity recorded for that root:
+
+- **What is compared.** The coordinator compares `/proc/self/mountinfo`
+  filesystem type, mount source, mount root and mount point (plus any
+  configured `share`), and the scan worker reads the filesystem UUID via
+  `ioctl(root_fd, FS_IOC_GETFSUUID)` before and after the walk.
+- **`Confirm` (scan only).** When the expected and current mountinfo match in
+  filesystem type, mount root and mount point on a local filesystem, both
+  sources start with `/dev/`, and any configured `share` matches, the verdict
+  is `Confirm` (`offline` with reason `identity check`) instead of `Mismatch`.
+  Under `Confirm`, only a scan is allowed: extraction, `send_next`, solo
+  retries and watchers stay off, and solo head-of-line entries for the root are
+  evicted.
+- **Precedence table at `scan_done`.** S is the stored UUID (`Absent`,
+  `Known(U)` or `Unreadable`), W the worker's UUID (before and after, equal),
+  A the root's `adopt_uuid`, and E the evidence. Scans already discarded
+  (before and after differ, or `Mismatch`) and `Probe` keep their behaviour.
+  Otherwise the first matching row decides:
+
+  | # | Condition | Result |
+  | --- | --- | --- |
+  | 1 | S `Unreadable` | reject |
+  | 2 | A set | accept iff `W == Some(A)` and the scan is complete; store S = A. Else reject |
+  | 3 | verdict `Adopt` | accept; store S = W |
+  | 4 | S `Known(U)` | accept iff `W == Some(U)`; else reject |
+  | 5 | S `Absent`, verdict `Ok` | accept; store S = W only if W is `Some` and E holds |
+  | 6 | S `Absent`, verdict `Confirm` | accept iff W is `Some`, the scan is complete and E holds; store S = W. Else reject |
+
+  - **Accept:** apply the scan as today and store the current `Share` with S.
+  - **Reject:** discard the scan, go `offline` with `identity mismatch`, and
+    set the rejection gate (holding the root at `Mismatch` until its mountinfo
+    changes, dropping its queue and stopping any live watcher).
+- **Evidence E:**
+  - **Requires a complete scan** (`ScanResult.complete`). An incomplete scan
+    never satisfies E. Under row 5, an incomplete scan still applies by the
+    existing rules (no deletions), but S stays `Absent`.
+  - **Denominator:** `indexed_meta(root)` (distinct `relpath` with `size` and
+    `mtime_ns` from both tiers) minus paths under the scan's protected skipped
+    subtrees.
+  - **Matches:** paths present among the scan's file entries (`!is_dir`) with
+    the same `size` and `mtime_ns`.
+  - **Holds iff** `denominator >= 1 && matches * 10 >= denominator * 9`.
+  - **Fails closed:** an `Err` from `indexed_meta` means E is false.
+- **`adopt_uuid`.** Setting `adopt_uuid` (Nix `adoptUuid`) selects row 2: it
+  may accept an empty disk if its UUID matches `adopt_uuid`, and the index then
+  follows that disk (removing previously indexed entries on the complete scan).
+  `adopt_uuid` never widens `Confirm` across a mount point, mount root or
+  filesystem type change. Leaving it set is safe because it pins one
+  filesystem; remove it once the root is `ok`.
+- **Cloned filesystems.** Cloned filesystems (for example via `dd`) share a
+  UUID and count as the same filesystem.
+- **Window after a service start.** With unchanged mountinfo, extraction and
+  watch run until the first scan checks the UUID, as they always did.
+- **Kernels before 6.5.** Kernels before 6.5 do not support `FS_IOC_GETFSUUID`
+  and give no UUID, so rows 4 and 6 reject and row 5 behaves as before.
+- **Rollback.** An older binary ignores the `fs_uuid` column and guards as
+  before. If it moves a root between tiers, it drops the UUID, and the next
+  upgrade re-enrols through evidence.
+
 ## Untrusted document content
 
 Documents can contain text that tries to steer an agent. llm-index reduces the

@@ -89,11 +89,12 @@ choose, so keep paths out of them.
 - **Closed reason list.** Applied to both `roots[].reason` and
   `config_errors[].reason`. A non-empty reason is kept if it is a state word
   (`ok`, `offline`, `degraded`, `config_error`), `mount`, an errno name such as
-  `EACCES`, or one of: `identity mismatch`, `watch degraded`, `watcher exited`,
-  `watch setup stalled`, `stdin blocked`, `no progress`, `extract timeout`,
-  `scan timeout`, `worker died`, `disk full`, `symlink in path`,
-  `root path contains a symlink`, `root path is not a directory`,
-  `landlock unavailable`. Anything else becomes `other`.
+  `EACCES`, or one of: `identity mismatch`, `identity check`, `watch degraded`,
+  `watcher exited`, `watch setup stalled`, `stdin blocked`, `no progress`,
+  `extract timeout`, `scan timeout`, `worker died`, `disk full`,
+  `symlink in path`, `root path contains a symlink`,
+  `root path is not a directory`, `landlock unavailable`. Anything else becomes
+  `other`.
 - **Config-error mapping.** Each `config_errors` path is mapped against the
   configured roots without exposing the path:
   - an exact match with a configured root's path gives `root: "<name>"`,
@@ -330,6 +331,16 @@ A file is skipped when:
   configured `exclude.paths` entry, or lies under the state directory;
 - it is a symlink, or lies across a mount boundary;
 - it exceeds a limit.
+
+### Root identity (`adopt_uuid` / `adoptUuid`)
+
+Set per root under `[[root]]` in `config.toml` as `adopt_uuid` or under
+`roots.<name>.adoptUuid` in the NixOS and Home Manager modules (nullable
+string, default `null`; see [installation](installation.md)):
+
+| Setting | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `adopt_uuid` (TOML) / `adoptUuid` (Nix) | string or `null` | `null` (unset) | Filesystem UUID in canonical dashed form (`11111111-2222-3333-4444-555555555555`) or plain hex (`11111111222233334444555555555555`), 2 to 32 hex digits once dashes are stripped (case-insensitive, stored lowercase without dashes). Accepts the root on a complete scan iff the filesystem's `FS_IOC_GETFSUUID` matches, adopting the current mount identity and storing the UUID. Remove it once the root is `ok`, though leaving it set is safe. See [security](security.md#root-identity-guard). |
 
 ### Limits
 
