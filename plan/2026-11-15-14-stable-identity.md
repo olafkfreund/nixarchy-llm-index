@@ -385,3 +385,8 @@ Traps for every step:
 - Step 4: the disks are added with `lib.recursiveUpdate (node {...})`
   rather than `node`'s `extra`, and the DB is read with python `sqlite3`
   in `mode=ro`, as the other checks do.
+- Branch review (Codex): `rederive` now applies the new verdict at once. A
+  root that turns `Mismatch` or `Confirm` while the service runs has its live
+  extract and watch workers retired (the `reload` mechanism, factored into
+  `retire()`), so their later results are ignored. Previously, an in-flight
+  extraction could be stored while the root waited in `Confirm`.

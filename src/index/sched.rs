@@ -227,6 +227,24 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             }
             self.roots[i].derived = d;
             self.roots[i].rejected = None;
+            // a mount that is no longer trusted stops extract and watch now, not at their next job
+            if matches!(self.verdict_of(i), Verdict::Mismatch | Verdict::Confirm) {
+                let live: Vec<_> = self
+                    .workers
+                    .iter()
+                    .filter(|(_, w)| {
+                        w.root == i
+                            && !w.abandoned
+                            && !w.retired
+                            && matches!(w.role, Role::Extract | Role::Watch)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in live {
+                    self.retire(id, now);
+                }
+                self.check_identity(i, now);
+            }
             // a new mount may end what the hold waited out (mismatch, offline): scan at once
             self.roots[i].hold = now;
             self.request_scan(i, now, Duration::ZERO);
@@ -244,7 +262,15 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            let w = self.workers.get_mut(&id).expect("listed");
+            self.retire(id, now);
+        }
+    }
+
+    /// Stop a worker for good: its later messages are ignored, its work is handed back,
+    /// and it is shut down (SIGKILL after `GRACE`).
+    fn retire(&mut self, id: WorkerId, now: Time) {
+        {
+            let w = self.workers.get_mut(&id).expect("live worker");
             w.retired = true;
             let i = w.root;
             if matches!(self.roots[i].busy, Some((b, _)) if b == id) {
@@ -272,8 +298,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     r.retry_at = now;
                 }
             }
-            self.shutdown(id, now);
         }
+        self.shutdown(id, now);
     }
 
     /// Per root: its path and the exclusions under it, to be validated now and after changes.
@@ -1691,6 +1717,29 @@ mod tests {
                     .any(|(w, j)| *w == id && j.contains("second"))
             );
         }
+    }
+
+    #[test]
+    fn a_live_device_rename_retires_extract_and_watch_and_drops_their_results() {
+        let (mut s, _) = identity_case(StoredUuid::Absent, None, false);
+        assert_eq!(s.verdict_of(0), Verdict::Ok);
+        s.queue_one(0, "first".into(), 1, 2);
+        s.start(0, Role::Extract, None, secs(0));
+        let extract = s.spawner.spawned.last().unwrap().0;
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        // the same mount point now comes from another device
+        s.rederive(&mut mi(&[&ext4(1, "/"), &ext4(3, "/mnt/nas")]), secs(5));
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.workers[&extract].retired && s.workers[&extract].closing.is_some());
+        assert!(s.workers[&watch].retired && s.workers[&watch].closing.is_some());
+        assert_eq!(s.roots[0].reason, "identity check");
+        s.handle(extract, extracted_msg("first"), secs(6));
+        s.tick(secs(6));
+        assert!(
+            s.sink.extracted.is_empty(),
+            "a retired extractor's result was stored"
+        );
     }
 
     #[test]
