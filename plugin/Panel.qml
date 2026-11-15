@@ -36,7 +36,7 @@ Panel {
     }
   }
 
-  IpcHandler {
+  ShellIpc {
     target: root.ipcTarget
 
     function open(): void { root.open() }

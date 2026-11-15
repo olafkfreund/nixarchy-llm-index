@@ -10,7 +10,7 @@ FocusScope {
   property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.5)
-  readonly property Item keyTarget: keyCatcher
+  readonly property Item keyTarget: root
   property string currentTab: "status"
   property bool confirmRestartOpen: false
 
@@ -62,12 +62,12 @@ FocusScope {
       + " (counts as of " + root.countsAge() + ")"
   }
 
-  PanelKeyCatcher {
-    id: keyCatcher
+  Keys.onPressed: function (event) {
+    if (event.key === Qt.Key_Escape && !restartConfirm.opened) { root.closeRequested(); event.accepted = true }
+  }
+
+  Item {
     anchors.fill: parent
-    blocked: restartConfirm.opened
-    onCloseRequested: root.closeRequested()
-    onTabRequested: function (direction) { root.switchPanelRequested(direction) }
 
     Column {
       id: column
@@ -126,6 +126,19 @@ FocusScope {
           text: root.unavailableCategory
         }
       }
+
+      Flickable {
+        id: scroller
+        width: parent.width
+        height: Math.min(content.implicitHeight, Style.space(420))
+        contentHeight: content.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+
+      Column {
+        id: content
+        width: scroller.width
+        spacing: Style.spacing.md
 
       Column {
         width: parent.width
@@ -213,8 +226,8 @@ FocusScope {
               color: Commons.Color.urgent
               font.family: root.fontFamily
               text: (modelData.root !== null ? modelData.root : "unmatched")
-                + " (" + modelData.what + "): "
-                + (modelData.reason !== null ? modelData.reason : "other")
+                + " (" + modelData.what + ")"
+                + (modelData.reason !== null ? ": " + modelData.reason : "")
             }
           }
         }
@@ -328,6 +341,8 @@ FocusScope {
           text: "Managed by Nix: `services.llm-index` in Home Manager. Change it in your system configuration and rebuild."
         }
       }
+      }
+      }
 
       Row {
         spacing: Style.spacing.sm
@@ -367,7 +382,7 @@ FocusScope {
       onOpenedChanged: {
         selectedIndex = 1
         if (opened) restartConfirm.forceActiveFocus()
-        else keyCatcher.forceActiveFocus()
+        else root.forceActiveFocus()
       }
       Keys.onPressed: function (event) {
         if (restartConfirm.handleKey(event)) event.accepted = true

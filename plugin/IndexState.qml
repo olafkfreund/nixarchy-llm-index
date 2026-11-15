@@ -47,6 +47,8 @@ Singleton {
     root.openPanels = Math.max(0, root.openPanels - 1)
   }
 
+  property bool fullAgain: false
+
   function refresh() {
     root.now = Math.floor(Date.now() / 1000)
     root.pollFull()
@@ -108,11 +110,6 @@ Singleton {
     unitProcess.handled = false
     unitDeadline.restart()
     unitProcess.running = true
-    if (!unitProcess.running && !unitProcess.handled) {
-      unitDeadline.stop()
-      unitProcess.handled = true
-      root.setUnit(Model.unitState(""))
-    }
   }
 
   function pollBrief() {
@@ -122,27 +119,19 @@ Singleton {
     briefProcess.handled = false
     briefDeadline.restart()
     briefProcess.running = true
-    if (!briefProcess.running && !briefProcess.handled) {
-      briefDeadline.stop()
-      briefProcess.handled = true
-      root.recordError("brief", "not installed")
-    }
   }
 
   function pollFull() {
-    if (fullProcess.running) return
+    if (fullProcess.running) {
+      root.fullAgain = true
+      return
+    }
     fullProcess.timedOut = false
     fullProcess.started = false
     fullProcess.handled = false
     root.setBusy(true)
     fullDeadline.restart()
     fullProcess.running = true
-    if (!fullProcess.running && !fullProcess.handled) {
-      fullDeadline.stop()
-      fullProcess.handled = true
-      root.setBusy(false)
-      root.recordError("full", "not installed")
-    }
   }
 
   Process {
@@ -154,16 +143,6 @@ Singleton {
     stdout: StdioCollector { id: unitOut; waitForEnd: true }
     stderr: StdioCollector { id: unitErr; waitForEnd: true }
     onStarted: started = true
-    onRunningChanged: {
-      if (running) return
-      Qt.callLater(function () {
-        if (!unitProcess.running && !unitProcess.handled) {
-          unitDeadline.stop()
-          unitProcess.handled = true
-          root.setUnit(Model.unitState(""))
-        }
-      })
-    }
     onExited: function (exitCode, exitStatus) {
       unitDeadline.stop()
       if (unitProcess.handled) return
@@ -181,9 +160,14 @@ Singleton {
     interval: 5000
     repeat: false
     onTriggered: {
-      if (!unitProcess.running) return
+      if (unitProcess.handled) return
+      unitProcess.handled = true
       unitProcess.timedOut = true
-      unitProcess.running = false
+      root.setUnit(Model.unitState(""))
+      if (unitProcess.running) {
+        unitProcess.running = false
+        killTimer.watch(unitProcess)
+      }
     }
   }
 
@@ -196,16 +180,6 @@ Singleton {
     stdout: StdioCollector { id: briefOut; waitForEnd: true }
     stderr: StdioCollector { id: briefErr; waitForEnd: true }
     onStarted: started = true
-    onRunningChanged: {
-      if (running) return
-      Qt.callLater(function () {
-        if (!briefProcess.running && !briefProcess.handled) {
-          briefDeadline.stop()
-          briefProcess.handled = true
-          root.recordError("brief", briefProcess.timedOut ? "timed out" : (briefProcess.started ? "status failed" : "not installed"))
-        }
-      })
-    }
     onExited: function (exitCode, exitStatus) {
       briefDeadline.stop()
       if (briefProcess.handled) return
@@ -231,9 +205,14 @@ Singleton {
     interval: 10000
     repeat: false
     onTriggered: {
-      if (!briefProcess.running) return
+      if (briefProcess.handled) return
+      briefProcess.handled = true
       briefProcess.timedOut = true
-      briefProcess.running = false
+      root.recordError("brief", briefProcess.started ? "timed out" : "not installed")
+      if (briefProcess.running) {
+        briefProcess.running = false
+        killTimer.watch(briefProcess)
+      }
     }
   }
 
@@ -246,17 +225,6 @@ Singleton {
     stdout: StdioCollector { id: fullOut; waitForEnd: true }
     stderr: StdioCollector { id: fullErr; waitForEnd: true }
     onStarted: started = true
-    onRunningChanged: {
-      root.setBusy(running)
-      if (running) return
-      Qt.callLater(function () {
-        if (!fullProcess.running && !fullProcess.handled) {
-          fullDeadline.stop()
-          fullProcess.handled = true
-          root.recordError("full", fullProcess.timedOut ? "timed out" : (fullProcess.started ? "status failed" : "not installed"))
-        }
-      })
-    }
     onExited: function (exitCode, exitStatus) {
       fullDeadline.stop()
       if (fullProcess.handled) return
@@ -275,6 +243,13 @@ Singleton {
       }
       root.recordSnapshot("full", fullOut.text)
     }
+    onRunningChanged: {
+      root.setBusy(running)
+      if (!running && root.fullAgain) {
+        root.fullAgain = false
+        Qt.callLater(root.pollFull)
+      }
+    }
   }
 
   Timer {
@@ -282,9 +257,14 @@ Singleton {
     interval: 60000
     repeat: false
     onTriggered: {
-      if (!fullProcess.running) return
+      if (fullProcess.handled) return
+      fullProcess.handled = true
       fullProcess.timedOut = true
-      fullProcess.running = false
+      root.recordError("full", fullProcess.started ? "timed out" : "not installed")
+      if (fullProcess.running) {
+        fullProcess.running = false
+        killTimer.watch(fullProcess)
+      }
     }
   }
 
@@ -305,6 +285,16 @@ Singleton {
     command: ["omarchy-launch-floating-terminal-with-presentation", "journalctl", "--user", "-fu", "llm-index"]
     stdout: StdioCollector { id: logOut; waitForEnd: true }
     stderr: StdioCollector { id: logErr; waitForEnd: true }
+  }
+
+  // shortcut: one kill timer; a second overdue process inside the 2 s grace
+  // replaces the first, which then gets only the SIGTERM already sent.
+  Timer {
+    id: killTimer
+    property var target: null
+    interval: 2000
+    function watch(p) { target = p; restart() }
+    onTriggered: if (target && target.running) target.signal(9)
   }
 
   Timer {

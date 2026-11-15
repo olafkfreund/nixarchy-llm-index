@@ -49,7 +49,9 @@ runCommand "llm-index-plugin-check"
       if diag=$(bash tests/lint.sh tests/bad/$r.qml); then
         echo "FAIL: lint.sh passed tests/bad/$r.qml"; exit 1
       fi
-      grep -q "^RULE $r: " <<<"$diag" || { echo "FAIL: no RULE $r diagnostic"; echo "$diag"; exit 1; }
+      want=$(sed -n 's|^// expect: ||p' tests/bad/$r.qml)
+      got=$(grep -c "^RULE $r: " <<<"$diag" || true)
+      [ "$got" = "$want" ] || { echo "FAIL: RULE $r reported $got of $want cases"; echo "$diag"; exit 1; }
     done
 
     echo "== qmltestrunner"

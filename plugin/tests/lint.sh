@@ -1,41 +1,76 @@
 #!/usr/bin/env bash
 # Privacy lint for the shell plugin. Usage: lint.sh FILE...
 # Prints "RULE <name>: <file>:<line>" per violation; exits 1 if any.
-# shortcut: braces are counted after stripping "strings" and // comments; a
-# brace inside a regex literal or block comment would confuse it.
+#
+# Each file is tokenised whole: '...', "..." and `...` strings, // and /* */
+# comments are recognised, so neither a string nor a comment can open, close
+# or satisfy a block. A text block (Text, PanelSectionHeader, Label, TextEdit,
+# TextInput, also when qualified as Q.Text) passes only if its own level, not
+# a child's or a sibling's, assigns textFormat: Text.PlainText.
 set -u
 rc=0
 for f in "$@"; do
   out=$(awk -v F="$f" '
     function report(rule, n) { printf "RULE %s: %s:%d\n", rule, F, n }
-    {
-      line = $0
-      gsub(/"([^"\\]|\\.)*"/, "\"\"", line)   # drop string contents
-      sub(/\/\/.*/, "", line)                 # drop line comments
-      raw = $0
-      if (raw ~ /(^|[^A-Za-z_])console\./ || raw ~ /(^|[^A-Za-z_.])print\(/) report("console", NR)
-      if (raw ~ /"(sh|bash|-c)"/ || raw ~ /(^|[^A-Za-z_])(sh|bash)[ \t]+-c/) report("shell", NR)
-      if (raw ~ /Qt\.openUrlExternally/) report("openurl", NR)
-      if (line ~ /textFormat:[ \t]*Text\.PlainText/ && depth > 0) ok[depth] = 1
-      rest = line
-      while (match(rest, /[{}]/)) {
-        pos = RSTART
-        c = substr(rest, pos, 1)
-        if (c == "{") {
-          pre = substr(rest, 1, pos - 1)
-          depth++
-          ok[depth] = 0; start[depth] = NR; istext[depth] = 0
-          if (match(pre, /[A-Za-z_][A-Za-z_0-9.]*[ \t]*$/)) {
-            t = substr(pre, RSTART, RLENGTH); sub(/[ \t]+$/, "", t)
-            if (t ~ /^(Text|PanelSectionHeader|Label|TextEdit|TextInput)$/) istext[depth] = 1
-          }
-          # a textFormat later on the opening line belongs to this block
-          if (substr(rest, pos + 1) ~ /textFormat:[ \t]*Text\.PlainText/ ) ok[depth] = 1
-        } else if (depth > 0) {
-          if (istext[depth] && !ok[depth]) report("plaintext", start[depth])
-          depth--
+    function shellish(s) {
+      return s == "-c" || s ~ /^(\/[^ ]*\/)?(sh|bash|dash|zsh|env)$/
+    }
+    { src = src $0 "\n" }
+    END {
+      n = length(src); line = 1; depth = 0; prev = ""; prev2 = ""; ident = ""
+      for (i = 1; i <= n; i++) {
+        c = substr(src, i, 1)
+        if (c == "\n") { line++; continue }
+        if (c == "/" && substr(src, i + 1, 1) == "/") {
+          while (i <= n && substr(src, i, 1) != "\n") i++
+          line++; continue
         }
-        rest = substr(rest, pos + 1)
+        if (c == "/" && substr(src, i + 1, 1) == "*") {
+          i += 2
+          while (i <= n && !(substr(src, i, 1) == "*" && substr(src, i + 1, 1) == "/")) {
+            if (substr(src, i, 1) == "\n") line++
+            i++
+          }
+          i++; continue
+        }
+        if (c == "\"" || c == "\x27" || c == "`") {
+          q = c; s = ""; i++
+          while (i <= n && substr(src, i, 1) != q) {
+            d = substr(src, i, 1)
+            if (d == "\\") { i++; d = substr(src, i, 1) }
+            if (d == "\n") line++
+            s = s d; i++
+          }
+          if (shellish(s)) report("shell", line)
+          prev2 = prev; prev = "STR"; continue
+        }
+        if (c ~ /[A-Za-z_]/) {
+          w = c
+          while (i < n && substr(src, i + 1, 1) ~ /[A-Za-z_0-9.]/) { i++; w = w substr(src, i, 1) }
+          if (w ~ /(^|\.)console\./ || w == "console") report("console", line)
+          if (w == "print" || w ~ /\.print$/) {
+            j = i + 1; while (substr(src, j, 1) ~ /[ \t]/) j++
+            if (substr(src, j, 1) == "(") report("console", line)
+          }
+          if (w ~ /openUrlExternally$/) report("openurl", line)
+          if (depth > 0 && prev == ":" && prev2 == "textFormat" && w == "Text.PlainText") ok[depth] = 1
+          prev2 = prev; prev = w; continue
+        }
+        if (c == "{") {
+          t = prev; sub(/^.*\./, "", t)
+          depth++; ok[depth] = 0; start[depth] = line
+          istext[depth] = (t ~ /^(Text|PanelSectionHeader|Label|TextEdit|TextInput)$/)
+          prev2 = prev; prev = "{"; continue
+        }
+        if (c == "}") {
+          if (depth > 0) {
+            if (istext[depth] && !ok[depth]) report("plaintext", start[depth])
+            depth--
+          }
+          prev2 = prev; prev = "}"; continue
+        }
+        if (c ~ /[ \t\r]/) continue
+        prev2 = prev; prev = c
       }
     }' "$f")
   [ -n "$out" ] && { printf '%s\n' "$out"; rc=1; }

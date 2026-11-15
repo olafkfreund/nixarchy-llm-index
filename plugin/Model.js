@@ -37,7 +37,8 @@ function validate(value) {
                 !optionalInteger(root.last_scan) || !optionalInteger(root.queued) ||
                 !optionalInteger(root.done) || !optionalInteger(root.skipped_symlinks) ||
                 !optionalInteger(root.files) || !optionalInteger(root.chunks) ||
-                (value.brief && (root.files !== null || root.chunks !== null)))
+                (value.brief ? (root.files !== null || root.chunks !== null)
+                             : (!integer(root.files) || !integer(root.chunks))))
             return null
     }
     for (var j = 0; j < value.config_errors.length; j++) {

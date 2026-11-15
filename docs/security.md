@@ -109,7 +109,8 @@ The Omarchy shell plugin (`olafkfreund.llm-index`) reads index state by running
 `llm-index status --json` (and `--brief`) as the desktop user:
 
 - **`status --json` is path-free.** It never outputs filesystem paths, network
-  share sources, or `lift_builtin` globs. Config errors are mapped to root names
+  share sources, or `lift_builtin` globs. Root names are copied as configured,
+  so a name is only as private as you make it. Config errors are mapped to root names
   and `root`/`exclusion`/`unknown`, and root and config-error reasons are
   filtered through a closed allowlist (anything else becomes `other`). See
   [reference](reference.md#status---json-and---brief).
@@ -122,9 +123,11 @@ The Omarchy shell plugin (`olafkfreund.llm-index`) reads index state by running
   overall level (`down`, `problem`, `indexing` or `ok`) and fixed tooltip text,
   never root names, counts or reasons.
 - **`stderr` is discarded.** Every command the plugin runs collects and drops
-  `stderr` without reading, logging or displaying it, and the plugin writes
-  nothing to the shell journal. Process failures map to fixed categories
-  (`not installed`, `status failed`, `bad output`, `timed out`).
+  `stderr` without reading, logging or displaying it, and the plugin itself
+  logs nothing. If `llm-index` is missing from the session `PATH`, Quickshell
+  logs the failed start with the command name only. Process failures map to
+  fixed categories (`not installed`, `status failed`, `bad output`,
+  `timed out`).
 - **Open log is the owner's explicit exception.** The panel's **Open log**
   button opens `journalctl --user -fu llm-index` in a separate floating
   terminal at the owner's request; systemd journal output can contain private

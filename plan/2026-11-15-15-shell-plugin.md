@@ -99,10 +99,13 @@ own issue and short artifacts that point here, as for #2906.
   ```text
   identity mismatch, watch degraded, watcher exited, watch setup stalled,
   stdin blocked, no progress, extract timeout, scan timeout, worker died,
-  disk full, symlink in path
+  disk full, symlink in path, root path contains a symlink,
+  root path is not a directory, landlock unavailable
   ```
 
-  Anything else becomes `other`.
+  Anything else becomes `other`. (The last three came from
+  `src/worker/sandbox.rs` during the branch review; they were missing from
+  the first list.)
 - **Config-error mapping:**
   - an exact root-path match gives `what: "root"`;
   - otherwise the deepest configured root containing the path by whole
@@ -549,3 +552,32 @@ Traps for every step:
     again, or run `omarchy plugin enable olafkfreund.llm-index` once.
   - Re-login so the shell drops the singleton.
 - Index databases are never touched.
+
+## Deviations found in review (recorded with the code)
+
+- `generated_at` is stamped when the read snapshot starts, not after the
+  counts, so a slow full run can't overwrite a newer brief result.
+- Keyboard: the view follows rebuild-panel's pattern instead of
+  `PanelKeyCatcher`. The view takes focus, Escape closes, and Tab walks the
+  focusable buttons. `PanelKeyCatcher` swallowed Tab and Enter, so no button
+  was reachable.
+- The tab content scrolls inside a bounded `Flickable`, so long root lists
+  stay inside the panel.
+- Deadlines record the failure immediately, send SIGTERM, and SIGKILL after
+  2 s. A start that never happens is caught by the deadline, not guessed
+  right after `running = true`. A refresh asked for during a full run runs
+  once it ends.
+- IPC uses the shell's `ShellIpc` (one live handler per target across
+  monitors) instead of a bare `IpcHandler`.
+- Theme colours go through `Commons.Color` (`import qs.Commons as Commons`).
+  A bare `Color` resolved to undefined in the live shell.
+- `Model.validate` requires integer counts in full snapshots.
+- The lint tokenises whole files: all string forms and comments, own-block
+  `textFormat` only, qualified type names, and path-qualified shells. Each
+  bad fixture states its expected count, and the check compares it.
+- Root names are copied as configured. The docs say so instead of claiming
+  no path can appear anywhere.
+- `nix/package.nix` includes `plugin/tests/fixtures`, because the packaged
+  cargo test reads the golden files. The plugin sources stay out.
+- If `llm-index` is missing from `PATH`, Quickshell itself logs the failed
+  start (command name only). The docs say so.

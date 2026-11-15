@@ -83,15 +83,17 @@ path-free JSON object on stdout:
 | `databases[]` | `name` and `bytes` for `public.db` and `private.db` (present in both modes). |
 
 Filesystem paths, network share sources, and `lift_builtin` globs never appear
-in the JSON output.
+in the JSON output. Root names are copied as configured: they are labels you
+choose, so keep paths out of them.
 
 - **Closed reason list.** Applied to both `roots[].reason` and
   `config_errors[].reason`. A non-empty reason is kept if it is a state word
   (`ok`, `offline`, `degraded`, `config_error`), `mount`, an errno name such as
   `EACCES`, or one of: `identity mismatch`, `watch degraded`, `watcher exited`,
   `watch setup stalled`, `stdin blocked`, `no progress`, `extract timeout`,
-  `scan timeout`, `worker died`, `disk full`, `symlink in path`. Anything else
-  becomes `other`.
+  `scan timeout`, `worker died`, `disk full`, `symlink in path`,
+  `root path contains a symlink`, `root path is not a directory`,
+  `landlock unavailable`. Anything else becomes `other`.
 - **Config-error mapping.** Each `config_errors` path is mapped against the
   configured roots without exposing the path:
   - an exact match with a configured root's path gives `root: "<name>"`,

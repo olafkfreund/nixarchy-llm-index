@@ -30,7 +30,7 @@ pub fn sandbox_state() -> &'static str {
 }
 
 const STATES: [&str; 4] = ["ok", "offline", "degraded", "config_error"];
-const REASONS: [&str; 11] = [
+const REASONS: [&str; 14] = [
     "identity mismatch",
     "watch degraded",
     "watcher exited",
@@ -42,6 +42,9 @@ const REASONS: [&str; 11] = [
     "worker died",
     "disk full",
     "symlink in path",
+    "root path contains a symlink",
+    "root path is not a directory",
+    "landlock unavailable",
 ];
 
 /// A state word, `mount`, or an errno name such as `EACCES`.
@@ -180,6 +183,9 @@ fn safe_reason(value: &Value) -> Value {
 
 fn json(store: &Store, config: Config, brief: bool) -> Res<Value> {
     store.set_config(config);
+    // stamped when the read snapshot starts: a full run's slow counts must not
+    // make its (older) root states look newer than a brief run's.
+    let generated_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let _snapshot = store.begin()?;
     let mut status = build_inner(store, false, brief)?;
     for row in status["roots"].as_array_mut().unwrap() {
@@ -230,10 +236,7 @@ fn json(store: &Store, config: Config, brief: bool) -> Res<Value> {
         },
     });
     }).ok_or("no config")?;
-    status["generated_at"] = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs()
-        .into();
+    status["generated_at"] = generated_at.into();
     status["brief"] = brief.into();
     Ok(status)
 }
