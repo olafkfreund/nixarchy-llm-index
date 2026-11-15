@@ -55,6 +55,14 @@ fn open(path: &Path, mode: Mode, private: bool) -> Res<Connection> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "journal_size_limit", 67_108_864)?; // WAL shrinks back after big writes
         conn.execute_batch(SCHEMA)?;
+        let has_uuid: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('roots') WHERE name = 'fs_uuid'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_uuid == 0 {
+            conn.execute_batch("ALTER TABLE roots ADD COLUMN fs_uuid TEXT")?;
+        }
         conn.execute_batch("DROP TABLE IF EXISTS embed_cache")?; // vectors now live in chunks
         if private {
             conn.execute_batch(PRIVATE_ONLY)?;
@@ -286,6 +294,41 @@ pub mod tests {
                 assert!(c.execute_batch("CREATE TABLE t(a)").is_err());
             }
         }
+    }
+
+    #[test]
+    fn writer_adds_the_fs_uuid_column_to_an_old_database() {
+        let dir = tmp("migrate");
+        let old = "CREATE TABLE roots(name TEXT PRIMARY KEY, path TEXT, kind TEXT, share_id TEXT,
+          state TEXT, reason TEXT, last_scan INTEGER, queued INTEGER, done INTEGER, skipped_symlinks INTEGER);
+          INSERT INTO roots(name, share_id) VALUES('r', 'x')";
+        for f in ["public.db", "private.db"] {
+            Connection::open(dir.join(f))
+                .unwrap()
+                .execute_batch(old)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            // the second open finds the column and leaves it alone
+            let s = Store::open(&dir, Mode::Writer).unwrap();
+            let v: Option<String> = s
+                .public
+                .query_row("SELECT fs_uuid FROM roots WHERE name = 'r'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(v, None);
+        }
+        // a reader of a database without the column does not write
+        let dir = tmp("migrate-ro");
+        for f in ["public.db", "private.db"] {
+            Connection::open(dir.join(f))
+                .unwrap()
+                .execute_batch(old)
+                .unwrap();
+        }
+        let s = Store::open(&dir, Mode::Both).unwrap();
+        assert!(s.public.prepare("SELECT fs_uuid FROM roots").is_err());
     }
 
     #[test]

@@ -47,6 +47,12 @@ rec {
                 example = "nas:/export";
                 description = "Share identity for roots on a network mount.";
               };
+              adoptUuid = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                example = "bdd8461e-7d6c-42b6-9cfe-39967825dd42";
+                description = "Filesystem UUID (2 to 32 hex digits, dashes optional) to accept for this root even when the index holds files from another disk. Remove it once the root is ok.";
+              };
             };
           }
         );
@@ -102,6 +108,7 @@ rec {
         inherit (r) path tier kind interval;
       }
       // lib.optionalAttrs (r.share != null) { inherit (r) share; }
+      // lib.optionalAttrs (r.adoptUuid != null) { adopt_uuid = r.adoptUuid; }
     ) cfg.roots;
     exclude = {
       inherit (cfg.exclude) paths;

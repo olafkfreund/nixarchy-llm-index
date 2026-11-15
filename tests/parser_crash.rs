@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use llm_index::config::Kind;
 use llm_index::index::sched::{Params, RootSpec, Sched};
-use llm_index::index::{ExtractedFile, ProcSpawner, ScanResult, Sink};
+use llm_index::index::{ExtractedFile, ProcSpawner, ScanResult, Sink, StoredUuid};
 use llm_index::proto::Share;
 use zip::{CompressionMethod, write::SimpleFileOptions};
 
@@ -28,8 +28,14 @@ impl Sink for Mem {
     fn expected_identity(&self, root: &str) -> Option<Share> {
         self.expected.get(root).cloned()
     }
-    fn set_expected_identity(&mut self, root: &str, share: &Share) {
+    fn expected_fs_uuid(&self, _: &str) -> StoredUuid {
+        StoredUuid::Absent
+    }
+    fn set_expected_identity(&mut self, root: &str, share: &Share, _: Option<&str>) {
         self.expected.insert(root.into(), share.clone());
+    }
+    fn indexed_meta(&self, _: &str) -> Result<Vec<(String, u64, i64)>, String> {
+        Ok(vec![])
     }
     fn known(&self, _: &str, _: &str) -> Option<(u64, i64)> {
         None
@@ -114,6 +120,7 @@ fn bomb_fails_once_and_the_next_file_is_extracted() {
             kind: Kind::Local,
             interval: Duration::from_secs(900),
             share: None,
+            adopt_uuid: None,
         }],
         &mut mountinfo,
         ProcSpawner::with_exe(wrapper, &config).unwrap(),

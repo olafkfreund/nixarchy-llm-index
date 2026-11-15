@@ -374,3 +374,11 @@ Traps for every step:
   - A binary rollback can't restore index entries removed by a deliberate
     `adopt_uuid` of an empty disk.
 - The column stays in the database, and it's harmless.
+
+## Deviations recorded during implementation
+
+- Step 2: `adopt_uuid` is validated and normalised by a serde
+  `deserialize_with` on the field, not in `Config::validate`, which takes
+  `&self` and can't rewrite it. A bad value fails at parse time.
+- Step 2: `tests/parser_crash.rs` has its own `Sink` and `RootSpec`, which
+  needed the new trait methods and field.

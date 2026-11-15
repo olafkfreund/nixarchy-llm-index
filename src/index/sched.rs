@@ -33,6 +33,7 @@ pub struct RootSpec {
     pub kind: Kind,
     pub interval: Duration,
     pub share: Option<String>,
+    pub adopt_uuid: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -671,7 +672,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if v == Some(Verdict::Adopt) {
             self.roots[i].expected = before.as_ref().map(|b| b.share.clone());
             if let Some(b) = &before {
-                self.sink.set_expected_identity(&name, &b.share);
+                self.sink
+                    .set_expected_identity(&name, &b.share, b.fs_uuid.as_deref());
             }
         }
         self.queue_extracts(i, &buf.entries);
@@ -1103,6 +1105,7 @@ fn take_job(w: &mut Worker, rel: &str) -> Option<ExtractJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::StoredUuid;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::process::Command;
@@ -1132,6 +1135,8 @@ mod tests {
     struct Mem {
         indexed: usize,
         expected: HashMap<String, Share>,
+        uuids: HashMap<String, Option<String>>,
+        meta: Vec<(String, u64, i64)>,
         scans: Vec<(String, bool)>,
         failed: Vec<String>,
         extracted: Vec<String>,
@@ -1144,8 +1149,18 @@ mod tests {
         fn expected_identity(&self, root: &str) -> Option<Share> {
             self.expected.get(root).cloned()
         }
-        fn set_expected_identity(&mut self, root: &str, share: &Share) {
+        fn expected_fs_uuid(&self, root: &str) -> StoredUuid {
+            match self.uuids.get(root) {
+                Some(Some(u)) => StoredUuid::Known(u.clone()),
+                _ => StoredUuid::Absent,
+            }
+        }
+        fn set_expected_identity(&mut self, root: &str, share: &Share, fs_uuid: Option<&str>) {
             self.expected.insert(root.into(), share.clone());
+            self.uuids.insert(root.into(), fs_uuid.map(Into::into));
+        }
+        fn indexed_meta(&self, _: &str) -> Result<Vec<(String, u64, i64)>, String> {
+            Ok(self.meta.clone())
         }
         fn indexed_files(&self, _: &str) -> usize {
             self.indexed
@@ -1208,6 +1223,7 @@ mod tests {
             kind: Kind::Auto,
             interval: Duration::from_secs(900),
             share: None,
+            adopt_uuid: None,
         }
     }
     fn sched(workers: usize, roots: &[(&str, &str)], mount: &[String]) -> T {

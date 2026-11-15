@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, params};
 
-use super::{ExtractedFile, ScanResult, Sink};
+use super::{ExtractedFile, ScanResult, Sink, StoredUuid};
 use crate::auth::{self, RootStates, Validated, path_hash};
 use crate::config::{self, Config, Tier};
 use crate::db::{Mode, Store};
@@ -338,13 +338,13 @@ impl DbSink {
     /// A root that changes tier keeps its recorded share identity while its path is unchanged;
     /// a changed path clears it so the next scan derives it again.
     fn sync_roots(&self) -> Res<()> {
-        let mut old: std::collections::HashMap<String, (Option<String>, Option<String>)> =
-            Default::default();
+        type Old = (Option<String>, Option<String>, Option<String>);
+        let mut old: std::collections::HashMap<String, Old> = Default::default();
         for t in TIERS {
             let mut stmt = self
                 .conn(t)
-                .prepare("SELECT name, path, share_id FROM roots")?;
-            for r in stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))? {
+                .prepare("SELECT name, path, share_id, fs_uuid FROM roots")?;
+            for r in stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))? {
                 let (name, v) = r?;
                 old.insert(name, v);
             }
@@ -365,19 +365,22 @@ impl DbSink {
                 let path = r.path.to_string_lossy();
                 let carried = old
                     .get(&r.name)
-                    .filter(|(p, _)| p.as_deref() == Some(&*path))
-                    .and_then(|(_, id)| id.clone());
+                    .filter(|(p, ..)| p.as_deref() == Some(&*path));
+                let share = carried.and_then(|(_, id, _)| id.clone());
+                let uuid = carried.and_then(|(.., u)| u.clone());
                 c.execute(
-                    "INSERT INTO roots(name, path, kind, share_id, state, queued, done, skipped_symlinks)
-                     VALUES(?1, ?2, ?3, ?4, '', 0, 0, 0)
+                    "INSERT INTO roots(name, path, kind, share_id, fs_uuid, state, queued, done, skipped_symlinks)
+                     VALUES(?1, ?2, ?3, ?4, ?5, '', 0, 0, 0)
                      ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,
                        share_id = CASE WHEN path IS excluded.path THEN share_id ELSE NULL END,
+                       fs_uuid = CASE WHEN path IS excluded.path THEN fs_uuid ELSE NULL END,
                        path = excluded.path",
                     params![
                         r.name,
                         path,
                         format!("{:?}", r.kind).to_lowercase(),
-                        carried
+                        share,
+                        uuid
                     ],
                 )?;
             }
@@ -674,7 +677,52 @@ impl Sink for DbSink {
         serde_json::from_str(&json?).ok()
     }
 
-    fn set_expected_identity(&mut self, root: &str, share: &Share) {
+    fn expected_fs_uuid(&self, root: &str) -> StoredUuid {
+        let Some(tier) = self.root(root).map(|r| r.tier) else {
+            return StoredUuid::Unreadable;
+        };
+        match self
+            .conn(tier)
+            .query_row("SELECT fs_uuid FROM roots WHERE name = ?1", [root], |r| {
+                r.get::<_, Option<String>>(0)
+            }) {
+            Ok(None) => StoredUuid::Absent,
+            Ok(Some(u)) => {
+                let u = u.to_ascii_lowercase();
+                if (2..=32).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    StoredUuid::Known(u)
+                } else {
+                    StoredUuid::Unreadable
+                }
+            }
+            Err(_) => StoredUuid::Unreadable,
+        }
+    }
+
+    fn indexed_meta(&self, root: &str) -> Result<Vec<(String, u64, i64)>, String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for t in TIERS {
+            let c = self.conn(t);
+            let mut stmt = c
+                .prepare("SELECT relpath, size, mtime_ns FROM files WHERE root_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([root], |r| {
+                    Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let row: (String, u64, i64) = row.map_err(|e| e.to_string())?;
+                if seen.insert(row.0.clone()) {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn set_expected_identity(&mut self, root: &str, share: &Share, fs_uuid: Option<&str>) {
         let Some(tier) = self.root(root).map(|r| r.tier) else {
             return;
         };
@@ -682,8 +730,8 @@ impl Sink for DbSink {
         log(self
             .conn(tier)
             .execute(
-                "UPDATE roots SET share_id = ?2 WHERE name = ?1",
-                params![root, json],
+                "UPDATE roots SET share_id = ?2, fs_uuid = ?3 WHERE name = ?1",
+                params![root, json, fs_uuid],
             )
             .map(drop)
             .map_err(Into::into));
@@ -1030,6 +1078,7 @@ mod tests {
                 mount_root: "/".into(),
                 mount_point: "/data/secret-things".into(),
             },
+            None,
         );
         f.sink
             .validated("/data/secret-things", ValidationResult::Ok);
@@ -1193,7 +1242,7 @@ mod tests {
             mount_point: "/data/pub".into(),
         };
         assert_eq!(f.sink.expected_identity("pub"), None);
-        f.sink.set_expected_identity("pub", &s);
+        f.sink.set_expected_identity("pub", &s, None);
         assert_eq!(f.sink.expected_identity("pub"), Some(s));
         assert_eq!(f.sink.indexed_files("pub"), 0);
     }
@@ -1368,8 +1417,12 @@ mod tests {
             mount_root: "/".into(),
             mount_point: "/data/pub/moving".into(),
         };
-        f.sink.set_expected_identity("moving", &s);
+        f.sink.set_expected_identity("moving", &s, Some("bdd8461e"));
         f.sink.reload(&f.cfg).unwrap();
+        assert_eq!(
+            f.sink.expected_fs_uuid("moving"),
+            StoredUuid::Known("bdd8461e".into())
+        );
         assert_eq!(
             share_of(&f, Tier::Private, "moving"),
             Some(serde_json::to_string(&s).unwrap())
@@ -1387,6 +1440,63 @@ mod tests {
         .unwrap();
         f.sink.reload(&f.cfg).unwrap();
         assert_eq!(share_of(&f, Tier::Private, "moving"), None);
+        assert_eq!(f.sink.expected_fs_uuid("moving"), StoredUuid::Absent);
+    }
+
+    #[test]
+    fn stored_uuid_reads_three_states() {
+        let mut f = fx("uuid3");
+        let s = Share {
+            fstype: "ext4".into(),
+            source: "/dev/sda1".into(),
+            mount_root: "/".into(),
+            mount_point: "/data/pub".into(),
+        };
+        assert_eq!(f.sink.expected_fs_uuid("pub"), StoredUuid::Absent);
+        f.sink.set_expected_identity("pub", &s, Some("AB12"));
+        assert_eq!(
+            f.sink.expected_fs_uuid("pub"),
+            StoredUuid::Known("ab12".into())
+        );
+        for bad in ["", "a", "zz", "bdd8461e-7d6c", &"a".repeat(33)] {
+            f.sink
+                .conn(Tier::Public)
+                .execute("UPDATE roots SET fs_uuid = ?1 WHERE name = 'pub'", [bad])
+                .unwrap();
+            assert_eq!(
+                f.sink.expected_fs_uuid("pub"),
+                StoredUuid::Unreadable,
+                "{bad}"
+            );
+        }
+        f.sink
+            .conn(Tier::Public)
+            .execute("UPDATE roots SET fs_uuid = x'ab' WHERE name = 'pub'", [])
+            .unwrap();
+        assert_eq!(f.sink.expected_fs_uuid("pub"), StoredUuid::Unreadable);
+        assert_eq!(f.sink.expected_fs_uuid("nope"), StoredUuid::Unreadable);
+    }
+
+    #[test]
+    fn indexed_meta_lists_a_path_in_both_tiers_once_public_first() {
+        let f = fx("meta");
+        let ins = |t: Tier, size: i64| {
+            f.sink
+                .conn(t)
+                .execute(
+                    "INSERT INTO files(root_id, relpath, abspath, size, mtime_ns, state)
+                     VALUES('pub', 'a.txt', '/data/pub/a.txt', ?1, 7, 'ok')",
+                    [size],
+                )
+                .unwrap();
+        };
+        ins(Tier::Private, 2);
+        ins(Tier::Public, 1);
+        assert_eq!(
+            f.sink.indexed_meta("pub"),
+            Ok(vec![("a.txt".to_string(), 1, 7)])
+        );
+        assert_eq!(f.sink.indexed_meta("other"), Ok(vec![]));
     }
 
     #[test]
