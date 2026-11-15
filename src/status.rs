@@ -30,8 +30,9 @@ pub fn sandbox_state() -> &'static str {
 }
 
 const STATES: [&str; 4] = ["ok", "offline", "degraded", "config_error"];
-const REASONS: [&str; 14] = [
+const REASONS: [&str; 15] = [
     "identity mismatch",
+    "identity check",
     "watch degraded",
     "watcher exited",
     "watch setup stalled",
@@ -328,6 +329,9 @@ mod tests {
             [[root]]
             name = "a"
             path = "/data/a"
+            [[root]]
+            name = "checking"
+            path = "/data/checking"
             [exclude]
             paths = ["/data/pub/x"]
             lift_builtin = ["secret/glob"]
@@ -339,6 +343,7 @@ mod tests {
         let writer = Store::open(&dir, Mode::Writer).unwrap();
         writer.public.execute("INSERT INTO roots(name,path,state,reason,last_scan,queued,done,skipped_symlinks) VALUES('pub','/data/pub','', '', 12, 3, 4, 5)", []).unwrap();
         writer.private.as_ref().unwrap().execute("INSERT INTO roots(name,path,state,reason) VALUES('moving','/data/pub/moving','offline','/secret/path')", []).unwrap();
+        writer.private.as_ref().unwrap().execute("INSERT INTO roots(name,path,state,reason) VALUES('checking','/data/checking','offline','identity check')", []).unwrap();
         let private = writer.private.as_ref().unwrap();
         for (path, reason) in [
             ("/data/pub", "symlink in path"),
@@ -376,6 +381,7 @@ mod tests {
                 "pub [public]   reason:   last scan: 12  queued/done: 3/4  files: 0  chunks: 0  skipped symlinks: 5\n",
                 "moving [private] offline  reason: /secret/path  last scan: -  queued/done: -/-  files: 0  chunks: 0  skipped symlinks: -\n",
                 "a [private] pending  reason: -  last scan: -  queued/done: -/-  files: 0  chunks: 0  skipped symlinks: -\n",
+                "checking [private] offline  reason: identity check  last scan: -  queued/done: -/-  files: 0  chunks: 0  skipped symlinks: -\n",
                 "config error: /data/ab: watch degraded\n",
                 "config error: /data/pub: symlink in path\n",
                 "config error: /data/pub/moving/x: EACCES\n",
@@ -404,12 +410,14 @@ mod tests {
                 db["bytes"] = json!(1);
             }
             let roots = value["roots"].as_array().unwrap().clone();
-            assert_eq!(roots.len(), 3);
+            assert_eq!(roots.len(), 4);
             assert_eq!(roots[0]["state"], "pending");
             assert!(roots[0]["reason"].is_null());
             assert_eq!(roots[1]["reason"], "other");
             assert!(roots[2]["last_scan"].is_null());
             assert_eq!(roots[2]["state"], "pending");
+            assert_eq!(roots[3]["state"], "offline");
+            assert_eq!(roots[3]["reason"], "identity check");
             assert_eq!(roots[0]["files"].is_null(), brief);
             assert_eq!(roots[0]["chunks"].is_null(), brief);
             let errors = value["config_errors"].as_array().unwrap().clone();

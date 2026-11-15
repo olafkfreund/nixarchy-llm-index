@@ -30,6 +30,23 @@ pub struct Root {
     #[serde(default = "default_interval")]
     pub interval: String,
     pub share: Option<String>,
+    /// Filesystem UUID to accept for this root; parsing strips dashes and lowercases.
+    #[serde(default, deserialize_with = "adopt_uuid")]
+    pub adopt_uuid: Option<String>,
+}
+
+fn adopt_uuid<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let Some(s) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    let hex = s.replace('-', "").to_ascii_lowercase();
+    if (2..=32).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(hex))
+    } else {
+        Err(serde::de::Error::custom(
+            "adopt_uuid must be 2 to 32 hex digits, dashes allowed",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -284,6 +301,32 @@ mod tests {
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn adopt_uuid_is_normalised_or_refused() {
+        let parse = |v: &str| {
+            toml::from_str::<Config>(&format!(
+                "state_dir = \"/state\"\n[[root]]\nname = \"a\"\npath = \"/x\"\n{v}"
+            ))
+        };
+        let got = |v: &str| parse(v).unwrap().roots[0].adopt_uuid.clone();
+        assert_eq!(got(""), None);
+        assert_eq!(
+            got("adopt_uuid = \"BDD8461E-7d6c-42b6-9cfe-39967825DD42\""),
+            Some("bdd8461e7d6c42b69cfe39967825dd42".into())
+        );
+        assert_eq!(got("adopt_uuid = \"ABCD\""), Some("abcd".into()));
+        for bad in [
+            "",
+            "a",
+            "xyz1",
+            "0123456789abcdef0123456789abcdef0",
+            "ab cd",
+            "--",
+        ] {
+            assert!(parse(&format!("adopt_uuid = \"{bad}\"")).is_err(), "{bad}");
+        }
     }
 
     #[test]

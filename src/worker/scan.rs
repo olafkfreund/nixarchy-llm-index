@@ -2,7 +2,7 @@ use std::error::Error;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rustix::fs::{
     AtFlags, CWD, Dir, Mode, OFlags, ResolveFlags, Statx, StatxFlags, fstat, openat, openat2, statx,
 };
+use rustix::ioctl::{Getter, ioctl};
 
 use super::{Output, sandbox::Ready};
 use crate::config::Tier;
@@ -127,6 +128,7 @@ fn mount_state(
         },
         mount_id: mount.id,
         submounts: below,
+        fs_uuid: None,
     }))
 }
 
@@ -142,6 +144,20 @@ impl<T: Read + Seek> ReadSeek for T {}
 
 pub fn root_mount_id(fd: &OwnedFd) -> Result<u64, Box<dyn Error>> {
     Ok(statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?.stx_mnt_id)
+}
+
+pub fn fs_uuid(fd: &impl AsFd) -> Option<String> {
+    // SAFETY: FS_IOC_GETFSUUID writes a length byte and up to 16 UUID bytes.
+    let buf = unsafe { ioctl(fd, Getter::<0x80111500, [u8; 17]>::new()) }.ok()?;
+    decode_fsuuid(&buf)
+}
+
+fn decode_fsuuid(buf: &[u8; 17]) -> Option<String> {
+    let len = usize::from(buf[0]);
+    if !(1..=16).contains(&len) {
+        return None;
+    }
+    Some(buf[1..=len].iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn open_dir(parent: &OwnedFd, name: &CStr) -> rustix::io::Result<OwnedFd> {
@@ -572,7 +588,10 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
         }
     };
     // An identity that is not the one the root fd lives on is unknown, not a mismatch.
-    let before = on_fd_mount(before, Some(fd_id));
+    let before = on_fd_mount(before, Some(fd_id)).map(|mut identity| {
+        identity.fs_uuid = fs_uuid(ready.root_fd.as_ref().expect("root fd checked above"));
+        identity
+    });
     let mut complete = before.is_some();
     let max_size = ready.config.limits.max_file_mb.saturating_mul(1024 * 1024);
     let mut walker = Walker::new(ready)?;
@@ -626,7 +645,10 @@ pub fn scan(ready: &mut Ready, output: &Output) -> Result<(), Box<dyn Error>> {
             None
         }
     };
-    let after = on_fd_mount(after, after_id);
+    let after = on_fd_mount(after, after_id).map(|mut identity| {
+        identity.fs_uuid = fs_uuid(ready.root_fd.as_ref().expect("root fd checked above"));
+        identity
+    });
     complete &= before == after && after.is_some();
     output.send(&Message::ScanDone {
         complete,
@@ -678,6 +700,38 @@ pub fn validate_path(path: &Path) -> ValidationResult {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn decode_fsuuid_bounds_and_hex() {
+        let mut buf = [0_u8; 17];
+        assert_eq!(decode_fsuuid(&buf), None);
+        buf[0] = 1;
+        buf[1] = 0xab;
+        assert_eq!(decode_fsuuid(&buf).as_deref(), Some("ab"));
+        buf[0] = 16;
+        buf[1..].copy_from_slice(&[
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ]);
+        assert_eq!(
+            decode_fsuuid(&buf).as_deref(),
+            Some("11111111222233334444555555555555")
+        );
+        buf[0] = 17;
+        assert_eq!(decode_fsuuid(&buf), None);
+    }
+
+    #[test]
+    fn fs_uuid_on_tempdir_does_not_panic() {
+        let path = std::env::temp_dir().join(format!("llm-index-fsuuid-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let dir = File::open(&path).unwrap();
+        if let Some(uuid) = fs_uuid(&dir) {
+            assert!((2..=32).contains(&uuid.len()));
+            assert!(uuid.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        std::fs::remove_dir(path).unwrap();
+    }
 
     #[test]
     fn identity_off_the_root_fd_mount_is_none() {

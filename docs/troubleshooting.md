@@ -93,13 +93,50 @@ Run `llm-index status` and read the state and reason.
 | `config_error`, `root path is not a directory` | The path is a file or does not resolve to a directory. | Fix `path`. |
 | `config_error`, `landlock unavailable` | See "Landlock" above. | |
 | `offline`, an OS error or a stall reason | The path is missing or the share stopped answering. | Mount the share; check the path. Retried after 60 s, then at doubling intervals up to `limits.backoffMax`. |
-| `offline`, `identity mismatch` | The mount at the path is not the one the root was set up for (for example the wrong share is mounted), or an older version left the root with indexed files and no recorded mount identity after an incomplete first scan. | Mount the right share, or fix `share`. If the path changed, or if the root is stuck from an incomplete first scan, set `share` for the root or rename the root; the message can still mean the wrong mount. |
+| `offline`, `identity check` | Only the `/dev` device name changed on a local mount; one scan is checking the filesystem UUID and evidence. | Wait for the scan to finish. |
+| `offline`, `identity mismatch` | The mount or filesystem at the path does not match the recorded root identity. | See [A root is offline with `identity mismatch`](#a-root-is-offline-with-identity-mismatch) below. |
 | `degraded`, `ENOSPC` | The inotify watch limit is reached. The root is polled every two minutes instead. | Raise `fs.inotify.max_user_watches`. |
 | `degraded`, `IN_Q_OVERFLOW` | The inotify event queue overflowed. Polled every two minutes. | Raise `fs.inotify.max_queued_events`. |
 | `degraded`, `watcher exited`, `watch setup stalled`, `watch degraded` or another OS error text | The watcher failed or stalled. Polled every two minutes. | Read the log. |
 
 A `config_error` root hides its files from search until fixed. `offline` and
 `degraded` roots keep their files searchable, marked `stale: true`.
+
+## A root is offline with `identity mismatch`
+
+`identity mismatch` means the mount or filesystem at the root's path is not the
+one recorded for that root:
+
+- the mount point, mount root, filesystem type or network `share` changed (for
+  example the wrong share or disk is mounted, or a mount is missing);
+- the filesystem UUID read during a scan did not match the stored UUID (or
+  `adopt_uuid` / `adoptUuid`); or
+- the kernel renamed a local `/dev` device, no UUID was stored yet, and the
+  scan did not meet the 90% file-metadata evidence threshold (or the kernel is
+  older than 6.5 and provides no `FS_IOC_GETFSUUID`).
+
+While rejected, the root stays `offline` (its indexed files remain searchable
+with `stale: true`) and is not rescanned until its mountinfo changes or the
+service restarts.
+
+1. Check what is mounted at the root path. If the wrong disk or share is
+   mounted, mount the right one (or fix `share` for a network root).
+2. If a local disk is intentionally new, replaced, or failed the evidence
+   check after heavy offline edits, find its filesystem UUID with either
+   command. `adoptUuid` only helps when the filesystem type, mount point and
+   mount root still match the recorded root (a disk reformatted from ext4 to
+   XFS, for example, needs the root renamed instead):
+
+   ```bash
+   findmnt -no UUID <mountpoint>
+   lsblk -no UUID <device>
+   ```
+
+3. Set `adoptUuid` (or `adopt_uuid` in `config.toml`) on the root **only if it
+   is the right disk**—`adoptUuid` accepts even an empty filesystem, and the
+   index then follows that disk. Once the scan completes and `llm-index status`
+   shows the root `ok`, remove `adoptUuid` (leaving it set is also safe, as it
+   keeps pinning that filesystem).
 
 ## A tool says `index configuration is being checked`
 

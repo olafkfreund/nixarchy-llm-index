@@ -70,12 +70,29 @@ pub struct ExtractedFile {
     pub mtime_ns: i64,
 }
 
+/// The filesystem UUID stored with a root's identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredUuid {
+    /// Nothing recorded (NULL).
+    Absent,
+    /// 2 to 32 hex digits, lowercased.
+    Known(String),
+    /// A database error or a malformed value: never a match.
+    Unreadable,
+}
+
 /// What the coordinator needs from storage; step 9 implements it over the databases.
 pub trait Sink {
     fn indexed_files(&self, root: &str) -> usize;
     /// Share identity recorded for the root (survives restarts); `None` before the first scan.
     fn expected_identity(&self, root: &str) -> Option<Share>;
-    fn set_expected_identity(&mut self, root: &str, share: &Share);
+    /// UUID recorded with the identity; read as three states, see [`StoredUuid`].
+    fn expected_fs_uuid(&self, root: &str) -> StoredUuid;
+    /// Writes the share and the UUID (`None` clears it) in one statement.
+    fn set_expected_identity(&mut self, root: &str, share: &Share, fs_uuid: Option<&str>);
+    /// `(relpath, size, mtime_ns)` of the indexed files from both tiers, public tier first,
+    /// each path once.
+    fn indexed_meta(&self, root: &str) -> Result<Vec<(String, u64, i64)>, String>;
     /// Stored (size, mtime_ns) of a file, if indexed.
     fn known(&self, root: &str, relpath: &str) -> Option<(u64, i64)>;
     fn scan_done(&mut self, root: &str, scan: ScanResult);
@@ -392,6 +409,7 @@ fn specs_of(config: &Config) -> Result<(Params, Vec<RootSpec>), Box<dyn Error>> 
                 kind: r.kind,
                 interval: parse_duration(&r.interval)?,
                 share: r.share.clone(),
+                adopt_uuid: r.adopt_uuid.clone(),
             })
         })
         .collect::<Result<_, String>>()?;

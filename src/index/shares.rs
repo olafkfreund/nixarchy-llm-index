@@ -51,6 +51,8 @@ pub enum Verdict {
     Adopt,
     /// autofs: scan once to trigger the real mount; the result is not accepted.
     Probe,
+    /// A local device name changed; a scan must confirm its filesystem UUID.
+    Confirm,
     Mismatch,
 }
 
@@ -76,6 +78,17 @@ pub fn verdict(
                 && current.mount_point != e.mount_point =>
         {
             Verdict::Adopt
+        }
+        Some(e)
+            if configured_ok
+                && !is_network(&current.fstype)
+                && e.fstype == current.fstype
+                && e.mount_root == current.mount_root
+                && e.mount_point == current.mount_point
+                && e.source.starts_with("/dev/")
+                && current.source.starts_with("/dev/") =>
+        {
+            Verdict::Confirm
         }
         _ => Verdict::Mismatch,
     }
@@ -172,6 +185,51 @@ mod tests {
         let mut auto = a.clone();
         auto.fstype = "autofs".into();
         assert_eq!(verdict(None, Some("nas:/a"), &auto, 0), Verdict::Probe);
+    }
+
+    #[test]
+    fn confirm_only_for_local_device_source_change() {
+        let old = Share {
+            fstype: "ext4".into(),
+            source: "/dev/vdb".into(),
+            mount_root: "/".into(),
+            mount_point: "/mnt/disk".into(),
+        };
+        let mut new = old.clone();
+        new.source = "/dev/vdc".into();
+        assert_eq!(verdict(Some(&old), None, &new, 1), Verdict::Confirm);
+        assert_eq!(
+            verdict(Some(&old), Some("/dev/vdc"), &new, 1),
+            Verdict::Confirm
+        );
+        assert_eq!(
+            verdict(Some(&old), Some("/dev/vdb"), &new, 1),
+            Verdict::Mismatch
+        );
+        for changed in [
+            Share {
+                mount_point: "/mnt/other".into(),
+                ..new.clone()
+            },
+            Share {
+                mount_root: "/sub".into(),
+                ..new.clone()
+            },
+            Share {
+                fstype: "xfs".into(),
+                ..new.clone()
+            },
+            Share {
+                source: "disk".into(),
+                ..new.clone()
+            },
+        ] {
+            assert_eq!(verdict(Some(&old), None, &changed, 1), Verdict::Mismatch);
+        }
+        let mut network = old.clone();
+        network.fstype = "nfs".into();
+        new.fstype = "nfs".into();
+        assert_eq!(verdict(Some(&network), None, &new, 1), Verdict::Mismatch);
     }
 
     #[test]

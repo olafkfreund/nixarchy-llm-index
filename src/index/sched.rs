@@ -1,13 +1,13 @@
 //! Scheduler: pool, per-share rule, timeouts, abandonment, solo retry, watcher lifecycle.
 //! Pure state machine: time, process control and storage are injected, so it never does I/O.
 use std::collections::hash_map::Entry as Slot;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::shares::{Derived, ShareBook, Time, Verdict, WorkerId, derive, is_network, verdict};
 use super::watchers::{DEGRADED_POLL, WatchState};
-use super::{Entry, Event, ExtractedFile, Role, ScanResult, Sink, Spawner};
+use super::{Entry, Event, ExtractedFile, Role, ScanResult, Sink, Spawner, StoredUuid};
 use crate::config::Kind;
 use crate::proto::{Job, Message, MountIdentity, Share, ValidationResult};
 use crate::worker::scan::ReadSeek;
@@ -33,6 +33,7 @@ pub struct RootSpec {
     pub kind: Kind,
     pub interval: Duration,
     pub share: Option<String>,
+    pub adopt_uuid: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,6 +63,8 @@ struct Worker {
     abandoned: bool,
     /// Started under an older config: Shutdown sent, output ignored, still counts until reaped.
     retired: bool,
+    /// Retired by a config reload: nothing new starts until it is reaped.
+    blocks: bool,
     /// Sent a byte/entry Progress during its job; silence from one that never did means stuck I/O.
     progressed: bool,
     /// Shutdown was sent at this time; SIGKILL after `GRACE` if still not reaped.
@@ -81,7 +84,12 @@ struct RootRt {
     spec: RootSpec,
     derived: Derived,
     expected: Option<Share>,
+    rejected: Option<Derived>,
+    /// A local mount changed under the running service: hold extract and watch until a
+    /// scan of the new mount is accepted.
+    unconfirmed: bool,
     state: String,
+    reason: String,
     scan_due: Time,
     rescan: bool,
     /// No new jobs for this root before this time (root error, identity mismatch).
@@ -143,8 +151,11 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             .map(|spec| RootRt {
                 derived: derive(mountinfo, &spec.path),
                 expected: sink.expected_identity(&spec.name),
+                rejected: None,
+                unconfirmed: false,
                 spec,
                 state: String::new(),
+                reason: String::new(),
                 scan_due: Time::ZERO,
                 rescan: false,
                 hold: Time::ZERO,
@@ -198,8 +209,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
 
     fn set_state(&mut self, i: usize, state: &str, reason: &str) {
         let r = &mut self.roots[i];
-        if r.state != state {
+        if r.state != state || r.reason != reason {
             r.state = state.into();
+            r.reason = reason.into();
             self.sink.root_state(&r.spec.name, state, reason);
         }
     }
@@ -219,11 +231,37 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     self.shares.charge(&d.share, *id);
                 }
             }
+            let local = !is_network(&d.share.fstype);
             self.roots[i].derived = d;
+            self.roots[i].rejected = None;
+            self.roots[i].unconfirmed |= local;
+            // a mount that is no longer trusted stops extract and watch now, not at their next job
+            if matches!(self.verdict_of(i), Verdict::Mismatch | Verdict::Confirm) {
+                self.untrust(i, now);
+            }
             // a new mount may end what the hold waited out (mismatch, offline): scan at once
             self.roots[i].hold = now;
             self.request_scan(i, now, Duration::ZERO);
         }
+    }
+
+    /// Retire the root's live extract and watch workers and apply the identity verdict.
+    fn untrust(&mut self, i: usize, now: Time) {
+        let live: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| {
+                w.root == i
+                    && !w.abandoned
+                    && !w.retired
+                    && matches!(w.role, Role::Extract | Role::Watch)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in live {
+            self.retire(id, now);
+        }
+        self.check_identity(i, now);
     }
 
     /// The config changed: swap the policy, retire every worker started under the old one
@@ -237,7 +275,16 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            let w = self.workers.get_mut(&id).expect("listed");
+            self.retire(id, now);
+            self.workers.get_mut(&id).expect("listed").blocks = true;
+        }
+    }
+
+    /// Stop a worker for good: its later messages are ignored, its work is handed back,
+    /// and it is shut down (SIGKILL after `GRACE`).
+    fn retire(&mut self, id: WorkerId, now: Time) {
+        {
+            let w = self.workers.get_mut(&id).expect("live worker");
             w.retired = true;
             let i = w.root;
             if matches!(self.roots[i].busy, Some((b, _)) if b == id) {
@@ -265,8 +312,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     r.retry_at = now;
                 }
             }
-            self.shutdown(id, now);
         }
+        self.shutdown(id, now);
     }
 
     /// Per root: its path and the exclusions under it, to be validated now and after changes.
@@ -589,17 +636,33 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
 
     fn verdict_of(&self, i: usize) -> Verdict {
         let r = &self.roots[i];
-        verdict(
+        if r.rejected.as_ref() == Some(&r.derived) {
+            return Verdict::Mismatch;
+        }
+        let v = verdict(
             r.expected.as_ref(),
             r.spec.share.as_deref(),
             &r.derived.share,
             self.sink.indexed_files(&r.spec.name),
-        )
+        );
+        if v == Verdict::Ok && r.unconfirmed {
+            Verdict::Confirm
+        } else {
+            v
+        }
     }
 
     /// `verdict_of` plus the Mismatch consequences: queue dropped, root held and offline.
     fn check_identity(&mut self, i: usize, now: Time) -> Verdict {
         let v = self.verdict_of(i);
+        if matches!(v, Verdict::Mismatch | Verdict::Confirm)
+            && let Some(id) = self.roots[i].watch.worker
+            && !self.workers.get(&id).is_some_and(|w| w.retired)
+        {
+            self.workers.get_mut(&id).expect("watch worker").retired = true;
+            self.roots[i].watch.ready = false;
+            self.shutdown(id, now);
+        }
         if v == Verdict::Mismatch {
             let r = &mut self.roots[i];
             r.queue.clear();
@@ -607,6 +670,8 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             r.hold = now + RETRY;
             self.solo.retain(|s| s.0 != i);
             self.set_state(i, "offline", "identity mismatch");
+        } else if v == Verdict::Confirm {
+            self.set_state(i, "offline", "identity check");
         }
         v
     }
@@ -646,6 +711,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.scan_finished(i, now, RETRY);
             return;
         }
+        // a scan of a mount that has since been replaced says nothing about the current one
+        if let Some(b) = &before
+            && (b.share != self.roots[i].derived.share
+                || b.mount_id != self.roots[i].derived.mount_id)
+        {
+            self.scan_finished(i, now, RETRY);
+            return;
+        }
         let changed = matches!((&before, &after), (Some(b), Some(a)) if b != a);
         let v = before.as_ref().map(|b| {
             let r = &self.roots[i];
@@ -656,8 +729,15 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 self.sink.indexed_files(&name),
             )
         });
-        if changed || v == Some(Verdict::Mismatch) {
+        if changed
+            || v == Some(Verdict::Mismatch)
+            || self.roots[i].rejected.as_ref() == Some(&self.roots[i].derived)
+        {
             // result discarded entirely
+            if changed && !self.network(i) {
+                self.roots[i].unconfirmed = true;
+                self.untrust(i, now);
+            }
             self.set_state(i, "offline", "identity mismatch");
             self.scan_finished(i, now, RETRY);
             return;
@@ -667,13 +747,75 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             return;
         }
         let accepted = complete && before == after;
-        // equal identities on both sides adopt even when the walk was incomplete
-        if v == Some(Verdict::Adopt) {
-            self.roots[i].expected = before.as_ref().map(|b| b.share.clone());
-            if let Some(b) = &before {
-                self.sink.set_expected_identity(&name, &b.share);
+        let b = before.as_ref().expect("checked above");
+        let stored = self.sink.expected_fs_uuid(&name);
+        let evidence = || {
+            if !complete {
+                return false;
             }
-        }
+            let Ok(meta) = self.sink.indexed_meta(&name) else {
+                return false;
+            };
+            let protected: HashSet<&str> = buf
+                .skipped
+                .iter()
+                .filter(|(_, why)| super::store::protects(why))
+                .map(|(rel, _)| rel.as_str())
+                .collect();
+            let files: HashMap<&str, (u64, i64)> = buf
+                .entries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| (e.relpath.as_str(), (e.size, e.mtime_ns)))
+                .collect();
+            let mut total = 0usize;
+            let mut matches = 0usize;
+            for (rel, size, mtime) in meta {
+                if super::store::under_any(&rel, &protected) {
+                    continue;
+                }
+                total += 1;
+                matches += usize::from(files.get(rel.as_str()) == Some(&(size, mtime)));
+            }
+            total > 0 && matches.saturating_mul(10) >= total.saturating_mul(9)
+        };
+        let uuid = match (
+            &stored,
+            self.roots[i].spec.adopt_uuid.as_deref(),
+            v.as_ref(),
+        ) {
+            (StoredUuid::Unreadable, _, _) => None,
+            (_, Some(a), _) if complete && b.fs_uuid.as_deref() == Some(a) => Some(Some(a)),
+            (_, Some(_), _) => None,
+            (_, None, Some(Verdict::Adopt)) => Some(b.fs_uuid.as_deref()),
+            (StoredUuid::Known(u), None, _) if b.fs_uuid.as_deref() == Some(u) => {
+                Some(Some(u.as_str()))
+            }
+            (StoredUuid::Known(_), None, _) => None,
+            (StoredUuid::Absent, None, Some(Verdict::Ok)) => {
+                Some(if b.fs_uuid.is_some() && evidence() {
+                    b.fs_uuid.as_deref()
+                } else {
+                    None
+                })
+            }
+            (StoredUuid::Absent, None, Some(Verdict::Confirm))
+                if b.fs_uuid.is_some() && evidence() =>
+            {
+                Some(b.fs_uuid.as_deref())
+            }
+            _ => None,
+        };
+        let Some(uuid) = uuid.map(|u| u.map(str::to_owned)) else {
+            self.roots[i].rejected = Some(self.roots[i].derived.clone());
+            self.check_identity(i, now);
+            self.scan_finished(i, now, RETRY);
+            return;
+        };
+        self.roots[i].expected = Some(b.share.clone());
+        self.roots[i].unconfirmed = false;
+        self.sink
+            .set_expected_identity(&name, &b.share, uuid.as_deref());
         self.queue_extracts(i, &buf.entries);
         self.sink.scan_done(
             &name,
@@ -914,7 +1056,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     }
 
     fn dispatch(&mut self, now: Time) {
-        if self.solo_running.is_some() || self.workers.values().any(|w| w.retired && !w.abandoned) {
+        if self.solo_running.is_some() || self.workers.values().any(|w| w.blocks && !w.abandoned) {
             return;
         }
         while let Some((i, rel, size, mtime)) = self.solo.front().cloned() {
@@ -926,8 +1068,15 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 self.solo.pop_front();
                 continue;
             }
-            if now >= self.roots[i].hold && self.check_identity(i, now) == Verdict::Mismatch {
-                continue; // the mismatch evicted this root; filter the new front too
+            if now >= self.roots[i].hold {
+                match self.check_identity(i, now) {
+                    Verdict::Mismatch => continue, // mismatch evicted this root
+                    Verdict::Confirm => {
+                        self.solo.pop_front();
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             break;
         }
@@ -1070,6 +1219,7 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
         role,
         abandoned: false,
         retired: false,
+        blocks: false,
         progressed: false,
         closing: None,
         served: 0,
@@ -1103,6 +1253,7 @@ fn take_job(w: &mut Worker, rel: &str) -> Option<ExtractJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::StoredUuid;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::process::Command;
@@ -1132,6 +1283,10 @@ mod tests {
     struct Mem {
         indexed: usize,
         expected: HashMap<String, Share>,
+        uuids: HashMap<String, Option<String>>,
+        unreadable_uuid: bool,
+        meta: Vec<(String, u64, i64)>,
+        meta_err: bool,
         scans: Vec<(String, bool)>,
         failed: Vec<String>,
         extracted: Vec<String>,
@@ -1144,8 +1299,25 @@ mod tests {
         fn expected_identity(&self, root: &str) -> Option<Share> {
             self.expected.get(root).cloned()
         }
-        fn set_expected_identity(&mut self, root: &str, share: &Share) {
+        fn expected_fs_uuid(&self, root: &str) -> StoredUuid {
+            if self.unreadable_uuid {
+                return StoredUuid::Unreadable;
+            }
+            match self.uuids.get(root) {
+                Some(Some(u)) => StoredUuid::Known(u.clone()),
+                _ => StoredUuid::Absent,
+            }
+        }
+        fn set_expected_identity(&mut self, root: &str, share: &Share, fs_uuid: Option<&str>) {
             self.expected.insert(root.into(), share.clone());
+            self.uuids.insert(root.into(), fs_uuid.map(Into::into));
+        }
+        fn indexed_meta(&self, _: &str) -> Result<Vec<(String, u64, i64)>, String> {
+            if self.meta_err {
+                Err("read failed".into())
+            } else {
+                Ok(self.meta.clone())
+            }
         }
         fn indexed_files(&self, _: &str) -> usize {
             self.indexed
@@ -1208,6 +1380,7 @@ mod tests {
             kind: Kind::Auto,
             interval: Duration::from_secs(900),
             share: None,
+            adopt_uuid: None,
         }
     }
     fn sched(workers: usize, roots: &[(&str, &str)], mount: &[String]) -> T {
@@ -1234,6 +1407,7 @@ mod tests {
             },
             mount_id: id,
             submounts: vec![],
+            fs_uuid: None,
         }
     }
     fn scans(s: &T) -> Vec<(WorkerId, String)> {
@@ -1297,6 +1471,364 @@ mod tests {
                 .any(|(w, j)| *w == id && j.contains("Shutdown"))
         );
         s.handle(id, Event::Exit, now);
+    }
+
+    fn identity_case(stored: StoredUuid, adopt: Option<&str>, confirm: bool) -> (T, MountIdentity) {
+        let mut s = sched(
+            2,
+            &[("r", "/mnt/nas")],
+            &[ext4(1, "/"), ext4(2, "/mnt/nas")],
+        );
+        let mut who = ident("/mnt/nas", "/dev/d2", "ext4", 2);
+        who.fs_uuid = Some("aabb".into());
+        s.roots[0].expected = Some(if confirm {
+            Share {
+                source: "/dev/old".into(),
+                ..who.share.clone()
+            }
+        } else {
+            who.share.clone()
+        });
+        s.roots[0].spec.adopt_uuid = adopt.map(Into::into);
+        match stored {
+            StoredUuid::Known(u) => {
+                s.sink.uuids.insert("r".into(), Some(u));
+            }
+            StoredUuid::Unreadable => s.sink.unreadable_uuid = true,
+            StoredUuid::Absent => {}
+        }
+        s.sink.meta = vec![("f".into(), 1, 2)];
+        (s, who)
+    }
+
+    fn identity_scan(
+        s: &mut T,
+        who: MountIdentity,
+        complete: bool,
+        files: &[(&str, u64, i64)],
+        skipped: &[(&str, &str)],
+    ) {
+        s.start(0, Role::Scan, None, secs(0));
+        let id = scans(s).last().unwrap().0;
+        for (rel, size, mtime) in files {
+            s.handle(
+                id,
+                Event::Msg(Message::Entry {
+                    relpath: (*rel).into(),
+                    size: *size,
+                    mtime_ns: *mtime,
+                    is_dir: false,
+                }),
+                secs(1),
+            );
+        }
+        for (rel, reason) in skipped {
+            s.handle(
+                id,
+                Event::Msg(Message::Skipped {
+                    relpath: (*rel).into(),
+                    reason: (*reason).into(),
+                }),
+                secs(1),
+            );
+        }
+        s.handle(
+            id,
+            Event::Msg(Message::ScanDone {
+                complete,
+                identity_before: Some(who.clone()),
+                identity_after: Some(who),
+            }),
+            secs(1),
+        );
+    }
+
+    #[test]
+    fn uuid_precedence_rows_and_negatives() {
+        // Row 1 wins even over an explicit adoption.
+        let (mut s, who) = identity_case(StoredUuid::Unreadable, Some("aabb"), false);
+        identity_scan(&mut s, who, true, &[("f", 1, 2)], &[]);
+        assert!(s.sink.scans.is_empty());
+        assert_eq!(s.roots[0].rejected, Some(s.roots[0].derived.clone()));
+
+        // Row 2 accepts only the requested UUID and a complete scan.
+        for (uuid, complete, accepted) in [
+            ("aabb", true, true),
+            ("ccdd", true, false),
+            ("aabb", false, false),
+        ] {
+            let (mut s, mut who) =
+                identity_case(StoredUuid::Known("ccdd".into()), Some("aabb"), false);
+            who.fs_uuid = Some(uuid.into());
+            identity_scan(&mut s, who, complete, &[], &[]);
+            assert_eq!(!s.sink.scans.is_empty(), accepted);
+            if accepted {
+                assert_eq!(s.sink.uuids["r"], Some("aabb".into()));
+            }
+        }
+
+        // Row 3 adopts even with an incomplete scan, including an unavailable UUID.
+        for uuid in [Some("aabb"), None] {
+            let (mut s, mut who) = identity_case(StoredUuid::Absent, None, false);
+            s.roots[0].expected = None;
+            who.fs_uuid = uuid.map(Into::into);
+            identity_scan(&mut s, who, false, &[], &[]);
+            assert_eq!(s.sink.scans, [("r".into(), false)]);
+            assert_eq!(s.sink.uuids["r"], uuid.map(Into::into));
+        }
+
+        // Row 4 pins the stored UUID; a missing or different worker UUID rejects.
+        for (uuid, accepted) in [(Some("aabb"), true), (Some("ccdd"), false), (None, false)] {
+            let (mut s, mut who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+            who.fs_uuid = uuid.map(Into::into);
+            identity_scan(&mut s, who, true, &[], &[]);
+            assert_eq!(!s.sink.scans.is_empty(), accepted);
+        }
+
+        // Row 5 applies scans regardless of evidence; enrolment requires UUID and E.
+        for (uuid, files, enrolled) in [
+            (Some("aabb"), vec![("f", 1, 2)], true),
+            (Some("aabb"), vec![], false),
+            (None, vec![("f", 1, 2)], false),
+        ] {
+            let (mut s, mut who) = identity_case(StoredUuid::Absent, None, false);
+            who.fs_uuid = uuid.map(Into::into);
+            identity_scan(&mut s, who, true, &files, &[]);
+            assert_eq!(s.sink.scans.len(), 1);
+            assert_eq!(s.sink.uuids["r"].is_some(), enrolled);
+        }
+
+        // Row 6 requires all three: worker UUID, complete scan, and evidence.
+        for (uuid, complete, files, accepted) in [
+            (Some("aabb"), true, vec![("f", 1, 2)], true),
+            (None, true, vec![("f", 1, 2)], false),
+            (Some("aabb"), false, vec![("f", 1, 2)], false),
+            (Some("aabb"), true, vec![], false),
+        ] {
+            let (mut s, mut who) = identity_case(StoredUuid::Absent, None, true);
+            who.fs_uuid = uuid.map(Into::into);
+            identity_scan(&mut s, who, complete, &files, &[]);
+            assert_eq!(!s.sink.scans.is_empty(), accepted);
+        }
+    }
+
+    #[test]
+    fn evidence_requires_complete_scan_and_ninety_percent_of_unprotected_metadata() {
+        for (denominator, matches, expected) in [
+            (0, 0, false),
+            (1, 1, true),
+            (100, 89, false),
+            (100, 90, true),
+        ] {
+            let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+            s.sink.meta = (0..denominator).map(|n| (format!("f{n}"), 1, 2)).collect();
+            let files: Vec<_> = (0..matches).map(|n| (format!("f{n}"), 1, 2)).collect();
+            let borrowed: Vec<_> = files
+                .iter()
+                .map(|(r, size, time)| (r.as_str(), *size, *time))
+                .collect();
+            identity_scan(&mut s, who, true, &borrowed, &[]);
+            assert_eq!(s.sink.uuids["r"].is_some(), expected);
+        }
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+        identity_scan(&mut s, who, false, &[("f", 1, 2)], &[]);
+        assert_eq!(s.sink.scans, [("r".into(), false)]);
+        assert_eq!(s.sink.uuids["r"], None);
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+        s.sink.meta_err = true;
+        identity_scan(&mut s, who, true, &[("f", 1, 2)], &[]);
+        assert_eq!(s.sink.uuids["r"], None);
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, true);
+        s.sink.meta = vec![
+            ("public".into(), 1, 2),
+            ("private".into(), 1, 2),
+            ("sub/gone".into(), 1, 2),
+        ];
+        identity_scan(
+            &mut s,
+            who,
+            true,
+            &[("public", 1, 2), ("private", 1, 2)],
+            &[("sub", "mount")],
+        );
+        assert_eq!(s.sink.uuids["r"], Some("aabb".into()));
+    }
+
+    #[test]
+    fn confirm_and_rejection_gate_stop_work_and_rederive_clears_gate() {
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, true);
+        s.queue_one(0, "queued".into(), 1, 2);
+        s.solo.push_back((0, "solo".into(), 1, 2));
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        assert!(!s.may_extract(0, secs(0)));
+        assert_eq!(s.roots[0].reason, "identity check");
+        assert!(s.workers[&watch].retired);
+        assert!(s.workers[&watch].closing.is_some());
+        assert!(!s.roots[0].watch.ready);
+        assert!(s.solo_held(0, secs(0)));
+        s.handle(watch, Event::Exit, secs(0));
+        s.dispatch(secs(0));
+        assert!(s.solo.is_empty());
+        assert_eq!(roles(&s, Role::Extract), 0);
+        s.tick(secs(0));
+        assert_eq!(roles(&s, Role::Watch), 1);
+        assert_eq!(roles(&s, Role::Scan), 1);
+        let scan = scans(&s)[0].0;
+        s.handle(
+            scan,
+            Event::Msg(Message::ScanDone {
+                complete: true,
+                identity_before: Some(who.clone()),
+                identity_after: Some(who),
+            }),
+            secs(1),
+        );
+        assert_eq!(s.verdict_of(0), Verdict::Mismatch);
+        assert_eq!(s.roots[0].reason, "identity mismatch");
+        assert!(s.roots[0].queue.is_empty());
+        assert!(s.solo.is_empty());
+        assert!(s.sink.scans.is_empty());
+        s.queue_one(0, "blocked".into(), 1, 2);
+        assert!(!s.may_extract(0, secs(62)));
+        assert!(s.roots[0].queue.is_empty());
+        s.rederive(&mut mi(&[&ext4(1, "/"), &ext4(3, "/mnt/nas")]), secs(63));
+        assert!(s.roots[0].rejected.is_none());
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+    }
+
+    #[test]
+    fn reason_only_state_change_is_written() {
+        let (mut s, _) = identity_case(StoredUuid::Absent, None, true);
+        s.set_state(0, "offline", "identity check");
+        s.set_state(0, "offline", "identity mismatch");
+        s.set_state(0, "offline", "identity mismatch");
+        assert_eq!(s.sink.states.borrow().len(), 2);
+        assert_eq!(s.sink.states.borrow()[1].2, "identity mismatch");
+    }
+
+    #[test]
+    fn adopt_uuid_does_not_confirm_mount_point_or_root_changes() {
+        let (mut s, who) = identity_case(StoredUuid::Absent, Some("aabb"), true);
+        for changed in [
+            Share {
+                mount_point: "/other".into(),
+                ..who.share.clone()
+            },
+            Share {
+                mount_root: "/sub".into(),
+                ..who.share.clone()
+            },
+        ] {
+            s.roots[0].derived.share = changed;
+            assert_eq!(s.verdict_of(0), Verdict::Mismatch);
+        }
+    }
+
+    #[test]
+    fn send_next_stops_extract_under_confirm_and_gate() {
+        for gated in [false, true] {
+            let (mut s, _) = identity_case(StoredUuid::Absent, None, true);
+            s.queue_one(0, "first".into(), 1, 2);
+            s.start(0, Role::Extract, None, secs(0));
+            let id = s.spawner.spawned.last().unwrap().0;
+            s.queue_one(0, "second".into(), 1, 2);
+            if gated {
+                s.roots[0].rejected = Some(s.roots[0].derived.clone());
+            }
+            s.send_next(id, secs(1));
+            assert!(
+                s.spawner
+                    .sent
+                    .iter()
+                    .any(|(w, j)| *w == id && j.contains("Shutdown"))
+            );
+            assert!(
+                !s.spawner
+                    .sent
+                    .iter()
+                    .any(|(w, j)| *w == id && j.contains("second"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_device_rename_retires_extract_and_watch_and_drops_their_results() {
+        let (mut s, _) = identity_case(StoredUuid::Absent, None, false);
+        assert_eq!(s.verdict_of(0), Verdict::Ok);
+        s.queue_one(0, "first".into(), 1, 2);
+        s.start(0, Role::Extract, None, secs(0));
+        let extract = s.spawner.spawned.last().unwrap().0;
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        // the same mount point now comes from another device
+        s.rederive(&mut mi(&[&ext4(1, "/"), &ext4(3, "/mnt/nas")]), secs(5));
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.workers[&extract].retired && s.workers[&extract].closing.is_some());
+        assert!(s.workers[&watch].retired && s.workers[&watch].closing.is_some());
+        assert_eq!(s.roots[0].reason, "identity check");
+        s.handle(extract, extracted_msg("first"), secs(6));
+        s.tick(secs(6));
+        assert!(
+            s.sink.extracted.is_empty(),
+            "a retired extractor's result was stored"
+        );
+    }
+
+    #[test]
+    fn a_live_remount_under_the_same_device_name_holds_until_a_scan_confirms_it() {
+        let (mut s, mut who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        // same /dev/d2 at the same place, but a new mount (id 2 -> 9)
+        s.rederive(
+            &mut mi(&[&ext4(1, "/"), "9 1 8:2 / /mnt/nas rw - ext4 /dev/d2 rw"]),
+            secs(5),
+        );
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.workers[&watch].retired);
+        assert!(!s.may_extract(0, secs(5)));
+        // a scan of the new mount with the enrolled UUID lifts the hold
+        who.mount_id = 9;
+        identity_scan(&mut s, who, true, &[("f", 1, 2)], &[]);
+        assert_eq!(s.verdict_of(0), Verdict::Ok);
+        assert!(s.may_extract(0, secs(70)));
+    }
+
+    #[test]
+    fn a_scan_of_a_replaced_mount_neither_accepts_nor_locks_out_the_new_one() {
+        // the scan saw the old mount (id 2); the root now sits on mount 9
+        let (mut s, who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+        s.rederive(
+            &mut mi(&[&ext4(1, "/"), "9 1 8:2 / /mnt/nas rw - ext4 /dev/d2 rw"]),
+            secs(5),
+        );
+        let mut wrong = who;
+        wrong.fs_uuid = Some("ccdd".into()); // would be rejected if it counted
+        identity_scan(&mut s, wrong, true, &[], &[]);
+        assert!(
+            s.roots[0].rejected.is_none(),
+            "a stale scan locked out the new mount"
+        );
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.sink.scans.is_empty(), "a stale scan was applied");
+    }
+
+    #[test]
+    fn uuid_rejection_shuts_down_an_existing_watcher() {
+        let (mut s, mut who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        who.fs_uuid = Some("ccdd".into());
+        identity_scan(&mut s, who, true, &[], &[]);
+        assert!(s.workers[&watch].retired);
+        assert!(s.workers[&watch].closing.is_some());
+        assert!(!s.roots[0].watch.ready);
+        assert!(s.solo_held(0, secs(62)));
+        assert!(!s.may_extract(0, secs(62)));
+        s.handle(watch, Event::Exit, secs(62));
+        s.tick(secs(62));
+        assert_eq!(roles(&s, Role::Watch), 1);
     }
 
     #[test]

@@ -47,6 +47,12 @@ rec {
                 example = "nas:/export";
                 description = "Share identity for roots on a network mount.";
               };
+              adoptUuid = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                example = "bdd8461e-7d6c-42b6-9cfe-39967825dd42";
+                description = "Filesystem UUID (2 to 32 hex digits, dashes optional) to accept for this root even when the index holds files from another disk. Remove it once the root is ok.";
+              };
             };
           }
         );
@@ -95,14 +101,17 @@ rec {
   # The attrset serialised to config.toml.
   configAttrs = cfg: {
     state_dir = cfg.stateDir;
-    root = lib.mapAttrsToList (
-      name: r:
-      {
-        inherit name;
-        inherit (r) path tier kind interval;
-      }
-      // lib.optionalAttrs (r.share != null) { inherit (r) share; }
-    ) cfg.roots;
+    root = lib.mapAttrsToList
+      (
+        name: r:
+          {
+            inherit name;
+            inherit (r) path tier kind interval;
+          }
+          // lib.optionalAttrs (r.share != null) { inherit (r) share; }
+          // lib.optionalAttrs (r.adoptUuid != null) { adopt_uuid = r.adoptUuid; }
+      )
+      cfg.roots;
     exclude = {
       inherit (cfg.exclude) paths;
       lift_builtin = cfg.exclude.liftBuiltin;
@@ -173,6 +182,16 @@ rec {
         message = "${prefix}.exclude.paths: every exclusion must be at or under a root path";
       }
       {
+        assertion = lib.all
+          (
+            r:
+            r.adoptUuid == null
+            || builtins.match "[0-9a-fA-F]{2,32}" (lib.replaceStrings [ "-" ] [ "" ] r.adoptUuid) != null
+          )
+          roots;
+        message = "${prefix}.roots: adoptUuid must be 2 to 32 hex digits (dashes allowed)";
+      }
+      {
         assertion = lib.all (r: duration r.interval) roots;
         message = "${prefix}.roots: interval must match [0-9]+[smhd] and be nonzero";
       }
@@ -185,10 +204,10 @@ rec {
   # Hardening and resource limits common to both units. No ProtectSystem, ProtectHome,
   # PrivateTmp or ReadWritePaths: the workers' own Landlock sandbox does the confinement.
   serviceConfig =
-    {
-      cfg,
-      exe,
-      configPath,
+    { cfg
+    , exe
+    , configPath
+    ,
     }:
     {
       ExecStartPre = "${exe} index --self-test --config ${configPath}";
