@@ -1,0 +1,22 @@
+{
+  "generated_at": 0,
+  "brief": false,
+  "roots": [
+    {"name": "source", "tier": "public", "state": "ok", "reason": null,
+     "last_scan": 0, "queued": 0, "done": 53697,
+     "skipped_symlinks": 238, "files": 41920, "chunks": 236442}
+  ],
+  "config_errors": [
+    {"root": "docs", "what": "exclusion", "reason": "symlink in path"}
+  ],
+  "settings": {
+    "roots": [{"name": "source", "tier": "public", "kind": "auto",
+               "interval": "7d", "share": false}],
+    "exclusions": 1,
+    "lifted_builtin": 0,
+    "limits": {"max_file_mb": 0, "max_text_bytes": 0, "max_cells": 0,
+               "memory_max_mb": 0, "workers": 0, "backoff_max": "1h"}
+  },
+  "sandbox": "landlock available",
+  "databases": [{"name": "public.db", "bytes": 1}, {"name": "private.db", "bytes": 1}]
+}

@@ -260,7 +260,7 @@ The QML test, in a shell with Qt. `qmltestrunner` is unwrapped, so it
 needs the import path and a writable `HOME`:
 
 ```bash
-nix shell nixpkgs#qt6.qtdeclarative -c sh -c 'q=$(dirname $(dirname $(readlink -f $(command -v qmltestrunner)))); HOME=$(mktemp -d) QT_QPA_PLATFORM=offscreen qmltestrunner -import "$q/lib/qt-6/qml" -input plugin/tests/tst_model.qml'
+nix shell nixpkgs#qt6.qtdeclarative -c sh -c 'q=$(dirname $(dirname $(readlink -f $(command -v qmltestrunner)))); HOME=$(mktemp -d) QML_XHR_ALLOW_FILE_READ=1 QT_QPA_PLATFORM=offscreen qmltestrunner -import "$q/lib/qt-6/qml" -input plugin/tests/tst_model.qml'
 ```
 
 Traps for every step:
@@ -386,8 +386,9 @@ Traps for every step:
 
      `manifest.json` sits at `$out`.
    - **`checks.${system}.plugin`:** a `runCommand` with
-     `qt6.qtdeclarative`. It sets `export HOME=$TMPDIR` and
-     `QT_QPA_PLATFORM=offscreen`, then runs:
+     `qt6.qtdeclarative`. It sets `export HOME=$TMPDIR`,
+     `QT_QPA_PLATFORM=offscreen` and `QML_XHR_ALLOW_FILE_READ=1`
+     (the golden files load through `XMLHttpRequest`), then runs:
      - **the syntax gate**, copied from nixarchy `tests/qml.nix:57-80`:
        `qmllint --bare … || true`, failing on any `[syntax]` line, with its
        own broken-brace self-test fixture;
