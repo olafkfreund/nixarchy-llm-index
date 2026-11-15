@@ -227,6 +227,7 @@ open.
     ```text
     omarchy-launch-floating-terminal-with-presentation journalctl --user -fu llm-index
     ```
+
 - **Text:** every `Text`, including `PanelSectionHeader` (a `Text`,
   `Ui/PanelSectionHeader.qml:8`), sets `textFormat: Text.PlainText`. There
   are no links and no `Qt.openUrlExternally`. Every `Process` gets an
