@@ -74,6 +74,18 @@
       "skipped_symlinks": null,
       "state": "pending",
       "tier": "private"
+    },
+    {
+      "chunks": null,
+      "done": null,
+      "files": null,
+      "last_scan": null,
+      "name": "checking",
+      "queued": null,
+      "reason": "identity check",
+      "skipped_symlinks": null,
+      "state": "offline",
+      "tier": "private"
     }
   ],
   "sandbox": "landlock available",
@@ -107,6 +119,13 @@
         "interval": "15m",
         "kind": "auto",
         "name": "a",
+        "share": false,
+        "tier": "private"
+      },
+      {
+        "interval": "15m",
+        "kind": "auto",
+        "name": "checking",
         "share": false,
         "tier": "private"
       }

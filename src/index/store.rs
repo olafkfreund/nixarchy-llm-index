@@ -90,7 +90,7 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 /// A skip whose subtree must keep its rows: a mount boundary or an I/O error, not a rule.
-fn protects(reason: &str) -> bool {
+pub(crate) fn protects(reason: &str) -> bool {
     reason == "mount"
         || reason.starts_with("Errno")
         || (reason.starts_with('E')
@@ -99,7 +99,7 @@ fn protects(reason: &str) -> bool {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
 }
 
-fn under_any(rel: &str, set: &HashSet<&str>) -> bool {
+pub(crate) fn under_any(rel: &str, set: &HashSet<&str>) -> bool {
     set.contains(rel) || rel.match_indices('/').any(|(i, _)| set.contains(&rel[..i]))
 }
 
