@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "olafkfreund.llm-index",
+  "name": "llm-index",
+  "version": "0.1.0",
+  "author": "olafkfreund",
+  "license": "MIT",
+  "description": "Status and settings panel for the llm-index document and code indexer.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "llm-index",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
