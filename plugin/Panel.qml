@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
@@ -12,7 +13,7 @@ Panel {
   ipcTarget: "olafkfreund.llm-index.bar"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   property bool panelTracked: false
 
@@ -57,7 +58,7 @@ Panel {
     visible: IndexState.level !== "ok" || root.opened || IndexState.openPanels > 0
     active: IndexState.level === "down" || IndexState.level === "problem" || IndexState.level === "indexing"
     useActiveColor: true
-    activeColor: (IndexState.level === "down" || IndexState.level === "problem") ? Color.urgent : Color.accent
+    activeColor: (IndexState.level === "down" || IndexState.level === "problem") ? Commons.Color.urgent : Commons.Color.accent
     tooltipText: Model.tooltip(IndexState.level)
     onPressed: function (b) { root.toggle() }
   }

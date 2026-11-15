@@ -1,12 +1,13 @@
 import QtQuick
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 FocusScope {
   id: root
 
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property Item keyTarget: keyCatcher
@@ -119,7 +120,7 @@ FocusScope {
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          color: Color.urgent
+          color: Commons.Color.urgent
           font.family: root.fontFamily
           visible: root.unavailableCategory !== ""
           text: root.unavailableCategory
@@ -141,7 +142,7 @@ FocusScope {
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          color: Color.urgent
+          color: Commons.Color.urgent
           font.family: root.fontFamily
           visible: !root.unavailable && (IndexState.briefError !== null || IndexState.fullError !== null)
           text: "Last update error: " + (IndexState.briefError || IndexState.fullError || "")
@@ -160,7 +161,7 @@ FocusScope {
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               color: (modelData.state === "offline" || modelData.state === "degraded" || modelData.state === "config_error")
-                ? Color.urgent : root.foreground
+                ? Commons.Color.urgent : root.foreground
               font.family: root.fontFamily
               text: modelData.name + " [" + modelData.tier + "] · " + modelData.state
                 + (modelData.reason ? " (" + modelData.reason + ")" : "")
@@ -209,7 +210,7 @@ FocusScope {
               width: column.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              color: Color.urgent
+              color: Commons.Color.urgent
               font.family: root.fontFamily
               text: (modelData.root !== null ? modelData.root : "unmatched")
                 + " (" + modelData.what + "): "
