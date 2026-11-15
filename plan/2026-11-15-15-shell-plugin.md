@@ -375,7 +375,8 @@ Traps for every step:
    - don't write `shell.json`.
 
 4. **Packaging and `checks.plugin`:** `flake.nix:37-42` and `:60-80`, new
-   `nix/plugin.nix`, `plugin/tests/lint.sh` and `plugin/tests/bad/`.
+   `nix/plugin.nix`, `nix/checks/plugin.nix` (the check, called like the
+   other checks), `plugin/tests/lint.sh` and `plugin/tests/bad/`.
    - **`packages.${system}.plugin`:** `lib.fileset.toSource` of `plugin/`
      minus `plugin/tests`, **wrapped in a derivation**, because `toSource`
      alone is not one:
