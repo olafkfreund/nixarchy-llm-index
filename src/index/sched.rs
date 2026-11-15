@@ -63,6 +63,8 @@ struct Worker {
     abandoned: bool,
     /// Started under an older config: Shutdown sent, output ignored, still counts until reaped.
     retired: bool,
+    /// Retired by a config reload: nothing new starts until it is reaped.
+    blocks: bool,
     /// Sent a byte/entry Progress during its job; silence from one that never did means stuck I/O.
     progressed: bool,
     /// Shutdown was sent at this time; SIGKILL after `GRACE` if still not reaped.
@@ -83,6 +85,9 @@ struct RootRt {
     derived: Derived,
     expected: Option<Share>,
     rejected: Option<Derived>,
+    /// A local mount changed under the running service: hold extract and watch until a
+    /// scan of the new mount is accepted.
+    unconfirmed: bool,
     state: String,
     reason: String,
     scan_due: Time,
@@ -147,6 +152,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 derived: derive(mountinfo, &spec.path),
                 expected: sink.expected_identity(&spec.name),
                 rejected: None,
+                unconfirmed: false,
                 spec,
                 state: String::new(),
                 reason: String::new(),
@@ -225,30 +231,37 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                     self.shares.charge(&d.share, *id);
                 }
             }
+            let local = !is_network(&d.share.fstype);
             self.roots[i].derived = d;
             self.roots[i].rejected = None;
+            self.roots[i].unconfirmed |= local;
             // a mount that is no longer trusted stops extract and watch now, not at their next job
             if matches!(self.verdict_of(i), Verdict::Mismatch | Verdict::Confirm) {
-                let live: Vec<_> = self
-                    .workers
-                    .iter()
-                    .filter(|(_, w)| {
-                        w.root == i
-                            && !w.abandoned
-                            && !w.retired
-                            && matches!(w.role, Role::Extract | Role::Watch)
-                    })
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in live {
-                    self.retire(id, now);
-                }
-                self.check_identity(i, now);
+                self.untrust(i, now);
             }
             // a new mount may end what the hold waited out (mismatch, offline): scan at once
             self.roots[i].hold = now;
             self.request_scan(i, now, Duration::ZERO);
         }
+    }
+
+    /// Retire the root's live extract and watch workers and apply the identity verdict.
+    fn untrust(&mut self, i: usize, now: Time) {
+        let live: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| {
+                w.root == i
+                    && !w.abandoned
+                    && !w.retired
+                    && matches!(w.role, Role::Extract | Role::Watch)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in live {
+            self.retire(id, now);
+        }
+        self.check_identity(i, now);
     }
 
     /// The config changed: swap the policy, retire every worker started under the old one
@@ -263,6 +276,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             .collect();
         for id in ids {
             self.retire(id, now);
+            self.workers.get_mut(&id).expect("listed").blocks = true;
         }
     }
 
@@ -625,12 +639,17 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         if r.rejected.as_ref() == Some(&r.derived) {
             return Verdict::Mismatch;
         }
-        verdict(
+        let v = verdict(
             r.expected.as_ref(),
             r.spec.share.as_deref(),
             &r.derived.share,
             self.sink.indexed_files(&r.spec.name),
-        )
+        );
+        if v == Verdict::Ok && r.unconfirmed {
+            Verdict::Confirm
+        } else {
+            v
+        }
     }
 
     /// `verdict_of` plus the Mismatch consequences: queue dropped, root held and offline.
@@ -692,6 +711,14 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             self.scan_finished(i, now, RETRY);
             return;
         }
+        // a scan of a mount that has since been replaced says nothing about the current one
+        if let Some(b) = &before
+            && (b.share != self.roots[i].derived.share
+                || b.mount_id != self.roots[i].derived.mount_id)
+        {
+            self.scan_finished(i, now, RETRY);
+            return;
+        }
         let changed = matches!((&before, &after), (Some(b), Some(a)) if b != a);
         let v = before.as_ref().map(|b| {
             let r = &self.roots[i];
@@ -707,6 +734,10 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             || self.roots[i].rejected.as_ref() == Some(&self.roots[i].derived)
         {
             // result discarded entirely
+            if changed && !self.network(i) {
+                self.roots[i].unconfirmed = true;
+                self.untrust(i, now);
+            }
             self.set_state(i, "offline", "identity mismatch");
             self.scan_finished(i, now, RETRY);
             return;
@@ -782,6 +813,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             return;
         };
         self.roots[i].expected = Some(b.share.clone());
+        self.roots[i].unconfirmed = false;
         self.sink
             .set_expected_identity(&name, &b.share, uuid.as_deref());
         self.queue_extracts(i, &buf.entries);
@@ -1024,7 +1056,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     }
 
     fn dispatch(&mut self, now: Time) {
-        if self.solo_running.is_some() || self.workers.values().any(|w| w.retired && !w.abandoned) {
+        if self.solo_running.is_some() || self.workers.values().any(|w| w.blocks && !w.abandoned) {
             return;
         }
         while let Some((i, rel, size, mtime)) = self.solo.front().cloned() {
@@ -1187,6 +1219,7 @@ fn new_worker(root: usize, role: Role, network: bool, now: Time) -> Worker {
         role,
         abandoned: false,
         retired: false,
+        blocks: false,
         progressed: false,
         closing: None,
         served: 0,
@@ -1740,6 +1773,45 @@ mod tests {
             s.sink.extracted.is_empty(),
             "a retired extractor's result was stored"
         );
+    }
+
+    #[test]
+    fn a_live_remount_under_the_same_device_name_holds_until_a_scan_confirms_it() {
+        let (mut s, mut who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+        s.start_watcher(0, secs(0));
+        let watch = s.roots[0].watch.worker.unwrap();
+        // same /dev/d2 at the same place, but a new mount (id 2 -> 9)
+        s.rederive(
+            &mut mi(&[&ext4(1, "/"), "9 1 8:2 / /mnt/nas rw - ext4 /dev/d2 rw"]),
+            secs(5),
+        );
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.workers[&watch].retired);
+        assert!(!s.may_extract(0, secs(5)));
+        // a scan of the new mount with the enrolled UUID lifts the hold
+        who.mount_id = 9;
+        identity_scan(&mut s, who, true, &[("f", 1, 2)], &[]);
+        assert_eq!(s.verdict_of(0), Verdict::Ok);
+        assert!(s.may_extract(0, secs(70)));
+    }
+
+    #[test]
+    fn a_scan_of_a_replaced_mount_neither_accepts_nor_locks_out_the_new_one() {
+        // the scan saw the old mount (id 2); the root now sits on mount 9
+        let (mut s, who) = identity_case(StoredUuid::Known("aabb".into()), None, false);
+        s.rederive(
+            &mut mi(&[&ext4(1, "/"), "9 1 8:2 / /mnt/nas rw - ext4 /dev/d2 rw"]),
+            secs(5),
+        );
+        let mut wrong = who;
+        wrong.fs_uuid = Some("ccdd".into()); // would be rejected if it counted
+        identity_scan(&mut s, wrong, true, &[], &[]);
+        assert!(
+            s.roots[0].rejected.is_none(),
+            "a stale scan locked out the new mount"
+        );
+        assert_eq!(s.verdict_of(0), Verdict::Confirm);
+        assert!(s.sink.scans.is_empty(), "a stale scan was applied");
     }
 
     #[test]

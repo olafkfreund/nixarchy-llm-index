@@ -123,7 +123,9 @@ service restarts.
    mounted, mount the right one (or fix `share` for a network root).
 2. If a local disk is intentionally new, replaced, or failed the evidence
    check after heavy offline edits, find its filesystem UUID with either
-   command:
+   command. `adoptUuid` only helps when the filesystem type, mount point and
+   mount root still match the recorded root (a disk reformatted from ext4 to
+   XFS, for example, needs the root renamed instead):
 
    ```bash
    findmnt -no UUID <mountpoint>

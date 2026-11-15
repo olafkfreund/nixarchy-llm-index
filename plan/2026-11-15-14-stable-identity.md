@@ -390,3 +390,15 @@ Traps for every step:
   extract and watch workers retired (the `reload` mechanism, factored into
   `retire()`), so their later results are ignored. Previously, an in-flight
   extraction could be stored while the root waited in `Confirm`.
+- Branch review (agy): live mount changes are held as well.
+  - A local mount that changes while the service runs, including a new
+    mount under the same `/dev` name or a mid-scan identity change, sets
+    `unconfirmed`. That turns `Ok` into `Confirm` and retires extract and
+    watch. An accepted scan clears it.
+  - A scan whose before identity (share and mount ID) is no longer the
+    root's current mount is discarded, so it can neither accept nor lock out
+    the new mount.
+  - Identity retirement no longer pauses dispatch for every root. That pause
+    (`blocks`) stays for config reloads only.
+  - Network shares are unchanged.
+  - `nix/config.nix` asserts `adoptUuid` at eval time.

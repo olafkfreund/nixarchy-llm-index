@@ -100,8 +100,12 @@ path against the identity recorded for that root:
   `ioctl(root_fd, FS_IOC_GETFSUUID)` before and after the walk.
 - **`Confirm` (scan only).** When the expected and current mountinfo match in
   filesystem type, mount root and mount point on a local filesystem, both
-  sources start with `/dev/`, and any configured `share` matches, the verdict
-  is `Confirm` (`offline` with reason `identity check`) instead of `Mismatch`.
+  sources start with `/dev/` but **differ**, and any configured `share`
+  matches, the verdict is `Confirm` (`offline` with reason `identity check`)
+  instead of `Mismatch`. A local mount that changes while the service runs
+  (even under the same `/dev` name) is also held in `Confirm` until a scan of
+  the new mount is accepted, and a scan of a mount that has since been replaced
+  is discarded.
   Under `Confirm`, only a scan is allowed: extraction, `send_next`, solo
   retries and watchers stay off, and solo head-of-line entries for the root are
   evicted.
