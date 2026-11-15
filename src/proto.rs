@@ -13,6 +13,8 @@ pub struct MountIdentity {
     pub share: Share,
     pub mount_id: u64,
     pub submounts: Vec<String>,
+    #[serde(default)]
+    pub fs_uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -132,11 +134,12 @@ mod tests {
                     },
                     mount_id: 42,
                     submounts: vec!["/mnt/share/sub".into()],
+                    fs_uuid: None,
                 }),
                 identity_after: None,
             })
             .unwrap(),
-            r#"{"message":"ScanDone","complete":true,"identity_before":{"share":{"fstype":"nfs","source":"host:/share","mount_root":"/","mount_point":"/mnt/share"},"mount_id":42,"submounts":["/mnt/share/sub"]},"identity_after":null}"#
+            r#"{"message":"ScanDone","complete":true,"identity_before":{"share":{"fstype":"nfs","source":"host:/share","mount_root":"/","mount_point":"/mnt/share"},"mount_id":42,"submounts":["/mnt/share/sub"],"fs_uuid":null},"identity_after":null}"#
         );
     }
 }

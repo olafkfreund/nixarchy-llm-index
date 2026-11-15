@@ -1234,6 +1234,7 @@ mod tests {
             },
             mount_id: id,
             submounts: vec![],
+            fs_uuid: None,
         }
     }
     fn scans(s: &T) -> Vec<(WorkerId, String)> {
