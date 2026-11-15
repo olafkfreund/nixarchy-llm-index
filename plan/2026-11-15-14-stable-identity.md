@@ -264,6 +264,7 @@ Traps for every step:
        ```nix
        disk = (localRoot "/mnt/disk/root" "public") // { interval = "30s"; };
        ```
+
    - **The test script, in order:**
      1. Make a filesystem with a known UUID, and stop the service before
         mounting it:
