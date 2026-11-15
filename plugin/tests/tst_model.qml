@@ -17,6 +17,10 @@ TestCase {
         var value = fixture("status-full.json")
         value.generated_at = 1000
         value.config_errors = []
+        // The golden file covers edge cases; the level tests start from one healthy root.
+        value.roots = [{"name": "source", "tier": "public", "state": "ok", "reason": null,
+                        "last_scan": 1000, "queued": 0, "done": 10,
+                        "skipped_symlinks": 0, "files": 10, "chunks": 20}]
         return value
     }
 
@@ -87,7 +91,7 @@ TestCase {
     function test_snapshot_order_and_counts() {
         var full = snapshot()
         var state = Model.applySnapshot(Model.empty(), full)
-        compare(state.full.roots[0].files, 41920)
+        compare(state.full.roots[0].files, 10)
         var brief = snapshot()
         brief.brief = true
         brief.generated_at = 1010
@@ -98,7 +102,7 @@ TestCase {
         compare(state.liveAt, 1010)
         compare(state.live.roots[0].queued, 3)
         compare(state.fullAt, 1000)
-        compare(state.full.roots[0].files, 41920)
+        compare(state.full.roots[0].files, 10)
 
         var older = snapshot()
         older.generated_at = 900
@@ -114,11 +118,11 @@ TestCase {
         state = Model.applySnapshot(state, full)
         compare(state.liveAt, 1010)
         compare(state.fullAt, 1000)
-        compare(state.full.roots[0].files, 41920)
+        compare(state.full.roots[0].files, 10)
         var staleBrief = fixture("status-brief.json")
         state = Model.applySnapshot(state, staleBrief)
         compare(state.liveAt, 1010)
-        compare(state.full.roots[0].files, 41920)
+        compare(state.full.roots[0].files, 10)
     }
 
     function test_unit_mapping() {
