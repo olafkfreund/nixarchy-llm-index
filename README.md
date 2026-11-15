@@ -111,6 +111,26 @@ private tier are in [docs/agents.md](docs/agents.md). Any model works through
 an MCP client. Register the private server only with clients that run a local
 model: tool results go to the model.
 
+## Desktop plugin
+
+The flake ships an Omarchy shell bar plugin (`olafkfreund.llm-index`, package
+`packages.x86_64-linux.plugin`). Its bar icon stays hidden while every root is
+`ok` and the panel is closed, and appears when the service is down, a root or
+config needs attention, or indexing is in progress.
+
+Open the panel from the bar icon, or bind a key or menu row to
+`omarchy-shell shell toggle olafkfreund.llm-index '{}'`. The host
+configuration supplies the binding (`SUPER + CTRL + ALT + I` on p620 and
+razer). It has two tabs:
+
+- **Status:** the `llm-index.service` unit state, each root's tier, state,
+  reason, last-scan age, queue progress, and file/chunk counts, plus config
+  errors, database sizes, Landlock availability, and actions to refresh,
+  restart the service, or open the live journal in a terminal.
+- **Settings:** a read-only summary of configured roots, exclusion counts, and
+  limits. Settings stay in Nix (`services.llm-index` in Home Manager); change
+  them in your system configuration and rebuild.
+
 ## Performance
 
 Targets on the reference laptop (4 cores, 8 GB): initial index of 10,000 files
