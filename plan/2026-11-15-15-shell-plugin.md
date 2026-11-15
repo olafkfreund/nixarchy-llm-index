@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 15
 spec: spec/2026-11-15-15-shell-plugin.md
 coders:
