@@ -52,7 +52,12 @@ enum Command {
         tier: Tier,
     },
     /// Show index status
-    Status,
+    Status {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, requires = "json")]
+        brief: bool,
+    },
     /// Recall evaluation on an indexed fixture (test-only)
     #[cfg(feature = "eval")]
     #[command(hide = true)]
@@ -137,7 +142,8 @@ fn main() -> ExitCode {
     }
     let result = match cli.command {
         Command::Mcp { tier } => llm_index::mcp::run(&config, matches!(tier, Tier::Public)),
-        _ => llm_index::status::run(&config),
+        Command::Status { json, brief } => llm_index::status::run(&config, json, brief),
+        _ => unreachable!(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -20,7 +20,7 @@ pass `--config /etc/llm-index/<owner>.toml` every time.
 | `index` | Long-running indexing service. This is what the systemd unit runs. |
 | `index --self-test` | Check the sandbox on this host and exit. |
 | `mcp --tier public\|private` | MCP server on stdio, read-only. `--tier` is required. |
-| `status` | Print the owner's view of the index: every root, then sandbox and database sizes. |
+| `status [--json [--brief]]` | Print the owner's view of the index: every root, then sandbox and database sizes. |
 | `--version`, `--help` | Version and help. |
 
 `worker` is internal: `index` starts it for each sandboxed child (`--role`
@@ -41,6 +41,68 @@ any), `sandbox: landlock available|landlock unavailable`, and one
 
 Root states: `ok`, `offline`, `degraded`, `config_error`, and `pending` (not
 scanned yet).
+
+#### `status --json` and `--brief`
+
+`llm-index status --json [--brief]` (`--brief` requires `--json`) prints one
+path-free JSON object on stdout:
+
+```json
+{
+  "generated_at": 1794709381,
+  "brief": false,
+  "roots": [
+    {"name": "source", "tier": "public", "state": "ok", "reason": null,
+     "last_scan": 1794709381, "queued": 0, "done": 53697,
+     "skipped_symlinks": 238, "files": 41920, "chunks": 236442}
+  ],
+  "config_errors": [
+    {"root": "docs", "what": "exclusion", "reason": "symlink in path"}
+  ],
+  "settings": {
+    "roots": [{"name": "source", "tier": "public", "kind": "auto",
+               "interval": "7d", "share": false}],
+    "exclusions": 1,
+    "lifted_builtin": 0,
+    "limits": {"max_file_mb": 0, "max_text_bytes": 0, "max_cells": 0,
+               "memory_max_mb": 0, "workers": 0, "backoff_max": "1h"}
+  },
+  "sandbox": "landlock available",
+  "databases": [{"name": "public.db", "bytes": 1}, {"name": "private.db", "bytes": 1}]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `generated_at` | Snapshot time in Unix seconds. |
+| `brief` | `true` when called with `--brief`, `false` otherwise. |
+| `roots[]` | Every configured root (`public` and `private`). `state` is `ok`, `offline`, `degraded`, `config_error` or `pending` (an empty DB state or a root with no DB row yet is normalised to `pending`). `last_scan` is in Unix seconds. `reason`, `last_scan`, `queued`, `done` and `skipped_symlinks` can be `null` (an empty reason becomes `null`). With `--brief`, the file and chunk count queries are skipped and `files` and `chunks` are `null` in every row. |
+| `config_errors[]` | Path-free config errors: `root` (root name or `null`), `what` (`root`, `exclusion` or `unknown`), and filtered `reason`. |
+| `settings` | Path-free projection of the configuration, present in both full and `--brief` modes: `roots[]` (`name`, `tier`, `kind`, `interval`, and boolean `share`), `exclusions` (`exclude.paths` count), `lifted_builtin` (`exclude.lift_builtin` count), and `limits`. |
+| `sandbox` | `landlock available` or `landlock unavailable` (present in both modes). |
+| `databases[]` | `name` and `bytes` for `public.db` and `private.db` (present in both modes). |
+
+Filesystem paths, network share sources, and `lift_builtin` globs never appear
+in the JSON output. Root names are copied as configured: they are labels you
+choose, so keep paths out of them.
+
+- **Closed reason list.** Applied to both `roots[].reason` and
+  `config_errors[].reason`. A non-empty reason is kept if it is a state word
+  (`ok`, `offline`, `degraded`, `config_error`), `mount`, an errno name such as
+  `EACCES`, or one of: `identity mismatch`, `watch degraded`, `watcher exited`,
+  `watch setup stalled`, `stdin blocked`, `no progress`, `extract timeout`,
+  `scan timeout`, `worker died`, `disk full`, `symlink in path`,
+  `root path contains a symlink`, `root path is not a directory`,
+  `landlock unavailable`. Anything else becomes `other`.
+- **Config-error mapping.** Each `config_errors` path is mapped against the
+  configured roots without exposing the path:
+  - an exact match with a configured root's path gives `root: "<name>"`,
+    `what: "root"`;
+  - otherwise, the deepest configured root that contains the path by whole path
+    components (`/data/a` contains `/data/a/x`, not `/data/ab`) gives
+    `root: "<name>"`, `what: "exclusion"`;
+  - no match (such as a stale row from an earlier configuration) gives
+    `root: null`, `what: "unknown"`.
 
 ### Exit codes
 

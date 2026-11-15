@@ -41,6 +41,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../src
       ../share
       ../tests/fixtures/sheets # include_bytes! in src/extract/sheet.rs tests
+      ../plugin/tests/fixtures # status --json golden files, src/status.rs tests
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;

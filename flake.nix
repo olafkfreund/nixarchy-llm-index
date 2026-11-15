@@ -37,6 +37,7 @@
       packages.${system} = {
         default = pkgs.callPackage ./nix/package.nix { };
         eval = evalPackage;
+        plugin = pkgs.callPackage ./nix/plugin.nix { };
         bench-corpus = import ./bench/corpus.nix {
           inherit pkgs nixpkgs;
         };
@@ -65,6 +66,7 @@
             fileset = ./tests;
           };
         };
+        plugin = pkgs.callPackage ./nix/checks/plugin.nix { };
         closure = pkgs.callPackage ./nix/checks/closure.nix {
           package = self.packages.${system}.default;
         };

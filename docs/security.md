@@ -103,6 +103,36 @@ risk but cannot remove it.
 - The agent snippet tells the agent to treat all of it as data. See
   [reference](reference.md#untrusted-content).
 
+## Desktop plugin
+
+The Omarchy shell plugin (`olafkfreund.llm-index`) reads index state by running
+`llm-index status --json` (and `--brief`) as the desktop user:
+
+- **`status --json` is path-free.** It never outputs filesystem paths, network
+  share sources, or `lift_builtin` globs. Root names are copied as configured,
+  so a name is only as private as you make it. Config errors are mapped to root names
+  and `root`/`exclusion`/`unknown`, and root and config-error reasons are
+  filtered through a closed allowlist (anything else becomes `other`). See
+  [reference](reference.md#status---json-and---brief).
+- **Private metadata appears only in the open panel.** Root names, tiers,
+  states, counts, config errors and settings are shown only while the panel is
+  open. Every text item in the panel renders with `Text.PlainText` and no
+  clickable links.
+- **Tooltip and IPC carry a level only.** The bar button tooltip and the
+  `omarchy-shell olafkfreund.llm-index.bar status` IPC reply expose only the
+  overall level (`down`, `problem`, `indexing` or `ok`) and fixed tooltip text,
+  never root names, counts or reasons.
+- **`stderr` is discarded.** Every command the plugin runs collects and drops
+  `stderr` without reading, logging or displaying it, and the plugin itself
+  logs nothing. If `llm-index` is missing from the session `PATH`, Quickshell
+  logs the failed start with the command name only. Process failures map to
+  fixed categories (`not installed`, `status failed`, `bad output`,
+  `timed out`).
+- **Open log is the owner's explicit exception.** The panel's **Open log**
+  button opens `journalctl --user -fu llm-index` in a separate floating
+  terminal at the owner's request; systemd journal output can contain private
+  paths.
+
 ## What is not protected
 
 - **Parser bugs.** Parsers run on hostile input. A crash is contained to one
