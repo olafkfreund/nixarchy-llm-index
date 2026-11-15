@@ -29,6 +29,9 @@ Repo `/mnt/code/Source-home/GitHub/nixarchy-llm-index`, branch
   the updated tip.
 - **Worktrees.** Each step works in `../llm-index-14-sN`, made from the
   branch tip at the time the step starts.
+- **Integration:** after each step, the lead commits it on
+  `fix/14-stable-identity-v2`. A later step's worktree is made from the
+  branch tip after that commit.
 - **Order:** steps 1 and 5 run in parallel, then 2, then 3, then 4. Step 2
   needs step 1's `MountIdentity` field, step 3 needs both, and step 4 needs
   the behaviour.
@@ -75,7 +78,8 @@ Repo `/mnt/code/Source-home/GitHub/nixarchy-llm-index`, branch
   - it is written together with `share_id` (`:677-690`).
 - **Read as three states:**
   - NULL gives `Absent`;
-  - 2 to 32 lowercase hex characters give `Known`;
+  - 2 to 32 hex characters, any case, give `Known`, lowercased for
+    comparison (the spec's rule);
   - an SQL error or anything else gives `Unreadable`.
 
 ### Worker
@@ -106,8 +110,10 @@ Repo `/mnt/code/Source-home/GitHub/nixarchy-llm-index`, branch
   - `verdict_of` returns `Mismatch` while `derived == rejected`;
   - `rederive` clears it when the derived identity changes;
   - a rejection goes through the `check_identity` `Mismatch` path: the
-    queue is dropped, the hold set, the state set, and the root's watch
-    worker stopped.
+    queue is dropped, the hold set and the state set;
+  - that path does **not** stop watchers today (`sched.rs:600-612`), so it
+    is extended to shut down the root's live watch worker. A test starts a
+    watcher before the rejection and checks that it is gone.
 - **`set_state`** writes when the state **or** the reason changes.
   `RootRt` gains `reason: String`.
 - **Root state under `Confirm`:** `offline`, with reason `identity check`.
@@ -136,6 +142,9 @@ first matching row decides:
 
 ### Evidence E
 
+- **Requires a complete scan** (`ScanResult.complete`). An incomplete scan
+  never satisfies E. Under row 5, an incomplete scan still applies by the
+  existing rules (no deletions), but S stays `Absent`.
 - **Denominator:** `indexed_meta(root)` minus paths under the scan's
   protected skipped subtrees, using `apply_scan`'s `protects()` filter
   (`store.rs:597-602`).
@@ -171,6 +180,8 @@ Traps for every step:
      (`scan.rs:543-575`, `:613-635`).
    - Update every `MountIdentity { .. }` literal in the crate (tests
      included) with `fs_uuid: None`.
+   - Update the exact serialised JSON assertion in `src/proto.rs:139`: the
+     new field serialises as `"fs_uuid":null`.
    - **Tests:**
      - `decode_fsuuid` for len 0, 1, 16 and 17, plus a known 16-byte value;
      - `fs_uuid()` on a tempdir returns `Some` or `None` without panicking.
@@ -179,10 +190,13 @@ Traps for every step:
    scheduler ignores the field until step 3.
 
 2. **Storage, Sink, config and Nix,** in `src/db.rs`, `src/index/store.rs`,
-   `src/index/mod.rs`, `src/index/sched.rs` (only `RootSpec`, the
-   `scan_done` call site, and the `Mem` test sink at `:1143`),
-   `src/config.rs`, `nix/config.nix` and `src/index/` where `RootSpec` is
-   built.
+   `src/index/mod.rs` (the trait, plus `RootSpec` construction at
+   `:380-398`), `src/index/sched.rs` (only `RootSpec`, the `scan_done` call
+   site, the `Mem` test sink at `:1143`, and the test `RootSpec` constructor
+   at `:1205`), `src/config.rs` and `nix/config.nix`.
+   - Update **every** affected constructor, call and assertion, including
+     the existing `set_expected_identity` test calls (for example
+     `store.rs:1196`).
    - Add the column migration and `StoredUuid`.
    - Make the `Sink` trait changes and implement them in `DbSink` and `Mem`.
    - `scan_done` keeps today's behaviour. It passes the worker's
@@ -204,8 +218,15 @@ Traps for every step:
    `src/status.rs` and `plugin/tests/fixtures/*.json` (regenerated).
    - Implement `Confirm`, the gate, `set_state` reasons, solo eviction, the
      precedence table and E exactly as in the Approved decisions.
-   - Add `identity check` to `REASONS`. Regenerate the golden files with
-     `UPDATE_STATUS_GOLDEN=1`.
+   - Add `identity check` to `REASONS`.
+     - Add a status test row with `offline` / `identity check` and assert it
+       survives the reason filter.
+     - Then regenerate the golden files inside the dev shell:
+
+       ```bash
+       UPDATE_STATUS_GOLDEN=1 cargo test json_contract_and_golden
+       ```
+
    - **Tests:**
      - every table row and its negative;
      - `Confirm` only for a `/dev` source-only local change with
@@ -232,36 +253,91 @@ Traps for every step:
    - keep `check_identity`'s existing `Mismatch` effects;
    - the network-mounts behaviour must not change.
 
-4. **VM stage,** in `nix/checks/vm.nix`. Add a stage that:
-   1. makes two ext4 images, A with `mkfs.ext4 -U <uuid-A>` and B with
-      another UUID;
-   2. attaches A as a virtio disk, mounts it at the root path, writes a few
-      files, starts the service, and waits until the root is `ok`;
-   3. asserts `roots.fs_uuid` equals uuid-A without dashes;
-   4. remounts A from a different device node: attach it as the second
-      disk, or move it with `losetup`, so the source differs. Then waits for
-      `ok` with unchanged file counts;
-   5. mounts empty B at the same point and asserts
-      `offline / identity mismatch` with the file count unchanged.
+4. **VM check `disk-identity`,** a new attribute in `nix/checks/vm.nix`
+   next to `network-mounts` (`:504`), built with the same
+   `pkgs.testers.runNixOSTest` and `node` helpers.
+   - **The machine:**
+     - `virtualisation.emptyDiskImages = [ 64 64 ]` gives `/dev/vdb` and
+       `/dev/vdc`;
+     - one root on the service instance, as the other checks do:
 
-   Reuse the existing stage helpers.
+       ```nix
+       disk = (localRoot "/mnt/disk/root" "public") // { interval = "30s"; };
+       ```
+   - **The test script, in order:**
+     1. Make a filesystem with a known UUID, and stop the service before
+        mounting it:
+
+        ```bash
+        mkfs.ext4 -F -U 11111111-2222-3333-4444-555555555555 /dev/vdb
+        ```
+
+        Then mount `/dev/vdb` at `/mnt/disk`, write 20 small `.txt` files
+        under `root/`, start the service, and wait until `llm-index status`
+        shows the root `ok` with `files: 20`.
+     2. Assert `roots.fs_uuid` is `11111111222233334444555555555555` and
+        `share_id` names `/dev/vdb`.
+     3. **Rename:** stop the service, unmount, clone the filesystem to the
+        other disk, mount `/dev/vdc` at `/mnt/disk`, and start the service:
+
+        ```bash
+        dd if=/dev/vdb of=/dev/vdc bs=1M
+        ```
+
+        Wait until `last_scan` is **greater** than before, the root is `ok`
+        with `files: 20`, `share_id` names `/dev/vdc`, and `fs_uuid` is
+        unchanged.
+     4. **Wrong disk:** stop the service, unmount, run
+        `mkfs.ext4 -F -U 99999999-…-999999999999 /dev/vdb`, mount
+        `/dev/vdb` (empty) at `/mnt/disk` with an empty `root/`, and start
+        the service. Wait for a new `last_scan` attempt, or 120 s. Assert
+        `offline` with reason `identity mismatch`, `files: 20` (the index is
+        untouched), and `fs_uuid` unchanged.
 
    → verify with:
 
    ```bash
-   nix build .#checks.x86_64-linux.<vm check name> -L
+   nix build .#checks.x86_64-linux.disk-identity -L
    ```
 
-   Trap: keep the existing stages and their timeouts.
+   Traps:
+   - don't touch the existing checks;
+   - read the status with the same helper the other checks use.
 
 5. **Docs,** in `docs/security.md`, `docs/reference.md` and
-   `docs/troubleshooting.md`, as in spec section 7.
-   - `security.md`: the identity guard, `Confirm`, the precedence table, the
-     evidence, `adopt_uuid` (it may accept an empty disk), and rollback.
-   - `reference.md`: the `adopt_uuid` setting and the `identity check`
-     reason.
-   - `troubleshooting.md`: "a root is offline with `identity mismatch`",
-     including `findmnt -no UUID <mountpoint>`.
+   `docs/troubleshooting.md`.
+   - **`security.md`, a new section "Root identity guard":**
+     - what is compared: mountinfo filesystem type, source, mount root and
+       mount point, plus the filesystem UUID read by the scan worker;
+     - `Confirm` (only the `/dev` name changed: a scan only);
+     - the precedence table and evidence, copied from this plan;
+     - `adopt_uuid`: it may accept an empty disk, and the index then follows
+       that disk; leaving it set is safe because it pins one filesystem;
+       remove it once the root is `ok`;
+     - cloned filesystems share a UUID and count as the same filesystem;
+     - the window after a service start: with unchanged mountinfo,
+       extraction and watch run until the first scan checks the UUID, as
+       they always did;
+     - kernels before 6.5 give no UUID, so rows 4 and 6 reject and row 5
+       behaves as before;
+     - rollback: an older binary ignores the UUID and guards as before. If
+       it moves a root between tiers, it drops the UUID, and the next
+       upgrade re-enrols through evidence.
+   - **`reference.md`:**
+     - the per-root `adopt_uuid` setting (TOML) and `adoptUuid` (Nix),
+       canonical or hex;
+     - `identity check` in the reason list.
+   - **`troubleshooting.md`, the entry "A root is offline with
+     `identity mismatch`":**
+     - what it means;
+     - how to find the filesystem UUID (both commands below);
+     - set `adoptUuid` only if it's the right disk, then remove it once the
+       root is `ok`.
+
+     ```bash
+     findmnt -no UUID <mountpoint>
+     lsblk -no UUID <device>
+     ```
 
    → verify with `markdownlint-cli2` on the three files.
 
@@ -286,7 +362,14 @@ Traps for every step:
 ## Rollback
 
 - **This repository:** revert the PR (`git revert -m 1 <merge>`).
-- **Hosts:** revert the nixos_config input bump and redeploy.
+- **Hosts:** first remove any `adoptUuid` from nixos_config. The older Nix
+  options lack it, and the older config parser rejects unknown fields
+  (`config.rs:21`). Then revert the input bump and redeploy.
   - The older binary ignores the `fs_uuid` column and guards as before.
-  - `share_id` already holds the current device name, so roots stay `ok`.
+  - Roots whose new identity was accepted stay `ok`, as long as the mount
+    source hasn't changed again: `share_id` holds the current device name.
+  - If the older binary moves a root between tiers, it drops `fs_uuid`.
+    Upgrading again re-enrols it through evidence.
+  - A binary rollback can't restore index entries removed by a deliberate
+    `adopt_uuid` of an empty disk.
 - The column stays in the database, and it's harmless.
