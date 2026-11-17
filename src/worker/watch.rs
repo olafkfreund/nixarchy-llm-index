@@ -279,7 +279,9 @@ fn process_events(
         };
         let path = dir.join(name);
         let is_dir = event.mask.contains(EventMask::ISDIR);
-        if name == ".git" {
+        // a skip marker file changed: the folder may have started or stopped being skipped
+        // (a `.git` folder is an ordinary repository and never a marker)
+        if !is_dir && (name == ".git" || name == "CACHEDIR.TAG") {
             if !dir.as_os_str().is_empty() {
                 let mut walker = Walker::new(ready)?;
                 if walker.under_skipped(&dir) {
@@ -527,7 +529,17 @@ mod tests {
         assert!(
             matches!(&messages[0], Message::WatchEvent { relpath, size: None, mtime_ns: None, .. } if relpath == "wt")
         );
-        fs::write(root.join("wt/deep/f.md"), "new").unwrap();
+        // a direct child of the kept worktree watch raises an inotify event; it must be dropped
+        fs::write(root.join("wt/f.md"), "new").unwrap();
+        events(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            &mut pending,
+        );
+        assert!(pending.contains_key(Path::new("wt/f.md")));
         assert!(flush(&ready, &mut pending).is_empty());
 
         fs::remove_file(root.join("wt/.git")).unwrap();
@@ -572,6 +584,45 @@ mod tests {
             &mut pending,
         );
         assert!(flush(&ready, &mut pending).iter().any(|message| matches!(message, Message::WatchEvent { relpath, size: Some(_), .. } if relpath == "plain.md")));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn removed_cache_tag_restores_children() {
+        let (base, root, ready) = fixture("cache-tag");
+        fs::create_dir_all(root.join("c/deep")).unwrap();
+        fs::write(
+            root.join("c/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let output = Output::new();
+        let mut inotify = Inotify::init().unwrap();
+        let mut watched = Watches::new();
+        let mut by_wd = HashMap::new();
+        let mut pending = Pending::new();
+        add_watches(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            &mut pending,
+            None,
+        )
+        .unwrap();
+        assert!(watched.contains_key(Path::new("c")));
+        assert!(!watched.contains_key(Path::new("c/deep")));
+        fs::remove_file(root.join("c/CACHEDIR.TAG")).unwrap();
+        events(
+            &ready,
+            &output,
+            &mut inotify,
+            &mut watched,
+            &mut by_wd,
+            &mut pending,
+        );
+        assert!(watched.contains_key(Path::new("c/deep")));
         fs::remove_dir_all(base).unwrap();
     }
 

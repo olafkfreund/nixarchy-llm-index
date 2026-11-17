@@ -110,7 +110,11 @@ struct RootRt {
 
 impl RootRt {
     fn under_skipped(&self, rel: &str) -> bool {
-        super::store::under_any(rel, &self.skipped_dirs.iter().map(String::as_str).collect())
+        // same prefix rule as store::under_any, without building a set per call
+        self.skipped_dirs.contains(rel)
+            || rel
+                .match_indices('/')
+                .any(|(i, _)| self.skipped_dirs.contains(&rel[..i]))
     }
 
     /// Put a job back at the front; a file already queued is newer (a watch event), so it stays.
