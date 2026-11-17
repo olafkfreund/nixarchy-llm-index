@@ -59,16 +59,29 @@ reviewers:
 - Add `fn linked_worktree(dir: &OwnedFd) -> bool`. It reuses
   `read_ignore(dir, ".git")` (`scan.rs:173-211`): a regular file only, no
   symlink following, capped at 1 MiB. It takes the first line, strips the
-  `gitdir:` prefix and trims whitespace, then checks
-  `Path::parent() == Some(..worktrees)` and that the grandparent's file name
-  is `.git` or ends with `.git`.
-- Add `fn skip_contents(dir: &OwnedFd) -> Option<&'static str>`: `worktree`
-  first, then the existing `CACHEDIR.TAG` test as `cache`.
+  `gitdir:` prefix and trims whitespace into `p: &Path`. It is true exactly
+  when:
+
+  ```rust
+  p.parent().and_then(Path::file_name) == Some("worktrees".as_ref())
+      && p.parent()
+          .and_then(Path::parent)
+          .and_then(Path::file_name)
+          .is_some_and(|g| g.as_bytes().ends_with(b".git"))
+  ```
+
+  This matches `.git` itself too, because `.git` ends with `.git`.
+- Add `pub(crate) fn skip_contents(dir: &OwnedFd) -> Option<&'static str>`:
+  `worktree` first, then the existing `CACHEDIR.TAG` test as `cache`.
+  `watch.rs` imports it with `use super::scan::skip_contents`.
 - In `Walker::descend`, replace the inline `CACHEDIR.TAG` block
   (`scan.rs:494-504`) with
-  `if let Some(r) = skip_contents(&child) { visit(&child_rel, &st, None, Some(r))?; continue; }`.
+  `if let Some(r) = skip_contents(&child) { visit(&child_rel, &st, Some(&child), Some(r))?; continue; }`.
+  Pass `Some(&child)`: the watcher needs the fd to watch the skipped folder
+  itself. The scanner's visitor ignores the fd (`scan.rs:598`, `|rel, st,
+  _, reason|`), so scans are unaffected.
 - In `walk_subtree` (`scan.rs:379-405`), check each folder opened along
-  `rel` and the final fd. If one matches, call
+  `rel` (excluding the root) and the final fd. If one matches, call
   `visit(<that rel>, &st, Some(&fd), Some(reason))` once and return without
   descending. The watcher needs the fd to keep one watch on the folder. For
   `rel == ""`, do not check.
@@ -104,16 +117,28 @@ reviewers:
 
 **Change:**
 
-- **Adding watches.** In `add_watches`'s `add` callback (`watch.rs:60-107`),
-  a visit with reason `worktree` or `cache` and `Some(fd)` installs the watch
-  on that folder as usual, without descending. Then it calls
-  `skip_contents(fd)` again. If that now returns `None` (the marker went away
-  during setup), record the folder for a follow-up `add_watches(Some(rel))`.
-  For the opposite case, the first `walk_subtree` check already handles a
-  marker that appears before the watch. A marker written after the watch is
-  installed produces an inotify event, handled below.
-- **Dropping events.** Add `Walker::under_skipped(&mut self, rel: &Path) ->
-  bool` in `scan.rs`, next to `allowed_event`. It opens each ancestor below
+- **Adding watches.** In `add_watches`'s `add` callback (`watch.rs:66-107`),
+  the early return `if reason.is_some() || …` (`watch.rs:70`) changes:
+  - A visit with reason `worktree` or `cache` and `Some(fd)` installs the
+    watch on that folder as usual. The walker does not descend into it.
+  - Other reasons still return early.
+- **Re-check after every install.** After the watch for any non-root folder
+  is installed, call `skip_contents(fd)` again and compare it with the
+  reason the folder was visited with:
+  - **It became skipped**, because `.git` appeared between the walker's
+    check and the watch. Record the folder in a `changed: Vec<PathBuf>`.
+    After the walk, prune the watches below it, keep its own, and queue a
+    size-less pending entry for it. This is the same handling as a `.git`
+    event.
+  - **It stopped being skipped**, because the marker went away. Record it
+    for a follow-up `add_watches(Some(rel))` and a size-less pending entry.
+
+  After the watch is installed, any later change raises an inotify event,
+  handled below.
+- **Dropping events.** Add
+  `pub(crate) fn under_skipped(&mut self, rel: &Path) -> bool` to `Walker`
+  in `scan.rs`, directly after `allowed_event` (`scan.rs:527`). Step 2 edits
+  `scan.rs` too, so steps 1 and 2 run in order on the same branch. It opens each ancestor below
   the root with `open_dir` and returns true when `skip_contents` matches.
   Call it in the flush loop (`watch.rs:252-265`) before sending a
   `WatchEvent`, and drop the event if it returns true.
@@ -126,7 +151,8 @@ reviewers:
   - If it is not skipped, push `dir` to `additions`.
   - Either way, insert a size-less pending entry for `dir`. The flush sends
     `WatchEvent { relpath: dir, size: None, mtime_ns: None }`; do not apply
-    `under_skipped` to this entry.
+    `under_skipped` to this entry. Then `continue`, so `dir/.git` itself is
+    never queued as a file.
 
 **Tests,** in `watch.rs` `mod tests`, using the pattern of
 `vanished_subtree_does_not_degrade_watcher` at `watch.rs:322`:
@@ -137,13 +163,20 @@ reviewers:
   folder, and a later file edit in it yields nothing;
 - removing `.git` then editing a file yields a normal event for the file;
 - changing `.git` at the root, then editing a file, still yields the file's
-  event.
+  event;
+- **initial setup:** a worktree present before the watcher starts gets
+  exactly one watch, on the folder itself. Removing its `.git` restores the
+  watches below it;
+- **setup race,** made deterministic with a test-only hook: in tests the
+  `add` callback runs a closure after the walker check and before the
+  install, and that closure writes `.git`. The folder ends with only its
+  own watch and one size-less pending entry.
 
 **Check:** `cargo test -p llm-index worker::watch` and clippy as in step 1.
 
 **Traps:**
 
-- `remove_watch` at `watch.rs:133` removes a subtree including its top
+- `remove_watch` at `watch.rs:127` removes a subtree including its top
   folder. Do not call it with `""`.
 - Activation of watcher changes is tested only in-process: the watcher runs
   sandboxed in production, so open nothing new outside the root fd.
@@ -153,8 +186,10 @@ reviewers:
 **Change:**
 
 - **New field.** Add `skipped_dirs: HashSet<String>` to `RootRt`
-  (`sched.rs:80-107`), initialised empty where `failed` is (`sched.rs:167`).
-- **On an accepted scan** (`sched.rs:815-835`, before `queue_extracts`):
+  (`sched.rs:83-107`), initialised empty where `failed` is (`sched.rs:167`).
+- **On an accepted scan** (`sched.rs:815-835`, before `queue_extracts`).
+  Guard this with `if accepted`, because lines 815-827 also run for partial
+  scans.
   - Set `skipped_dirs` from `buf.skipped` for the reasons `worktree` and
     `cache`.
   - Drop entries of `queue` and `queued` under any of them. Use
@@ -178,9 +213,21 @@ and the `Mem` sink (`sched.rs:1298`):
 - `evidence` with `StoredUuid::Absent` and `Verdict::Confirm`:
   - 50% of the files are under a `worktree` skip and the rest match:
     accepted;
-  - all of them are under the skip: rejected (`total == 0`).
+  - the same with a `cache` skip: accepted;
+  - all of them are under the skip: rejected (`total == 0`);
+  - 50% under an `ignored` skip: rejected. The other reasons are unchanged.
+- a partial scan with a `worktree` skip leaves `skipped_dirs` unchanged.
 
-**Check:** `cargo test -p llm-index index::sched` and clippy.
+**Store test,** in `src/index/store.rs` `mod tests` (`store.rs:856`), with the
+real SQLite store:
+
+- index `repo/a.md` and `wt/a.md`, each with chunks;
+- run a complete `scan_done` that lists `repo/a.md` and has skipped
+  `("wt", "worktree")`;
+- check that `files` and `chunks` have no rows for `wt/a.md`, and that
+  `repo/a.md`'s rows are intact.
+
+**Check:** `cargo test -p llm-index index::` and clippy.
 
 **Traps:**
 
@@ -199,8 +246,9 @@ and the `Mem` sink (`sched.rs:1298`):
 - `docs/architecture.md`, "Watching" (lines 59-67): one line saying the
   watcher applies the same rule to live events.
 
-**Check:** `nix build .#checks.x86_64-linux.<docs check, if any>`. Otherwise
-read the diff. No line in the docs may contradict the spec.
+**Check:** read `git diff -- docs/` against the approved decisions above.
+No line may contradict them. `nix flake check` in step 5 builds the package,
+whose fileset includes the docs.
 
 **Traps:** keep the docs path-free, with no host paths. That is the
 existing style.
@@ -212,7 +260,9 @@ existing style.
 - `cargo test`, `cargo clippy --all-targets -- -D warnings`, `nix flake check`
   (VM and plugin checks).
 - Reviews: a fresh Opus reviewer given only this plan and `git diff main`,
-  plus Codex and agy (`reviewers:`).
+  plus Codex and agy (`reviewers:`). The Codex review is a new
+  `codex exec --ephemeral` session, never the one that implemented steps 1
+  and 2.
 - Open the PR linking the intent, spec and plan. Wait for CI and merge on
   your OK.
 
