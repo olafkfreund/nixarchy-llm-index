@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 18
 spec: spec/2026-11-17-18-skip-worktrees.md
 coders:
