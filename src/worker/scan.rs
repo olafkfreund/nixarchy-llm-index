@@ -589,6 +589,28 @@ impl<'a> Walker<'a> {
         }
         true
     }
+    pub(crate) fn under_skipped(&mut self, rel: &Path) -> bool {
+        let Some(root) = self.ready.root_fd.as_ref() else {
+            return false;
+        };
+        let mut fd = match rustix::io::dup(root) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        for part in rel.components() {
+            let Ok(name) = CString::new(part.as_os_str().as_bytes()) else {
+                return false;
+            };
+            fd = match open_dir(&fd, &name) {
+                Ok(fd) => fd,
+                Err(_) => return false,
+            };
+            if skip_contents(&fd).is_some() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// An identity is reported only when it is the mount the root fd lives on.
