@@ -325,6 +325,11 @@ A file is skipped when:
   `.venv`, `venv`, `__pycache__`, `.direnv`, `vendor`, `target` or
   `third_party`, one whose name starts with `result` (`result*`), or one
   that contains a regular `CACHEDIR.TAG` file;
+- it is inside a linked git worktree: a folder whose `.git` is a regular file
+  with a first line `gitdir: <path>`, where `<path>` ends in
+  `<name>.git/worktrees/<name>` (or `.git/worktrees/<name>`). Its contents are
+  not indexed. Submodules, a `.git` folder or symlink, and a root that is
+  itself a worktree are still indexed;
 - it matches an ignore file (`.gitignore`, `.ignore`, `.llmindexignore`,
   `.git/info/exclude`, or the global git ignore), the built-in denylist
   (secrets, keys, browser and agent profiles; see [security](security.md)), a
