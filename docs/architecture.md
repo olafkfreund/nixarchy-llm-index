@@ -60,6 +60,8 @@ is not retried until its size or modification time changes.
 
 - **Local roots** are watched with inotify, so edits show up in seconds. A full
   reconcile scan runs every 24 hours as a backstop.
+  The watcher applies the same skip rules to live events. A skipped worktree
+  keeps one watch on itself, so a `.git` that appears or disappears is noticed.
 - **Network roots** are polled: rescanned every `interval`.
 - If the watcher cannot keep up (the inotify watch limit is reached or its
   event queue overflows), the root is marked `degraded` and polled every two

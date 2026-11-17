@@ -210,6 +210,42 @@ fn read_ignore(parent: &OwnedFd, name: &str) -> Option<String> {
     Some(text)
 }
 
+fn linked_worktree(dir: &OwnedFd) -> bool {
+    let Some(text) = read_ignore(dir, ".git") else {
+        return false;
+    };
+    let Some(path) = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+    else {
+        return false;
+    };
+    let p = Path::new(path.trim());
+    p.parent().and_then(Path::file_name) == Some("worktrees".as_ref())
+        && p.parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|g| g.as_bytes().ends_with(b".git"))
+}
+
+pub(crate) fn skip_contents(dir: &OwnedFd) -> Option<&'static str> {
+    if linked_worktree(dir) {
+        Some("worktree")
+    } else if statx(
+        dir,
+        "CACHEDIR.TAG",
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::TYPE,
+    )
+    .is_ok_and(|tag| tag.stx_mode & 0o170000 == 0o100000)
+    {
+        Some("cache")
+    } else {
+        None
+    }
+}
+
 pub fn global_ignore() -> Gitignore {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -381,6 +417,7 @@ impl<'a> Walker<'a> {
         F: FnMut(&Path, &Statx, Option<&OwnedFd>, Option<&str>) -> Result<(), Box<dyn Error>>,
     {
         let mut fd = rustix::io::dup(self.ready.root_fd.as_ref().ok_or("missing root fd")?)?;
+        let mut opened_rel = PathBuf::new();
         for part in rel.components() {
             fd = match open_dir(&fd, &CString::new(part.as_os_str().as_bytes())?) {
                 Ok(fd) => fd,
@@ -399,6 +436,12 @@ impl<'a> Walker<'a> {
                 }
                 Err(error) => return Err(error.into()),
             };
+            opened_rel.push(part.as_os_str());
+            if let Some(reason) = skip_contents(&fd) {
+                let st = statx(&fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?;
+                visit(&opened_rel, &st, Some(&fd), Some(reason))?;
+                return Ok(());
+            }
         }
         let st = statx(&fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?;
         visit(rel, &st, Some(&fd), None)?;
@@ -491,15 +534,8 @@ impl<'a> Walker<'a> {
                                 visit(&child_rel, &st, None, Some("symlink"))?;
                                 continue;
                             }
-                            if statx(
-                                &child,
-                                "CACHEDIR.TAG",
-                                AtFlags::SYMLINK_NOFOLLOW,
-                                StatxFlags::TYPE,
-                            )
-                            .is_ok_and(|tag| tag.stx_mode & 0o170000 == 0o100000)
-                            {
-                                visit(&child_rel, &st, None, Some("cache"))?;
+                            if let Some(reason) = skip_contents(&child) {
+                                visit(&child_rel, &st, Some(&child), Some(reason))?;
                                 continue;
                             }
                             visit(&child_rel, &st, Some(&child), None)?;
@@ -552,6 +588,28 @@ impl<'a> Walker<'a> {
             }
         }
         true
+    }
+    pub(crate) fn under_skipped(&mut self, rel: &Path) -> bool {
+        let Some(root) = self.ready.root_fd.as_ref() else {
+            return false;
+        };
+        let mut fd = match rustix::io::dup(root) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        for part in rel.components() {
+            let Ok(name) = CString::new(part.as_os_str().as_bytes()) else {
+                return false;
+            };
+            fd = match open_dir(&fd, &name) {
+                Ok(fd) => fd,
+                Err(_) => return false,
+            };
+            if skip_contents(&fd).is_some() {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -700,6 +758,130 @@ pub fn validate_path(path: &Path) -> ValidationResult {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn test_ready(base: &Path) -> Ready {
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = base.join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "state_dir = \"{}\"\n[[root]]\nname = \"r\"\npath = \"{}\"\n",
+                base.join("state").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(&cfg).unwrap();
+        let root_fd = openat2(
+            CWD,
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        Ready {
+            root: Some(0),
+            root_fd: Some(root_fd),
+            mountinfo: File::open("/proc/self/mountinfo").unwrap(),
+            global_ignore: Gitignore::empty(),
+            oom_score_adj: String::new(),
+            config,
+        }
+    }
+
+    #[test]
+    fn linked_worktree_markers_skip_only_worktrees() {
+        let base =
+            std::env::temp_dir().join(format!("llm-index-worktree-markers-{}", std::process::id()));
+        let root = base.join("root");
+        for (name, marker) in [
+            ("standard", "gitdir: /x/repo/.git/worktrees/a"),
+            ("bare", "gitdir: /x/repo.git/worktrees/a"),
+            ("submodule", "gitdir: ../.git/modules/foo"),
+            ("named_worktrees", "gitdir: ../.git/modules/worktrees/foo"),
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".git"), marker).unwrap();
+            std::fs::write(dir.join("file.md"), name).unwrap();
+        }
+        std::fs::create_dir_all(root.join("git_folder/.git")).unwrap();
+        std::fs::write(root.join("git_folder/file.md"), "content").unwrap();
+        std::fs::write(base.join("git_target"), "gitdir: /x/repo/.git/worktrees/a").unwrap();
+        std::fs::create_dir_all(root.join("git_symlink")).unwrap();
+        std::os::unix::fs::symlink(base.join("git_target"), root.join("git_symlink/.git")).unwrap();
+        std::fs::write(root.join("git_symlink/file.md"), "content").unwrap();
+
+        let ready = test_ready(&base);
+        let mut seen = Vec::new();
+        Walker::new(&ready)
+            .unwrap()
+            .walk(|rel, _, _, reason| {
+                seen.push((rel.to_path_buf(), reason.map(str::to_owned)));
+                Ok(())
+            })
+            .unwrap();
+        for name in ["standard", "bare"] {
+            assert!(seen.contains(&(PathBuf::from(name), Some("worktree".into()))));
+            assert!(
+                !seen
+                    .iter()
+                    .any(|(rel, _)| rel == &Path::new(name).join("file.md"))
+            );
+        }
+        for name in ["submodule", "named_worktrees", "git_folder", "git_symlink"] {
+            assert!(seen.contains(&(PathBuf::from(name), None)));
+            assert!(seen.contains(&(Path::new(name).join("file.md"), None)));
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn worktree_root_is_walked() {
+        let base =
+            std::env::temp_dir().join(format!("llm-index-worktree-root-{}", std::process::id()));
+        let ready = test_ready(&base);
+        std::fs::write(base.join("root/.git"), "gitdir: /x/repo/.git/worktrees/a").unwrap();
+        std::fs::write(base.join("root/file.md"), "content").unwrap();
+        let mut seen = Vec::new();
+        Walker::new(&ready)
+            .unwrap()
+            .walk(|rel, _, _, reason| {
+                seen.push((rel.to_path_buf(), reason.map(str::to_owned)));
+                Ok(())
+            })
+            .unwrap();
+        assert!(seen.contains(&(PathBuf::from("file.md"), None)));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn worktree_subtree_visits_only_skipped_folder() {
+        let base =
+            std::env::temp_dir().join(format!("llm-index-worktree-subtree-{}", std::process::id()));
+        let ready = test_ready(&base);
+        std::fs::create_dir_all(base.join("root/wt/nested")).unwrap();
+        std::fs::write(
+            base.join("root/wt/.git"),
+            "gitdir: /x/repo/.git/worktrees/a",
+        )
+        .unwrap();
+        std::fs::write(base.join("root/wt/nested/file.md"), "content").unwrap();
+        for rel in ["wt", "wt/nested"] {
+            let mut seen = Vec::new();
+            Walker::new(&ready)
+                .unwrap()
+                .walk_subtree(Path::new(rel), |path, _, fd, reason| {
+                    seen.push((path.to_path_buf(), fd.is_some(), reason.map(str::to_owned)));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(seen, [(PathBuf::from("wt"), true, Some("worktree".into()))]);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn decode_fsuuid_bounds_and_hex() {
