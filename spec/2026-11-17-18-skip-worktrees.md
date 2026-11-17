@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 18
 intent: intent/2026-11-17-18-skip-worktrees.md
 ---
