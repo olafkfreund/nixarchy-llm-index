@@ -1658,4 +1658,26 @@ mod tests {
         assert_eq!(files(&f.sink, Tier::Public), 744);
         assert_eq!(files(&f.sink, Tier::Private), 0);
     }
+
+    #[test]
+    fn complete_scan_deletes_rows_under_a_worktree_skip() {
+        let mut f = fx("worktree");
+        for rel in ["repo/a.md", "wt/a.md"] {
+            f.sink
+                .extracted("pub", extracted(rel, "alpha words"))
+                .unwrap();
+        }
+        f.sink
+            .scan_done("pub", scan(true, &["repo/a.md"], &[("wt", "worktree")]));
+        let c = f.sink.conn(Tier::Public);
+        assert_eq!(
+            count(c, "SELECT count(*) FROM files WHERE relpath = 'wt/a.md'"),
+            0
+        );
+        assert_eq!(
+            count(c, "SELECT count(*) FROM files WHERE relpath = 'repo/a.md'"),
+            1
+        );
+        assert_eq!(count(c, "SELECT count(*) FROM chunks"), 1);
+    }
 }

@@ -101,12 +101,18 @@ struct RootRt {
     queue: VecDeque<String>,
     queued: HashMap<String, (u64, i64)>,
     failed: HashMap<String, (u64, i64)>,
+    /// Folders the last accepted scan skipped as `worktree` or `cache`.
+    skipped_dirs: HashSet<String>,
     retried: HashMap<String, (u64, i64)>,
     busy: Option<(WorkerId, Role)>,
     watch: WatchState,
 }
 
 impl RootRt {
+    fn under_skipped(&self, rel: &str) -> bool {
+        super::store::under_any(rel, &self.skipped_dirs.iter().map(String::as_str).collect())
+    }
+
     /// Put a job back at the front; a file already queued is newer (a watch event), so it stays.
     fn requeue(&mut self, rel: String, size: u64, mtime: i64) {
         if let Slot::Vacant(v) = self.queued.entry(rel.clone()) {
@@ -165,6 +171,7 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                 queue: VecDeque::new(),
                 queued: HashMap::new(),
                 failed: HashMap::new(),
+                skipped_dirs: HashSet::new(),
                 retried: HashMap::new(),
                 busy: None,
                 watch: WatchState::default(),
@@ -454,7 +461,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
                         size: job.size,
                         mtime_ns: job.mtime,
                     };
-                    if let Err(e) = self.sink.extracted(&self.roots[i].spec.name, file) {
+                    if !self.roots[i].under_skipped(&file.relpath)
+                        && let Err(e) = self.sink.extracted(&self.roots[i].spec.name, file)
+                    {
                         self.store_error(i, &job, &e, now);
                     }
                     self.send_next(id, now);
@@ -759,7 +768,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
             let protected: HashSet<&str> = buf
                 .skipped
                 .iter()
-                .filter(|(_, why)| super::store::protects(why))
+                .filter(|(_, why)| {
+                    super::store::protects(why) || matches!(why.as_str(), "worktree" | "cache")
+                })
                 .map(|(rel, _)| rel.as_str())
                 .collect();
             let files: HashMap<&str, (u64, i64)> = buf
@@ -816,6 +827,19 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
         self.roots[i].unconfirmed = false;
         self.sink
             .set_expected_identity(&name, &b.share, uuid.as_deref());
+        if accepted {
+            let r = &mut self.roots[i];
+            r.skipped_dirs = buf
+                .skipped
+                .iter()
+                .filter(|(_, why)| matches!(why.as_str(), "worktree" | "cache"))
+                .map(|(rel, _)| rel.clone())
+                .collect();
+            let set: HashSet<&str> = r.skipped_dirs.iter().map(String::as_str).collect();
+            r.queue.retain(|rel| !super::store::under_any(rel, &set));
+            r.queued
+                .retain(|rel, _| !super::store::under_any(rel, &set));
+        }
         self.queue_extracts(i, &buf.entries);
         self.sink.scan_done(
             &name,
@@ -853,6 +877,9 @@ impl<S: Spawner, K: Sink> Sched<S, K> {
     fn queue_one(&mut self, i: usize, rel: String, size: u64, mtime: i64) {
         let r = &mut self.roots[i];
         let cur = (size, mtime);
+        if r.under_skipped(&rel) {
+            return;
+        }
         if self.sink.known(&r.spec.name, &rel) == Some(cur) || r.failed.get(&rel) == Some(&cur) {
             return;
         }
@@ -3122,5 +3149,73 @@ mod tests {
             "{text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn wt_case(skipped: &[(&str, &str)], files: &[(&str, u64, i64)]) -> T {
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+        s.queue_one(0, "wt/f.md".into(), 1, 2);
+        identity_scan(&mut s, who, true, files, skipped);
+        s
+    }
+
+    #[test]
+    fn accepted_scan_drops_queued_work_under_a_worktree_and_ignores_its_results() {
+        let mut s = wt_case(&[("wt", "worktree")], &[("f", 1, 2)]);
+        assert!(s.roots[0].skipped_dirs.contains("wt"));
+        assert!(!s.roots[0].queue.contains(&"wt/f.md".to_string()));
+        assert!(!s.roots[0].queued.contains_key("wt/f.md"));
+        s.queue_one(0, "wt/g.md".into(), 1, 2);
+        assert!(!s.roots[0].queued.contains_key("wt/g.md"));
+        // an in-flight result for a skipped path is dropped, the worker moves on
+        let (mut s, e) = extracting(&[("f", 10, 5), ("g", 1, 1)]);
+        s.roots[0].skipped_dirs.insert("f".into());
+        s.handle(e, extracted_msg("f"), secs(2));
+        assert!(s.sink.extracted.is_empty());
+        assert!(extracts(&s).iter().any(|(_, j)| j.contains("\"g\"")));
+    }
+
+    #[test]
+    fn next_accepted_scan_without_the_skip_queues_the_path_again() {
+        let mut s = wt_case(&[("wt", "worktree")], &[("f", 1, 2)]);
+        let mut who = ident("/mnt/nas", "/dev/d2", "ext4", 2);
+        who.fs_uuid = Some("aabb".into());
+        identity_scan(&mut s, who, true, &[("f", 1, 2), ("wt/f.md", 1, 2)], &[]);
+        assert!(s.roots[0].skipped_dirs.is_empty());
+        assert!(s.roots[0].queued.contains_key("wt/f.md"));
+    }
+
+    #[test]
+    fn partial_scan_leaves_skipped_dirs_alone() {
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+        s.roots[0].skipped_dirs.insert("old".into());
+        identity_scan(&mut s, who, false, &[("f", 1, 2)], &[("wt", "worktree")]);
+        assert_eq!(s.roots[0].skipped_dirs, HashSet::from(["old".to_string()]));
+    }
+
+    #[test]
+    fn evidence_leaves_out_worktree_and_cache_but_not_other_skips() {
+        // meta: 2 files under the skip, 2 outside; half of the total is skipped
+        for (reason, expected) in [("worktree", true), ("cache", true), ("ignored", false)] {
+            let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+            s.sink.meta = vec![
+                ("wt/a".into(), 1, 2),
+                ("wt/b".into(), 1, 2),
+                ("c".into(), 1, 2),
+                ("d".into(), 1, 2),
+            ];
+            identity_scan(
+                &mut s,
+                who,
+                true,
+                &[("c", 1, 2), ("d", 1, 2)],
+                &[("wt", reason)],
+            );
+            assert_eq!(s.sink.uuids["r"].is_some(), expected, "{reason}");
+        }
+        // every indexed row is under the skip: total == 0, rejected
+        let (mut s, who) = identity_case(StoredUuid::Absent, None, false);
+        s.sink.meta = vec![("wt/a".into(), 1, 2), ("wt/b".into(), 1, 2)];
+        identity_scan(&mut s, who, true, &[], &[("wt", "worktree")]);
+        assert_eq!(s.sink.uuids["r"], None);
     }
 }
